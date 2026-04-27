@@ -1,0 +1,1091 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+
+	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	ext_procv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_proc/v3"
+	v3 "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/baggage"
+	otelcodes "go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.30.0"
+	"go.opentelemetry.io/otel/trace"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+)
+
+var otelTracer trace.Tracer
+var otelEnabled bool
+var agentServiceName string
+var localPodIP string
+
+// inboundEntry holds the trace context and conversation ID of the active inbound span.
+// sessionID is written once after request body parsing (before the agent makes any outbound
+// calls, guaranteed by Envoy's BUFFERED request body mode) and read by outbound streams.
+type inboundEntry struct {
+	ctx       context.Context
+	sessionID string
+}
+
+// activeInbound holds the most-recent inbound span context so that outbound calls can be
+// parented under it. Protected by activeInboundMu.
+// For OTel-instrumented agents the traceparent header takes precedence (see handleOutbound).
+var (
+	activeInboundMu sync.Mutex
+	activeInbound   *inboundEntry
+	traceInbound    = make(map[trace.TraceID]*inboundEntry) // OTel path: keyed by trace-id for concurrent-safe lookup
+)
+
+const maxResponseBodyBytes = 1 * 1024 * 1024
+
+func initOTEL(endpoint string) (func(), error) {
+	ctx := context.Background()
+
+	hostPort := strings.TrimPrefix(strings.TrimPrefix(endpoint, "https://"), "http://")
+
+	exp, err := otlptracehttp.New(ctx,
+		otlptracehttp.WithEndpoint(hostPort),
+		otlptracehttp.WithInsecure(),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create OTLP HTTP exporter: %w", err)
+	}
+
+	res, err := resource.New(ctx,
+		resource.WithAttributes(
+			semconv.ServiceName("otel-sidecar"),
+		),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create OTEL resource: %w", err)
+	}
+
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exp),
+		sdktrace.WithResource(res),
+	)
+	otel.SetTracerProvider(tp)
+	otelTracer = tp.Tracer("otel-sidecar")
+
+	shutdown := func() {
+		if err := tp.Shutdown(context.Background()); err != nil {
+			log.Printf("[OTEL] Shutdown error: %v", err)
+		}
+	}
+	return shutdown, nil
+}
+
+func initLocalPodIP() {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return
+	}
+	for _, addr := range addrs {
+		if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
+			if ipnet.IP.To4() != nil {
+				localPodIP = ipnet.IP.String()
+				return
+			}
+		}
+	}
+}
+
+// shortServiceName extracts the Kubernetes short service name from an authority header.
+// For k8s FQDNs like "svc.namespace.svc.cluster.local:port" it returns "svc".
+// For other hostnames (e.g. "host.docker.internal") it returns the host without port.
+func shortServiceName(authority string) string {
+	host := authority
+	if h, _, err := net.SplitHostPort(authority); err == nil {
+		host = h
+	}
+	if net.ParseIP(host) != nil {
+		return host
+	}
+	if strings.Contains(host, ".svc.") {
+		if idx := strings.IndexByte(host, '.'); idx > 0 {
+			return host[:idx]
+		}
+	}
+	return host
+}
+
+// isMCPNonToolMethod returns true for MCP JSON-RPC methods that are not tool
+// invocations. These are session lifecycle and discovery calls (initialize,
+// list_tools, ping, notifications/*) that should not produce telemetry spans.
+func isMCPNonToolMethod(method string) bool {
+	switch method {
+	case "initialize", "tools/list", "resources/list", "prompts/list",
+		"ping", "roots/list", "sampling/createMessage":
+		return true
+	}
+	return strings.HasPrefix(method, "notifications/")
+}
+
+// llmPathHints maps well-known LLM inference paths to a provider hint.
+// Paths that belong to a single provider return that provider name;
+// OpenAI-compatible paths (shared by many providers) return "".
+var llmPathHints = map[string]string{
+	"/v1/chat/completions": "",         // OpenAI-compatible: OpenAI, vLLM, LiteLLM, Ollama, etc.
+	"/v1/completions":      "",         // OpenAI legacy
+	"/v1/embeddings":       "",         // OpenAI-compatible embeddings
+	"/v1/messages":         "anthropic", // Anthropic-only path
+	"/api/chat":            "ollama",   // Ollama native
+	"/api/generate":        "ollama",   // Ollama native
+}
+
+// llmPathSystem returns (isLLM, providerHint) for a request path.
+// providerHint is non-empty only for paths that uniquely identify a provider.
+func llmPathSystem(path string) (bool, string) {
+	if i := strings.IndexByte(path, '?'); i >= 0 {
+		path = path[:i]
+	}
+	hint, ok := llmPathHints[path]
+	return ok, hint
+}
+
+// llmRegistryEntry maps a hostname pattern or model name pattern to an LLM provider name.
+// Hostname entries use Suffix or Contains; model fallback entries use ModelContains.
+type llmRegistryEntry struct {
+	Suffix        string `json:"suffix,omitempty"`
+	Contains      string `json:"contains,omitempty"`
+	ModelContains string `json:"model_contains,omitempty"`
+	System        string `json:"system"`
+}
+
+var llmRegistry []llmRegistryEntry
+
+// defaultLLMRegistry is the built-in fallback used when no external registry is configured.
+// Entries are evaluated in order; the first match wins.
+// Hostname entries: "suffix" or "contains" matched against the request :authority.
+// Model fallback entries: "model_contains" matched against the model name in the request body.
+var defaultLLMRegistry = []llmRegistryEntry{
+	{Suffix: ".openai.com", System: "openai"},
+	{Suffix: ".anthropic.com", System: "anthropic"},
+	{Suffix: ".amazonaws.com", System: "bedrock"},
+	{Suffix: ".googleapis.com", System: "google"},
+	{Contains: "ollama", System: "ollama"},
+	{Contains: "host.docker.internal", System: "ollama"}, // local Ollama on macOS/Kind
+	{Contains: "localhost", System: "ollama"},            // local Ollama via localhost
+	{ModelContains: ":", System: "ollama"},               // Ollama model tags (e.g. qwen2.5:3b)
+}
+
+func initLLMRegistry() {
+	llmRegistry = defaultLLMRegistry
+}
+
+// llmSystem returns the provider name for an authority header by walking hostname entries.
+func llmSystem(authority string) string {
+	host := authority
+	if h, _, err := net.SplitHostPort(authority); err == nil {
+		host = h
+	}
+	for _, e := range llmRegistry {
+		if e.Suffix != "" && strings.HasSuffix(host, e.Suffix) {
+			return e.System
+		}
+		if e.Contains != "" && strings.Contains(host, e.Contains) {
+			return e.System
+		}
+	}
+	return ""
+}
+
+// llmSystemFromModel returns the provider name by matching a model name against registry entries.
+// Only consulted when hostname and path did not resolve a provider.
+func llmSystemFromModel(model string) string {
+	for _, e := range llmRegistry {
+		if e.ModelContains != "" && strings.Contains(model, e.ModelContains) {
+			return e.System
+		}
+	}
+	return ""
+}
+
+// extractLLMText parses OpenAI-compatible and Ollama NDJSON streaming responses.
+func extractLLMText(data []byte) string {
+	// Non-streaming: try single JSON object
+	var obj map[string]interface{}
+	if err := json.Unmarshal(data, &obj); err == nil {
+		// Ollama non-streaming: {"message":{"content":"..."}}
+		if msg, ok := obj["message"].(map[string]interface{}); ok {
+			if content, ok := msg["content"].(string); ok && content != "" {
+				return content
+			}
+		}
+		// OpenAI non-streaming: {"choices":[{"message":{"content":"..."}}]}
+		if choices, ok := obj["choices"].([]interface{}); ok && len(choices) > 0 {
+			if choice, ok := choices[0].(map[string]interface{}); ok {
+				if msg, ok := choice["message"].(map[string]interface{}); ok {
+					if content, ok := msg["content"].(string); ok && content != "" {
+						return content
+					}
+				}
+			}
+		}
+	}
+	// Streaming: accumulate content across NDJSON lines or SSE data: lines
+	var buf strings.Builder
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "data:") {
+			line = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		}
+		if line == "" || line == "[DONE]" {
+			continue
+		}
+		var chunk map[string]interface{}
+		if err := json.Unmarshal([]byte(line), &chunk); err != nil {
+			continue
+		}
+		// Ollama NDJSON delta: {"message":{"content":"..."}}
+		if msg, ok := chunk["message"].(map[string]interface{}); ok {
+			if content, ok := msg["content"].(string); ok {
+				buf.WriteString(content)
+			}
+		}
+		// OpenAI SSE delta: {"choices":[{"delta":{"content":"..."}}]}
+		if choices, ok := chunk["choices"].([]interface{}); ok && len(choices) > 0 {
+			if choice, ok := choices[0].(map[string]interface{}); ok {
+				if delta, ok := choice["delta"].(map[string]interface{}); ok {
+					if content, ok := delta["content"].(string); ok {
+						buf.WriteString(content)
+					}
+				}
+			}
+		}
+	}
+	return buf.String()
+}
+
+func resolveAgentServiceName() string {
+	if name := os.Getenv("TELEMETRY_SERVICE_NAME"); name != "" {
+		return name
+	}
+	hostname := os.Getenv("HOSTNAME")
+	if hostname == "" {
+		return ""
+	}
+	parts := strings.Split(hostname, "-")
+	if len(parts) <= 2 {
+		return hostname
+	}
+	return strings.Join(parts[:len(parts)-2], "-")
+}
+
+type otelStreamState struct {
+	span          trace.Span
+	ctx           context.Context
+	bodyBuf       bytes.Buffer
+	isInbound     bool
+	isLLM         bool
+	hasDestName   bool          // true when destination.name was resolved from path hint or registry
+	hasSystemName bool          // true when gen_ai.system was resolved from path hint or registry
+	inboundEntry  *inboundEntry // non-nil for inbound streams; shared pointer for session.id propagation
+}
+
+func truncateString(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	b := []byte(s[:maxBytes])
+	for len(b) > 0 {
+		r := b[len(b)-1]
+		if r < 0x80 || r >= 0xC0 {
+			break
+		}
+		b = b[:len(b)-1]
+	}
+	return string(b) + "…"
+}
+
+func jsonGet(obj map[string]interface{}, keys ...string) (interface{}, bool) {
+	var cur interface{} = obj
+	for _, k := range keys {
+		m, ok := cur.(map[string]interface{})
+		if !ok {
+			return nil, false
+		}
+		cur, ok = m[k]
+		if !ok {
+			return nil, false
+		}
+	}
+	return cur, true
+}
+
+// decodeJWTPayload base64-decodes the JWT payload section without signature verification.
+// Used to extract enduser.id claims without requiring Keycloak configuration.
+func decodeJWTPayload(tokenString string) map[string]interface{} {
+	parts := strings.SplitN(tokenString, ".", 3)
+	if len(parts) != 3 {
+		return nil
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return nil
+	}
+	var claims map[string]interface{}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return nil
+	}
+	return claims
+}
+
+func getHeaderValue(headers []*core.HeaderValue, key string) string {
+	for _, header := range headers {
+		if strings.EqualFold(header.Key, key) {
+			return string(header.RawValue)
+		}
+	}
+	return ""
+}
+
+type processor struct {
+	v3.UnimplementedExternalProcessorServer
+}
+
+// headerCarrier adapts an Envoy HeaderValue slice to propagation.TextMapCarrier.
+// Get reads from the existing headers; Set collects injected headers in the
+// injected map for later use in HeaderMutation.SetHeaders.
+type headerCarrier struct {
+	headers  []*core.HeaderValue
+	injected map[string]string
+}
+
+func (h *headerCarrier) Get(key string) string {
+	return getHeaderValue(h.headers, strings.ToLower(key))
+}
+func (h *headerCarrier) Set(key, val string) { h.injected[strings.ToLower(key)] = val }
+func (h *headerCarrier) Keys() []string      { return nil }
+
+// handleInbound always passes the request through and starts an OTEL span for
+// inbound A2A POST requests. JWT is decoded without validation for enduser.id.
+func (p *processor) handleInbound(headers *core.HeaderMap) (*v3.ProcessingResponse, *otelStreamState) {
+	passthrough := &v3.ProcessingResponse{
+		Response: &v3.ProcessingResponse_RequestHeaders{
+			RequestHeaders: &v3.HeadersResponse{},
+		},
+	}
+
+	httpMethod := getHeaderValue(headers.Headers, ":method")
+	requestPath := getHeaderValue(headers.Headers, ":path")
+
+	if !otelEnabled || otelTracer == nil || httpMethod != "POST" || (requestPath != "/" && requestPath != "") {
+		return passthrough, nil
+	}
+
+	var userID, sourceService string
+	authHeader := getHeaderValue(headers.Headers, "authorization")
+	if authHeader != "" {
+		tokenString := strings.TrimPrefix(authHeader, "Bearer ")
+		tokenString = strings.TrimPrefix(tokenString, "bearer ")
+		if claims := decodeJWTPayload(tokenString); claims != nil {
+			if pu, ok := claims["preferred_username"].(string); ok && pu != "" {
+				userID = pu
+			} else if sub, ok := claims["sub"].(string); ok {
+				userID = sub
+			}
+			if azp, ok := claims["azp"].(string); ok {
+				sourceService = azp
+			}
+		}
+	}
+
+	// Extract traceparent + W3C baggage (upstream sidecar may have injected session.id).
+	prop := propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{})
+	carrier := &headerCarrier{headers: headers.Headers, injected: make(map[string]string)}
+	parentCtx := prop.Extract(context.Background(), carrier)
+
+	spanName := "telemetry.inbound"
+	if agentServiceName != "" {
+		spanName = "telemetry.inbound " + agentServiceName
+	}
+	spanCtx, span := otelTracer.Start(
+		parentCtx,
+		spanName,
+		trace.WithSpanKind(trace.SpanKindServer),
+	)
+
+	attrs := []attribute.KeyValue{
+		attribute.String("openinference.span.kind", "AGENT"),
+		attribute.String("http.method", httpMethod),
+		attribute.String("http.target", requestPath),
+	}
+	if userID != "" {
+		attrs = append(attrs, attribute.String("enduser.id", userID))
+	}
+	if sourceService != "" {
+		attrs = append(attrs, attribute.String("source.name", sourceService))
+	}
+	if agentServiceName != "" {
+		attrs = append(attrs, attribute.String("destination.name", agentServiceName))
+	}
+	if authority := getHeaderValue(headers.Headers, ":authority"); authority != "" {
+		attrs = append(attrs, attribute.String("destination.address", authority))
+	}
+	if src := getHeaderValue(headers.Headers, "x-source-address"); src != "" {
+		attrs = append(attrs, attribute.String("source.address", src))
+	} else if xff := getHeaderValue(headers.Headers, "x-forwarded-for"); xff != "" {
+		sourceAddr := strings.SplitN(xff, ",", 2)[0]
+		attrs = append(attrs, attribute.String("source.address", strings.TrimSpace(sourceAddr)))
+	}
+	span.SetAttributes(attrs...)
+
+	entry := &inboundEntry{ctx: spanCtx}
+	// Upstream sidecar may have injected session.id via W3C Baggage; pick it up immediately
+	// so outbound calls made before body parsing can already carry the session ID.
+	if m := baggage.FromContext(parentCtx).Member("session.id"); m.Key() != "" {
+		entry.sessionID = m.Value()
+		span.SetAttributes(
+			attribute.String("gen_ai.conversation.id", m.Value()),
+			attribute.String("session.id", m.Value()),
+		)
+	}
+	traceID := span.SpanContext().TraceID()
+	activeInboundMu.Lock()
+	traceInbound[traceID] = entry
+	activeInbound = entry
+	activeInboundMu.Unlock()
+
+	otelState := &otelStreamState{span: span, ctx: spanCtx, isInbound: true, inboundEntry: entry}
+	log.Printf("[OTEL] Started span %s for user %q", spanName, userID)
+
+	// Inject our traceparent into the inbound request so OTel-instrumented agents inherit
+	// this trace-id. handleOutbound can then look up the inbound entry by trace-id, giving
+	// correct session.id under concurrent requests without relying on the timing-based global.
+	injectCarrier := &headerCarrier{headers: headers.Headers, injected: make(map[string]string)}
+	propagation.TraceContext{}.Inject(spanCtx, injectCarrier)
+	var injectHeaders []*core.HeaderValueOption
+	for k, v := range injectCarrier.injected {
+		injectHeaders = append(injectHeaders, &core.HeaderValueOption{
+			Header: &core.HeaderValue{Key: k, RawValue: []byte(v)},
+		})
+	}
+
+	return &v3.ProcessingResponse{
+		Response: &v3.ProcessingResponse_RequestHeaders{
+			RequestHeaders: &v3.HeadersResponse{
+				Response: &v3.CommonResponse{
+					HeaderMutation: &v3.HeaderMutation{SetHeaders: injectHeaders},
+				},
+			},
+		},
+		ModeOverride: &ext_procv3.ProcessingMode{
+			RequestBodyMode:    ext_procv3.ProcessingMode_BUFFERED,
+			ResponseHeaderMode: ext_procv3.ProcessingMode_SEND,
+			ResponseBodyMode:   ext_procv3.ProcessingMode_STREAMED,
+		},
+	}, otelState
+}
+
+// isObservabilityEndpoint returns true for hosts that are telemetry infrastructure
+// (OTEL collectors, Prometheus, Jaeger, etc.) that should not be traced as agent calls.
+func isObservabilityEndpoint(authority string) bool {
+	host := authority
+	if h, _, err := net.SplitHostPort(authority); err == nil {
+		host = h
+	}
+	return strings.Contains(host, "otel-collector") ||
+		strings.Contains(host, "jaeger") ||
+		strings.Contains(host, "zipkin") ||
+		strings.Contains(host, "prometheus")
+}
+
+func (p *processor) handleOutbound(headers *core.HeaderMap) (*v3.ProcessingResponse, *otelStreamState) {
+	method := getHeaderValue(headers.Headers, ":method")
+	authority := getHeaderValue(headers.Headers, ":authority")
+	passthrough := &v3.ProcessingResponse{
+		Response: &v3.ProcessingResponse_RequestHeaders{
+			RequestHeaders: &v3.HeadersResponse{},
+		},
+	}
+	if !otelEnabled || otelTracer == nil {
+		return passthrough, nil
+	}
+	if method != "POST" {
+		return passthrough, nil
+	}
+	// Skip span creation for telemetry infrastructure — these are not agent calls.
+	if isObservabilityEndpoint(authority) {
+		return passthrough, nil
+	}
+
+	// Prefer traceparent propagated by the agent (OTel-instrumented agents do this
+	// automatically), which gives correct parenting under concurrent requests.
+	// Fall back to the timing-based active inbound context for non-OTel agents.
+	extractProp := propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{})
+	extractCarrier := &headerCarrier{headers: headers.Headers, injected: make(map[string]string)}
+	extractedCtx := extractProp.Extract(context.Background(), extractCarrier)
+
+	var parentCtx context.Context
+	var sessionID string
+	activeInboundMu.Lock()
+	if sc := trace.SpanFromContext(extractedCtx).SpanContext(); sc.IsValid() {
+		// OTel agent: parent context comes from the agent's propagated traceparent.
+		// Look up session.id by trace-id — each inbound span has a unique trace-id that the
+		// agent inherits via the traceparent we injected, so this is concurrent-safe.
+		parentCtx = extractedCtx
+		if e, ok := traceInbound[sc.TraceID()]; ok {
+			sessionID = e.sessionID
+		} else if activeInbound != nil {
+			sessionID = activeInbound.sessionID // fallback if map entry already cleaned up
+		}
+	} else if activeInbound != nil {
+		// Non-OTel agent: fall back to timing-based global (safe for sequential agents).
+		parentCtx = activeInbound.ctx
+		sessionID = activeInbound.sessionID
+	}
+	activeInboundMu.Unlock()
+	// Baggage session.id from upstream sidecar (2nd+ agent in chain) takes highest precedence.
+	if m := baggage.FromContext(extractedCtx).Member("session.id"); m.Key() != "" {
+		sessionID = m.Value()
+	}
+	if parentCtx == nil {
+		parentCtx = context.Background()
+	}
+
+	targetName := getHeaderValue(headers.Headers, ":authority")
+	if targetName == "" {
+		targetName = getHeaderValue(headers.Headers, "host")
+	}
+	requestPath := getHeaderValue(headers.Headers, ":path")
+	llm, pathHint := llmPathSystem(requestPath)
+	spanName := "telemetry.outbound"
+	if agentServiceName != "" {
+		spanName = "telemetry.outbound " + agentServiceName
+	}
+	spanCtx, span := otelTracer.Start(parentCtx, spanName, trace.WithSpanKind(trace.SpanKindClient))
+
+	spanKind := "TOOL"
+	if llm {
+		spanKind = "LLM"
+	}
+	attrs := []attribute.KeyValue{
+		attribute.String("openinference.span.kind", spanKind),
+		attribute.String("http.method", "POST"),
+	}
+	hasSystemName := false
+	if llm {
+		// Path hint takes precedence; registry provides fallback for ambiguous paths.
+		sys := pathHint
+		if sys == "" {
+			sys = llmSystem(targetName)
+		}
+		if sys != "" {
+			attrs = append(attrs, attribute.String("gen_ai.system", sys))
+			hasSystemName = true
+		}
+	}
+	hasDestName := false
+	if targetName != "" {
+		destName := shortServiceName(targetName)
+		if llm && hasSystemName {
+			sys := pathHint
+			if sys == "" {
+				sys = llmSystem(targetName)
+			}
+			destName = sys
+			hasDestName = true
+		}
+		attrs = append(attrs, attribute.String("destination.name", destName))
+		attrs = append(attrs, attribute.String("destination.address", targetName))
+	}
+	if agentServiceName != "" {
+		attrs = append(attrs, attribute.String("source.name", agentServiceName))
+	}
+	if localPodIP != "" {
+		attrs = append(attrs, attribute.String("source.address", localPodIP))
+	}
+	span.SetAttributes(attrs...)
+	if sessionID != "" {
+		span.SetAttributes(
+			attribute.String("gen_ai.conversation.id", sessionID),
+			attribute.String("session.id", sessionID),
+		)
+	}
+
+	var injectCtx context.Context = spanCtx
+	if sessionID != "" {
+		if m, err := baggage.NewMember("session.id", sessionID); err == nil {
+			if bag, err := baggage.New(m); err == nil {
+				injectCtx = baggage.ContextWithBaggage(spanCtx, bag)
+			}
+		}
+	}
+	prop := propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{})
+	carrier := &headerCarrier{headers: headers.Headers, injected: make(map[string]string)}
+	prop.Inject(injectCtx, carrier)
+
+	var setHeaders []*core.HeaderValueOption
+	for k, v := range carrier.injected {
+		setHeaders = append(setHeaders, &core.HeaderValueOption{
+			Header: &core.HeaderValue{Key: k, RawValue: []byte(v)},
+		})
+	}
+
+	return &v3.ProcessingResponse{
+		Response: &v3.ProcessingResponse_RequestHeaders{
+			RequestHeaders: &v3.HeadersResponse{
+				Response: &v3.CommonResponse{
+					HeaderMutation: &v3.HeaderMutation{SetHeaders: setHeaders},
+				},
+			},
+		},
+		ModeOverride: &ext_procv3.ProcessingMode{
+			RequestBodyMode:    ext_procv3.ProcessingMode_BUFFERED,
+			ResponseHeaderMode: ext_procv3.ProcessingMode_SEND,
+			ResponseBodyMode:   ext_procv3.ProcessingMode_STREAMED,
+		},
+	}, &otelStreamState{span: span, ctx: spanCtx, isLLM: llm, hasDestName: hasDestName, hasSystemName: hasSystemName}
+}
+
+func (p *processor) handleRequestBody(body *v3.HttpBody, state *otelStreamState) *v3.ProcessingResponse {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[OTEL] Recovered from panic in handleRequestBody: %v", r)
+		}
+	}()
+
+	if body != nil && len(body.Body) > 0 {
+		var rpc map[string]interface{}
+		if err := json.Unmarshal(body.Body, &rpc); err != nil {
+			log.Printf("[OTEL] Request body is not valid JSON: %v", err)
+		} else if state.isLLM {
+			if model, ok := rpc["model"].(string); ok {
+				attrs := []attribute.KeyValue{
+					attribute.String("llm.model_name", model),
+					attribute.String("gen_ai.request.model", model),
+				}
+				if !state.hasSystemName {
+					if sys := llmSystemFromModel(model); sys != "" {
+						attrs = append(attrs, attribute.String("gen_ai.system", sys))
+						if !state.hasDestName {
+							attrs = append(attrs, attribute.String("destination.name", sys))
+						}
+					} else if !state.hasDestName {
+						attrs = append(attrs, attribute.String("destination.name", model))
+					}
+				} else if !state.hasDestName {
+					attrs = append(attrs, attribute.String("destination.name", model))
+				}
+				state.span.SetAttributes(attrs...)
+			}
+			if messages, ok := rpc["messages"].([]interface{}); ok {
+				for i := len(messages) - 1; i >= 0; i-- {
+					if msg, ok := messages[i].(map[string]interface{}); ok {
+						if role, _ := msg["role"].(string); role == "user" {
+							if content, ok := msg["content"].(string); ok && content != "" {
+								state.span.SetAttributes(
+									attribute.String("input.value", truncateString(content, 4096)),
+									attribute.String("gen_ai.prompt", truncateString(content, 4096)),
+								)
+								log.Printf("[OTEL] Captured LLM input.value (%d chars)", len(content))
+							}
+							break
+						}
+					}
+				}
+			}
+		} else {
+			if method, ok := rpc["method"].(string); ok {
+				// MCP protocol methods that are not tool invocations (initialize, list_tools,
+				// ping, notifications/*) produce noisy spans that pollute the trace view.
+				// End the span immediately and replace it with a noop so nothing is exported.
+				if isMCPNonToolMethod(method) {
+					state.span.End()
+					state.span = trace.SpanFromContext(context.Background())
+					return &v3.ProcessingResponse{
+						Response: &v3.ProcessingResponse_RequestBody{
+							RequestBody: &v3.BodyResponse{
+								Response: &v3.CommonResponse{},
+							},
+						},
+					}
+				}
+				state.span.SetAttributes(attribute.String("a2a.method", method))
+			}
+			if state.isInbound {
+				state.span.SetAttributes(attribute.String("gen_ai.operation.name", "invoke_agent"))
+			}
+			if msg, ok := jsonGet(rpc, "params", "message"); ok {
+				if msgMap, ok := msg.(map[string]interface{}); ok {
+					if ctxID, ok := msgMap["contextId"].(string); ok && ctxID != "" {
+						state.span.SetAttributes(
+							attribute.String("gen_ai.conversation.id", ctxID),
+							attribute.String("session.id", ctxID),
+						)
+						if state.inboundEntry != nil {
+							activeInboundMu.Lock()
+							state.inboundEntry.sessionID = ctxID
+							activeInboundMu.Unlock()
+						}
+					}
+					if msgID, ok := msgMap["messageId"].(string); ok && msgID != "" {
+						state.span.SetAttributes(attribute.String("a2a.message_id", msgID))
+					}
+					if parts, ok := msgMap["parts"].([]interface{}); ok && len(parts) > 0 {
+						if part, ok := parts[0].(map[string]interface{}); ok {
+							if text, ok := part["text"].(string); ok && text != "" {
+								state.span.SetAttributes(
+									attribute.String("input.value", truncateString(text, 4096)),
+									attribute.String("gen_ai.prompt", truncateString(text, 4096)),
+								)
+								log.Printf("[OTEL] Captured input.value (%d chars)", len(text))
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return &v3.ProcessingResponse{
+		Response: &v3.ProcessingResponse_RequestBody{
+			RequestBody: &v3.BodyResponse{
+				Response: &v3.CommonResponse{},
+			},
+		},
+	}
+}
+
+func extractTextAndContextFromA2AResponse(data []byte) (text, contextID string) {
+	var rpc map[string]interface{}
+	if err := json.Unmarshal(data, &rpc); err == nil {
+		if t := extractArtifactText(rpc); t != "" {
+			text = t
+		}
+		if result, ok := rpc["result"].(map[string]interface{}); ok {
+			if cid, ok := result["contextId"].(string); ok {
+				contextID = cid
+			}
+		}
+		if text != "" {
+			return
+		}
+	}
+
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if payload == "" || payload == "[DONE]" {
+			continue
+		}
+		var evt map[string]interface{}
+		if err := json.Unmarshal([]byte(payload), &evt); err != nil {
+			continue
+		}
+		if t := extractArtifactText(evt); t != "" {
+			text = t
+		}
+		if contextID == "" {
+			if result, ok := evt["result"].(map[string]interface{}); ok {
+				if cid, ok := result["contextId"].(string); ok {
+					contextID = cid
+				}
+			}
+		}
+	}
+	return
+}
+
+func extractArtifactText(rpc map[string]interface{}) string {
+	result, ok := rpc["result"].(map[string]interface{})
+	if !ok {
+		return ""
+	}
+
+	if artifacts, ok := result["artifacts"].([]interface{}); ok && len(artifacts) > 0 {
+		return extractPartsText(artifacts)
+	}
+
+	if art, ok := result["artifact"].(map[string]interface{}); ok {
+		if parts, ok := art["parts"].([]interface{}); ok {
+			if text := extractTextFromParts(parts); text != "" {
+				return text
+			}
+		}
+	}
+
+	if statusObj, ok := result["status"].(map[string]interface{}); ok {
+		if state, _ := statusObj["state"].(string); state == "input-required" || state == "input_required" {
+			if msg, ok := statusObj["message"].(map[string]interface{}); ok {
+				if parts, ok := msg["parts"].([]interface{}); ok {
+					if text := extractTextFromParts(parts); text != "" {
+						return text
+					}
+				}
+			}
+		}
+	}
+
+	// MCP tools/call response: result.content[].text
+	if content, ok := result["content"].([]interface{}); ok && len(content) > 0 {
+		if text := extractTextFromParts(content); text != "" {
+			return text
+		}
+	}
+
+	return ""
+}
+
+func extractPartsText(artifacts []interface{}) string {
+	var buf strings.Builder
+	for _, art := range artifacts {
+		artMap, ok := art.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		parts, ok := artMap["parts"].([]interface{})
+		if !ok {
+			continue
+		}
+		buf.WriteString(extractTextFromParts(parts))
+	}
+	return buf.String()
+}
+
+func extractTextFromParts(parts []interface{}) string {
+	var buf strings.Builder
+	for _, p := range parts {
+		pMap, ok := p.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if text, ok := pMap["text"].(string); ok && text != "" {
+			buf.WriteString(text)
+		}
+	}
+	return buf.String()
+}
+
+func (p *processor) handleResponseBody(body *v3.HttpBody, state *otelStreamState) *v3.ProcessingResponse {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[OTEL] Recovered from panic in handleResponseBody: %v", r)
+		}
+	}()
+
+	if body != nil && len(body.Body) > 0 {
+		if state.bodyBuf.Len() < maxResponseBodyBytes {
+			remaining := maxResponseBodyBytes - state.bodyBuf.Len()
+			if len(body.Body) <= remaining {
+				state.bodyBuf.Write(body.Body)
+			} else {
+				state.bodyBuf.Write(body.Body[:remaining])
+				log.Printf("[OTEL] Response body truncated at %d bytes", maxResponseBodyBytes)
+			}
+		}
+	}
+
+	if body != nil && body.EndOfStream {
+		if state.bodyBuf.Len() > 0 {
+			if state.isLLM {
+				if text := extractLLMText(state.bodyBuf.Bytes()); text != "" {
+					truncated := truncateString(text, 4096)
+					state.span.SetAttributes(
+						attribute.String("output.value", truncated),
+						attribute.String("gen_ai.completion", truncated),
+					)
+					log.Printf("[OTEL] Captured LLM output.value (%d chars)", len(text))
+				}
+			} else {
+				outputText, contextID := extractTextAndContextFromA2AResponse(state.bodyBuf.Bytes())
+				if outputText != "" {
+					truncated := truncateString(outputText, 4096)
+					state.span.SetAttributes(
+						attribute.String("output.value", truncated),
+						attribute.String("gen_ai.completion", truncated),
+					)
+					log.Printf("[OTEL] Captured output.value (%d chars)", len(outputText))
+				}
+				if contextID != "" {
+					state.span.SetAttributes(
+						attribute.String("gen_ai.conversation.id", contextID),
+						attribute.String("session.id", contextID),
+					)
+				}
+			}
+		}
+		state.span.SetStatus(otelcodes.Ok, "")
+		state.span.End()
+		log.Println("[OTEL] Span ended")
+		if state.isInbound {
+			activeInboundMu.Lock()
+			delete(traceInbound, state.span.SpanContext().TraceID())
+			if activeInbound == state.inboundEntry {
+				activeInbound = nil
+			}
+			activeInboundMu.Unlock()
+		}
+	}
+
+	return &v3.ProcessingResponse{
+		Response: &v3.ProcessingResponse_ResponseBody{
+			ResponseBody: &v3.BodyResponse{
+				Response: &v3.CommonResponse{},
+			},
+		},
+	}
+}
+
+func (p *processor) Process(stream v3.ExternalProcessor_ProcessServer) error {
+	log.Printf("[OTEL] Process() stream started")
+	ctx := stream.Context()
+	var otelState *otelStreamState
+
+	defer func() {
+		if otelState != nil {
+			if otelState.span.IsRecording() {
+				otelState.span.End()
+			}
+			if otelState.isInbound {
+				activeInboundMu.Lock()
+				delete(traceInbound, otelState.span.SpanContext().TraceID())
+				if activeInbound == otelState.inboundEntry {
+					activeInbound = nil
+				}
+				activeInboundMu.Unlock()
+			}
+		}
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		req, err := stream.Recv()
+		if err != nil {
+			return status.Errorf(codes.Unknown, "cannot receive stream request: %v", err)
+		}
+
+		resp := &v3.ProcessingResponse{}
+
+		switch r := req.Request.(type) {
+		case *v3.ProcessingRequest_RequestHeaders:
+			headers := r.RequestHeaders.Headers
+			direction := getHeaderValue(headers.Headers, "x-telemetry-direction")
+			log.Printf("[OTEL] RequestHeaders: direction=%q authority=%q method=%q",
+				direction,
+				getHeaderValue(headers.Headers, ":authority"),
+				getHeaderValue(headers.Headers, ":method"))
+			if direction == "inbound" {
+				resp, otelState = p.handleInbound(headers)
+			} else {
+				resp, otelState = p.handleOutbound(headers)
+			}
+
+		case *v3.ProcessingRequest_RequestBody:
+			if otelState != nil {
+				resp = p.handleRequestBody(r.RequestBody, otelState)
+			} else {
+				resp = &v3.ProcessingResponse{
+					Response: &v3.ProcessingResponse_RequestBody{
+						RequestBody: &v3.BodyResponse{
+							Response: &v3.CommonResponse{},
+						},
+					},
+				}
+			}
+
+		case *v3.ProcessingRequest_ResponseHeaders:
+			if otelState != nil {
+				headers := r.ResponseHeaders.Headers
+				if headers != nil {
+					if statusStr := getHeaderValue(headers.Headers, ":status"); statusStr != "" {
+						if code, err := strconv.Atoi(statusStr); err == nil {
+							otelState.span.SetAttributes(attribute.Int("http.status_code", code))
+						}
+					}
+				}
+			}
+			resp = &v3.ProcessingResponse{
+				Response: &v3.ProcessingResponse_ResponseHeaders{
+					ResponseHeaders: &v3.HeadersResponse{},
+				},
+			}
+
+		case *v3.ProcessingRequest_ResponseBody:
+			if otelState != nil {
+				resp = p.handleResponseBody(r.ResponseBody, otelState)
+			} else {
+				resp = &v3.ProcessingResponse{
+					Response: &v3.ProcessingResponse_ResponseBody{
+						ResponseBody: &v3.BodyResponse{
+							Response: &v3.CommonResponse{},
+						},
+					},
+				}
+			}
+
+		default:
+			log.Printf("Unknown request type: %T\n", r)
+		}
+
+		if err := stream.Send(resp); err != nil {
+			return status.Errorf(codes.Unknown, "cannot send stream response: %v", err)
+		}
+	}
+}
+
+func main() {
+	log.Println("=== Telemetry Processor Starting ===")
+
+	otelEndpoint := os.Getenv("TELEMETRY_OTEL_ENDPOINT")
+	if otelEndpoint == "" {
+		otelEndpoint = "http://otel-collector.kagenti-system.svc.cluster.local:8335"
+		log.Printf("[OTEL] TELEMETRY_OTEL_ENDPOINT not set, using default: %s", otelEndpoint)
+	}
+	if otelEndpoint != "disabled" {
+		shutdownOTEL, err := initOTEL(otelEndpoint)
+		if err != nil {
+			log.Printf("[OTEL] Failed to initialize (continuing without OTEL): %v", err)
+		} else {
+			otelEnabled = true
+			defer shutdownOTEL()
+			agentServiceName = resolveAgentServiceName()
+			initLocalPodIP()
+			initLLMRegistry()
+			log.Printf("[OTEL] Enabled, exporting spans to %s (service: otel-sidecar, agent: %s, podIP: %s)", otelEndpoint, agentServiceName, localPodIP)
+		}
+	} else {
+		log.Println("[OTEL] TELEMETRY_OTEL_ENDPOINT=disabled, OTEL skipped")
+	}
+
+	port := ":9091"
+	lis, err := net.Listen("tcp", port)
+	if err != nil {
+		log.Fatalf("failed to listen: %v", err)
+	}
+
+	grpcServer := grpc.NewServer()
+	v3.RegisterExternalProcessorServer(grpcServer, &processor{})
+
+	log.Printf("Starting telemetry processor on %s", port)
+	if err := grpcServer.Serve(lis); err != nil {
+		log.Fatalf("failed to serve: %v", err)
+	}
+}

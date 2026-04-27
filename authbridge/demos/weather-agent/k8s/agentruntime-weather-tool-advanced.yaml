@@ -8,11 +8,8 @@ kind: AgentRuntime
 metadata:
   name: weather-tool-advanced
   namespace: team1
-# Use type "agent" so the operator does not force pod labels to kagenti.io/type=tool
-# (which skips injection when the injectTools feature gate is off). The workload
-# is still the MCP `weather_tool` by container image and Deployment name.
 spec:
-  type: agent
+  type: tool
   targetRef:
     apiVersion: apps/v1
     kind: Deployment

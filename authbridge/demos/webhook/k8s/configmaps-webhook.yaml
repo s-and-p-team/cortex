@@ -20,11 +20,12 @@ stringData:
   KEYCLOAK_ADMIN_PASSWORD: "admin"
 
 ---
-# authbridge-config ConfigMap - Unified config for both client-registration and envoy-proxy (authbridge)
+# authbridge-config ConfigMap - Unified config for client-registration, authbridge, and telemetry-processor
 #
 # client-registration reads: KEYCLOAK_URL, KEYCLOAK_REALM, PLATFORM_CLIENT_IDS
 # authbridge reads: KEYCLOAK_URL, KEYCLOAK_REALM (to derive TOKEN_URL/ISSUER), TOKEN_URL, ISSUER,
 #                   DEFAULT_OUTBOUND_POLICY
+# telemetry-processor: LLM provider registry is built-in (no configmap entry needed)
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -163,6 +164,20 @@ data:
                     response_header_mode: SKIP
                     request_body_mode: NONE
                     response_body_mode: NONE
+              - name: envoy.filters.http.ext_proc
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+                  failure_mode_allow: true
+                  allow_mode_override: true
+                  grpc_service:
+                    envoy_grpc:
+                      cluster_name: telemetry_proc_cluster
+                    timeout: 30s
+                  processing_mode:
+                    request_header_mode: SEND
+                    response_header_mode: SKIP
+                    request_body_mode: NONE
+                    response_body_mode: NONE
               - name: envoy.filters.http.router
                 typed_config:
                   "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
@@ -200,14 +215,34 @@ data:
                   "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
                   inline_code: |
                     function envoy_on_request(request_handle)
-                      request_handle:headers():add("x-authbridge-direction", "inbound")
+                      request_handle:headers():replace("x-authbridge-direction", "inbound")
+                      request_handle:headers():replace("x-telemetry-direction", "inbound")
+                      local addr = request_handle:streamInfo():downstreamDirectRemoteAddress()
+                      if addr ~= nil then
+                        request_handle:headers():replace("x-source-address", addr)
+                      end
                     end
               - name: envoy.filters.http.ext_proc
                 typed_config:
                   "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+                  allow_mode_override: true
                   grpc_service:
                     envoy_grpc:
                       cluster_name: ext_proc_cluster
+                    timeout: 30s
+                  processing_mode:
+                    request_header_mode: SEND
+                    response_header_mode: SKIP
+                    request_body_mode: NONE
+                    response_body_mode: NONE
+              - name: envoy.filters.http.ext_proc
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+                  failure_mode_allow: true
+                  allow_mode_override: true
+                  grpc_service:
+                    envoy_grpc:
+                      cluster_name: telemetry_proc_cluster
                     timeout: 30s
                   processing_mode:
                     request_header_mode: SEND
@@ -240,3 +275,18 @@ data:
                   socket_address:
                     address: 127.0.0.1
                     port_value: 9090
+
+      - name: telemetry_proc_cluster
+        connect_timeout: 5s
+        type: STATIC
+        lb_policy: ROUND_ROBIN
+        http2_protocol_options: {}
+        load_assignment:
+          cluster_name: telemetry_proc_cluster
+          endpoints:
+          - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: 127.0.0.1
+                    port_value: 9091

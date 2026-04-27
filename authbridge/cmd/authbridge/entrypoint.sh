@@ -11,7 +11,7 @@ set -euo pipefail
 
 cleanup() {
   echo "[entrypoint] Received signal, shutting down..."
-  kill "$AUTHBRIDGE_PID" "$ENVOY_PID" 2>/dev/null || true
+  kill "$AUTHBRIDGE_PID" "$TELEMETRY_PROCESSOR_PID" "$ENVOY_PID" 2>/dev/null || true
   wait
   exit 0
 }
@@ -22,7 +22,12 @@ echo "[entrypoint] Starting authbridge..."
 /usr/local/bin/authbridge "$@" &
 AUTHBRIDGE_PID=$!
 
-# Give authbridge a moment to start the gRPC listener
+# Start telemetry-processor (OTEL span emitter, ext_proc on :9091) in the background
+echo "[entrypoint] Starting telemetry-processor..."
+/usr/local/bin/telemetry-processor &
+TELEMETRY_PROCESSOR_PID=$!
+
+# Give processors a moment to start their gRPC listeners
 sleep 2
 
 # Start Envoy in the background
@@ -31,10 +36,10 @@ echo "[entrypoint] Starting Envoy..."
   --service-cluster auth-proxy --service-node auth-proxy &
 ENVOY_PID=$!
 
-# Wait for the first child to exit. If either dies, restart the container.
-wait -n "$AUTHBRIDGE_PID" "$ENVOY_PID"
+# Wait for the first child to exit. If any dies, restart the container.
+wait -n "$AUTHBRIDGE_PID" "$TELEMETRY_PROCESSOR_PID" "$ENVOY_PID"
 EXIT_CODE=$?
 echo "[entrypoint] A process exited unexpectedly (exit code $EXIT_CODE), terminating container"
-kill "$AUTHBRIDGE_PID" "$ENVOY_PID" 2>/dev/null || true
+kill "$AUTHBRIDGE_PID" "$TELEMETRY_PROCESSOR_PID" "$ENVOY_PID" 2>/dev/null || true
 wait
 exit 1

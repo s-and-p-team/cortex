@@ -80,7 +80,7 @@ spec:
             - name: LLM_API_KEY
               value: "ollama"
             - name: LLM_MODEL
-              value: "llama3.2:3b-instruct-fp16"
+              value: "qwen2.5:3b"
             - name: LOG_LEVEL
               value: "INFO"
           readinessProbe:
