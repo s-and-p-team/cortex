@@ -378,9 +378,16 @@ func (h *headerCarrier) Keys() []string      { return nil }
 // handleInbound always passes the request through and starts an OTEL span for
 // inbound A2A POST requests. JWT is decoded without validation for enduser.id.
 func (p *processor) handleInbound(headers *core.HeaderMap) (*v3.ProcessingResponse, *otelStreamState) {
+	// For non-telemetered requests (health checks, non-POST, etc.) override the base
+	// BUFFERED/STREAMED body modes back to NONE so we don't waste ext_proc calls.
 	passthrough := &v3.ProcessingResponse{
 		Response: &v3.ProcessingResponse_RequestHeaders{
 			RequestHeaders: &v3.HeadersResponse{},
+		},
+		ModeOverride: &ext_procv3.ProcessingMode{
+			RequestBodyMode:    ext_procv3.ProcessingMode_NONE,
+			ResponseBodyMode:   ext_procv3.ProcessingMode_NONE,
+			ResponseHeaderMode: ext_procv3.ProcessingMode_SKIP,
 		},
 	}
 
@@ -440,7 +447,10 @@ func (p *processor) handleInbound(headers *core.HeaderMap) (*v3.ProcessingRespon
 	if authority := getHeaderValue(headers.Headers, ":authority"); authority != "" {
 		attrs = append(attrs, attribute.String("destination.address", authority))
 	}
-	if src := getHeaderValue(headers.Headers, "x-source-address"); src != "" {
+	if src := getHeaderValue(headers.Headers, "x-telemetry-source-address"); src != "" {
+		// Injected by the Lua filter from Envoy's downstream peer address (most accurate).
+		attrs = append(attrs, attribute.String("source.address", src))
+	} else if src := getHeaderValue(headers.Headers, "x-source-address"); src != "" {
 		attrs = append(attrs, attribute.String("source.address", src))
 	} else if xff := getHeaderValue(headers.Headers, "x-forwarded-for"); xff != "" {
 		sourceAddr := strings.SplitN(xff, ",", 2)[0]
@@ -487,11 +497,6 @@ func (p *processor) handleInbound(headers *core.HeaderMap) (*v3.ProcessingRespon
 				},
 			},
 		},
-		ModeOverride: &ext_procv3.ProcessingMode{
-			RequestBodyMode:    ext_procv3.ProcessingMode_BUFFERED,
-			ResponseHeaderMode: ext_procv3.ProcessingMode_SEND,
-			ResponseBodyMode:   ext_procv3.ProcessingMode_STREAMED,
-		},
 	}, otelState
 }
 
@@ -511,9 +516,15 @@ func isObservabilityEndpoint(authority string) bool {
 func (p *processor) handleOutbound(headers *core.HeaderMap) (*v3.ProcessingResponse, *otelStreamState) {
 	method := getHeaderValue(headers.Headers, ":method")
 	authority := getHeaderValue(headers.Headers, ":authority")
+	// Non-telemetered requests opt out of body processing to avoid buffering overhead.
 	passthrough := &v3.ProcessingResponse{
 		Response: &v3.ProcessingResponse_RequestHeaders{
 			RequestHeaders: &v3.HeadersResponse{},
+		},
+		ModeOverride: &ext_procv3.ProcessingMode{
+			RequestBodyMode:    ext_procv3.ProcessingMode_NONE,
+			ResponseBodyMode:   ext_procv3.ProcessingMode_NONE,
+			ResponseHeaderMode: ext_procv3.ProcessingMode_SKIP,
 		},
 	}
 	if !otelEnabled || otelTracer == nil {
@@ -538,14 +549,18 @@ func (p *processor) handleOutbound(headers *core.HeaderMap) (*v3.ProcessingRespo
 	var sessionID string
 	activeInboundMu.Lock()
 	if sc := trace.SpanFromContext(extractedCtx).SpanContext(); sc.IsValid() {
-		// OTel agent: parent context comes from the agent's propagated traceparent.
-		// Look up session.id by trace-id — each inbound span has a unique trace-id that the
-		// agent inherits via the traceparent we injected, so this is concurrent-safe.
-		parentCtx = extractedCtx
 		if e, ok := traceInbound[sc.TraceID()]; ok {
+			// Agent's traceparent belongs to our trace (we injected it) → keep it as parent
+			// so OTel-instrumented agent spans (e.g. LangChain) nest correctly under inbound.
+			parentCtx = extractedCtx
 			sessionID = e.sessionID
 		} else if activeInbound != nil {
-			sessionID = activeInbound.sessionID // fallback if map entry already cleaned up
+			// Agent's traceparent is from a foreign trace (e.g. MLflow auto-instrumentation) →
+			// re-parent to the active inbound span so outbound stays in the same thread.
+			parentCtx = activeInbound.ctx
+			sessionID = activeInbound.sessionID
+		} else {
+			parentCtx = extractedCtx
 		}
 	} else if activeInbound != nil {
 		// Non-OTel agent: fall back to timing-based global (safe for sequential agents).
@@ -648,11 +663,6 @@ func (p *processor) handleOutbound(headers *core.HeaderMap) (*v3.ProcessingRespo
 				},
 			},
 		},
-		ModeOverride: &ext_procv3.ProcessingMode{
-			RequestBodyMode:    ext_procv3.ProcessingMode_BUFFERED,
-			ResponseHeaderMode: ext_procv3.ProcessingMode_SEND,
-			ResponseBodyMode:   ext_procv3.ProcessingMode_STREAMED,
-		},
 	}, &otelStreamState{span: span, ctx: spanCtx, isLLM: llm, hasDestName: hasDestName, hasSystemName: hasSystemName}
 }
 
@@ -705,21 +715,43 @@ func (p *processor) handleRequestBody(body *v3.HttpBody, state *otelStreamState)
 			}
 		} else {
 			if method, ok := rpc["method"].(string); ok {
-				// MCP protocol methods that are not tool invocations (initialize, list_tools,
-				// ping, notifications/*) produce noisy spans that pollute the trace view.
-				// End the span immediately and replace it with a noop so nothing is exported.
-				if isMCPNonToolMethod(method) {
-					state.span.End()
-					state.span = trace.SpanFromContext(context.Background())
-					return &v3.ProcessingResponse{
-						Response: &v3.ProcessingResponse_RequestBody{
-							RequestBody: &v3.BodyResponse{
-								Response: &v3.CommonResponse{},
-							},
-						},
+				// Rename span to the method so each action is distinguishable in Phoenix.
+				// Only rename outbound spans — inbound "telemetry.inbound" is kept as-is.
+				if !state.isInbound {
+					state.span.SetName(method)
+					// Protocol setup methods (initialize, list_tools, ping) are CHAIN spans;
+					// actual tool invocations are TOOL spans (already set in handleOutbound).
+					if isMCPNonToolMethod(method) {
+						state.span.SetAttributes(attribute.String("openinference.span.kind", "CHAIN"))
 					}
+					log.Printf("[OTEL] Outbound action: %q", method)
 				}
 				state.span.SetAttributes(attribute.String("a2a.method", method))
+
+				// For tools/call, extract tool name and arguments as input.value
+				// and rename span to "tools/call: <toolname>" for Phoenix trace clarity.
+				if method == "tools/call" && !state.isInbound {
+					if params, ok := rpc["params"].(map[string]interface{}); ok {
+						toolName, _ := params["name"].(string)
+						if toolName != "" {
+							state.span.SetName("tools/call: " + toolName)
+							state.span.SetAttributes(attribute.String("tool.name", toolName))
+						}
+						inputMap := map[string]interface{}{}
+						if toolName != "" {
+							inputMap["tool"] = toolName
+						}
+						if args, ok := params["arguments"]; ok {
+							inputMap["arguments"] = args
+						}
+						if len(inputMap) > 0 {
+							if b, err := json.Marshal(inputMap); err == nil {
+								state.span.SetAttributes(attribute.String("input.value", truncateString(string(b), 4096)))
+								log.Printf("[OTEL] Captured tools/call input: tool=%q", toolName)
+							}
+						}
+					}
+				}
 			}
 			if state.isInbound {
 				state.span.SetAttributes(attribute.String("gen_ai.operation.name", "invoke_agent"))
@@ -957,6 +989,36 @@ func (p *processor) Process(stream v3.ExternalProcessor_ProcessServer) error {
 	defer func() {
 		if otelState != nil {
 			if otelState.span.IsRecording() {
+				// Stream closed without EndOfStream (e.g. SSE response completed, client
+				// disconnect, or timeout). Flush any buffered response body and mark OK —
+				// reaching here means the request completed without an explicit error.
+				if otelState.bodyBuf.Len() > 0 {
+					if otelState.isLLM {
+						if text := extractLLMText(otelState.bodyBuf.Bytes()); text != "" {
+							truncated := truncateString(text, 4096)
+							otelState.span.SetAttributes(
+								attribute.String("output.value", truncated),
+								attribute.String("gen_ai.completion", truncated),
+							)
+						}
+					} else {
+						outputText, contextID := extractTextAndContextFromA2AResponse(otelState.bodyBuf.Bytes())
+						if outputText != "" {
+							truncated := truncateString(outputText, 4096)
+							otelState.span.SetAttributes(
+								attribute.String("output.value", truncated),
+								attribute.String("gen_ai.completion", truncated),
+							)
+						}
+						if contextID != "" {
+							otelState.span.SetAttributes(
+								attribute.String("gen_ai.conversation.id", contextID),
+								attribute.String("session.id", contextID),
+							)
+						}
+					}
+				}
+				otelState.span.SetStatus(otelcodes.Ok, "")
 				otelState.span.End()
 			}
 			if otelState.isInbound {
