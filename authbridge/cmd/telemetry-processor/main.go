@@ -295,6 +295,8 @@ type otelStreamState struct {
 	bodyBuf       bytes.Buffer
 	isInbound     bool
 	isLLM         bool
+	isA2A         bool          // true for outbound A2A peer calls (/message/…)
+	destName      string        // short destination service name (e.g. "travel-advisor")
 	hasDestName   bool          // true when destination.name was resolved from path hint or registry
 	hasSystemName bool          // true when gen_ai.system was resolved from path hint or registry
 	inboundEntry  *inboundEntry // non-nil for inbound streams; shared pointer for session.id propagation
@@ -550,9 +552,10 @@ func (p *processor) handleOutbound(headers *core.HeaderMap) (*v3.ProcessingRespo
 	activeInboundMu.Lock()
 	if sc := trace.SpanFromContext(extractedCtx).SpanContext(); sc.IsValid() {
 		if e, ok := traceInbound[sc.TraceID()]; ok {
-			// Agent's traceparent belongs to our trace (we injected it) → keep it as parent
-			// so OTel-instrumented agent spans (e.g. LangChain) nest correctly under inbound.
-			parentCtx = extractedCtx
+			// Agent's traceparent belongs to our trace — use the inbound span itself as
+			// parent so outbound spans appear as direct children of telemetry.inbound,
+			// matching the flat network-level view rather than nesting under SDK spans.
+			parentCtx = e.ctx
 			sessionID = e.sessionID
 		} else if activeInbound != nil {
 			// Agent's traceparent is from a foreign trace (e.g. MLflow auto-instrumentation) →
@@ -582,15 +585,22 @@ func (p *processor) handleOutbound(headers *core.HeaderMap) (*v3.ProcessingRespo
 	}
 	requestPath := getHeaderValue(headers.Headers, ":path")
 	llm, pathHint := llmPathSystem(requestPath)
+	isA2A := !llm && strings.HasPrefix(requestPath, "/message/")
+	destShortName := shortServiceName(targetName)
 	spanName := "telemetry.outbound"
 	if agentServiceName != "" {
 		spanName = "telemetry.outbound " + agentServiceName
+	}
+	if isA2A && destShortName != "" {
+		spanName = destShortName
 	}
 	spanCtx, span := otelTracer.Start(parentCtx, spanName, trace.WithSpanKind(trace.SpanKindClient))
 
 	spanKind := "TOOL"
 	if llm {
 		spanKind = "LLM"
+	} else if isA2A {
+		spanKind = "AGENT"
 	}
 	attrs := []attribute.KeyValue{
 		attribute.String("openinference.span.kind", spanKind),
@@ -663,7 +673,7 @@ func (p *processor) handleOutbound(headers *core.HeaderMap) (*v3.ProcessingRespo
 				},
 			},
 		},
-	}, &otelStreamState{span: span, ctx: spanCtx, isLLM: llm, hasDestName: hasDestName, hasSystemName: hasSystemName}
+	}, &otelStreamState{span: span, ctx: spanCtx, isLLM: llm, isA2A: isA2A, destName: destShortName, hasDestName: hasDestName, hasSystemName: hasSystemName}
 }
 
 func (p *processor) handleRequestBody(body *v3.HttpBody, state *otelStreamState) *v3.ProcessingResponse {
@@ -715,16 +725,26 @@ func (p *processor) handleRequestBody(body *v3.HttpBody, state *otelStreamState)
 			}
 		} else {
 			if method, ok := rpc["method"].(string); ok {
-				// Rename span to the method so each action is distinguishable in Phoenix.
-				// Only rename outbound spans — inbound "telemetry.inbound" is kept as-is.
 				if !state.isInbound {
-					state.span.SetName(method)
-					// Protocol setup methods (initialize, list_tools, ping) are CHAIN spans;
-					// actual tool invocations are TOOL spans (already set in handleOutbound).
-					if isMCPNonToolMethod(method) {
-						state.span.SetAttributes(attribute.String("openinference.span.kind", "CHAIN"))
+					isA2AMethod := method == "message/stream" || method == "message/send"
+					if isA2AMethod && !state.isA2A {
+						// Body-time A2A detection: Python a2a SDK sends POST to base URL "/"
+						// so the path-based isA2A check in handleOutbound never fires.
+						state.isA2A = true
+						state.span.SetAttributes(attribute.String("openinference.span.kind", "AGENT"))
+						if state.destName != "" {
+							state.span.SetName(state.destName)
+						}
+						log.Printf("[OTEL] A2A call detected (body): dest=%q", state.destName)
+					} else if !state.isA2A {
+						// MCP / non-A2A: rename to the JSON-RPC method so each action is
+						// distinguishable in Phoenix.
+						state.span.SetName(method)
+						if isMCPNonToolMethod(method) {
+							state.span.SetAttributes(attribute.String("openinference.span.kind", "CHAIN"))
+						}
+						log.Printf("[OTEL] Outbound action: %q", method)
 					}
-					log.Printf("[OTEL] Outbound action: %q", method)
 				}
 				state.span.SetAttributes(attribute.String("a2a.method", method))
 
