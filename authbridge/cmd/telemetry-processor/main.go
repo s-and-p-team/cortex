@@ -105,18 +105,51 @@ func startPendingInboundTTL() {
 
 const maxResponseBodyBytes = 1 * 1024 * 1024
 
+// filteringExporter wraps an sdktrace.SpanExporter and drops spans that carry
+// the telemetry.lifecycle=true attribute. These are MCP lifecycle calls
+// (initialize, notifications/*, etc.) that fire at agent startup before any
+// inbound request is in-flight and would otherwise appear as orphan root spans.
+type filteringExporter struct {
+	inner sdktrace.SpanExporter
+}
+
+func (f *filteringExporter) ExportSpans(ctx context.Context, spans []sdktrace.ReadOnlySpan) error {
+	filtered := spans[:0]
+	for _, s := range spans {
+		drop := false
+		for _, a := range s.Attributes() {
+			if a.Key == "telemetry.lifecycle" && a.Value.AsBool() {
+				drop = true
+				break
+			}
+		}
+		if !drop {
+			filtered = append(filtered, s)
+		}
+	}
+	if len(filtered) == 0 {
+		return nil
+	}
+	return f.inner.ExportSpans(ctx, filtered)
+}
+
+func (f *filteringExporter) Shutdown(ctx context.Context) error {
+	return f.inner.Shutdown(ctx)
+}
+
 func initOTEL(endpoint string) (func(), error) {
 	ctx := context.Background()
 
 	hostPort := strings.TrimPrefix(strings.TrimPrefix(endpoint, "https://"), "http://")
 
-	exp, err := otlptracehttp.New(ctx,
+	otlpExp, err := otlptracehttp.New(ctx,
 		otlptracehttp.WithEndpoint(hostPort),
 		otlptracehttp.WithInsecure(),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("create OTLP HTTP exporter: %w", err)
 	}
+	exp := &filteringExporter{inner: otlpExp}
 
 	res, err := resource.New(ctx,
 		resource.WithAttributes(
@@ -808,13 +841,16 @@ func (p *processor) handleRequestBody(body *v3.HttpBody, state *otelStreamState)
 						}
 						log.Printf("[OTEL] A2A call detected (body): dest=%q", state.destName)
 					} else if !state.isA2A {
-						// MCP / non-A2A: rename to the JSON-RPC method so each action is
-						// distinguishable in Phoenix.
 						state.span.SetName(method)
+						// MCP lifecycle methods (initialize, notifications/*, etc.) fire at
+						// agent startup before any inbound is in-flight, making them orphan
+						// root spans. Mark them so the filtering exporter can suppress them.
 						if isMCPNonToolMethod(method) {
-							state.span.SetAttributes(attribute.String("openinference.span.kind", "CHAIN"))
+							state.span.SetAttributes(attribute.Bool("telemetry.lifecycle", true))
+							log.Printf("[OTEL] Marked lifecycle span for suppression: %q", method)
+						} else {
+							log.Printf("[OTEL] Outbound action: %q", method)
 						}
-						log.Printf("[OTEL] Outbound action: %q", method)
 					}
 				}
 				state.span.SetAttributes(attribute.String("a2a.method", method))
@@ -951,12 +987,12 @@ func extractArtifactText(rpc map[string]interface{}) string {
 	}
 
 	if statusObj, ok := result["status"].(map[string]interface{}); ok {
-		if state, _ := statusObj["state"].(string); state == "input-required" || state == "input_required" {
-			if msg, ok := statusObj["message"].(map[string]interface{}); ok {
-				if parts, ok := msg["parts"].([]interface{}); ok {
-					if text := extractTextFromParts(parts); text != "" {
-						return text
-					}
+		// Extract text from any terminal or interactive status that carries a message
+		// (completed, input-required, failed, etc.) — not just input-required.
+		if msg, ok := statusObj["message"].(map[string]interface{}); ok {
+			if parts, ok := msg["parts"].([]interface{}); ok {
+				if text := extractTextFromParts(parts); text != "" {
+					return text
 				}
 			}
 		}
