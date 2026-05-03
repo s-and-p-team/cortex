@@ -12,6 +12,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
+
+	"github.com/google/uuid"
 
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	ext_procv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_proc/v3"
@@ -36,22 +39,69 @@ var otelEnabled bool
 var agentServiceName string
 var localPodIP string
 
-// inboundEntry holds the trace context and conversation ID of the active inbound span.
+// inboundEntry holds the trace context and conversation ID of an active inbound span.
 // sessionID is written once after request body parsing (before the agent makes any outbound
 // calls, guaranteed by Envoy's BUFFERED request body mode) and read by outbound streams.
 type inboundEntry struct {
 	ctx       context.Context
 	sessionID string
+	startTime time.Time // for TTL eviction and recency ordering
 }
 
-// activeInbound holds the most-recent inbound span context so that outbound calls can be
-// parented under it. Protected by activeInboundMu.
-// For OTel-instrumented agents the traceparent header takes precedence (see handleOutbound).
+// pendingInbounds holds all currently in-flight inbound requests keyed by a sidecar-generated
+// UUID. An entry lives from handleInbound until the inbound response stream ends (or TTL).
+// For OTel-instrumented agents the traceInbound map takes precedence (see handleOutbound).
+// For non-OTel agents, pickPendingInbound selects the best candidate from this set, which is
+// deterministic when exactly one request is in-flight and heuristic (most-recent) otherwise.
+const pendingInboundTTL = 5 * time.Minute
+
 var (
 	activeInboundMu sync.Mutex
-	activeInbound   *inboundEntry
-	traceInbound    = make(map[trace.TraceID]*inboundEntry) // OTel path: keyed by trace-id for concurrent-safe lookup
+	pendingInbounds = make(map[string]*inboundEntry)          // keyed by sidecar UUID
+	traceInbound    = make(map[trace.TraceID]*inboundEntry)   // OTel path: keyed by trace-id
 )
+
+// pickPendingInbound returns the best candidate inbound entry for a non-OTel outbound call.
+// Must be called with activeInboundMu held.
+// Returns the single entry if unambiguous, the most-recently-started entry if concurrent,
+// or nil if no in-flight inbound exists.
+func pickPendingInbound() *inboundEntry {
+	switch len(pendingInbounds) {
+	case 0:
+		return nil
+	case 1:
+		for _, e := range pendingInbounds {
+			return e
+		}
+	}
+	var best *inboundEntry
+	for _, e := range pendingInbounds {
+		if best == nil || e.startTime.After(best.startTime) {
+			best = e
+		}
+	}
+	return best
+}
+
+// startPendingInboundTTL launches a background goroutine that evicts zombie entries
+// (requests that never completed, e.g. due to agent crash or timeout).
+func startPendingInboundTTL() {
+	go func() {
+		ticker := time.NewTicker(pendingInboundTTL)
+		defer ticker.Stop()
+		for range ticker.C {
+			cutoff := time.Now().Add(-pendingInboundTTL)
+			activeInboundMu.Lock()
+			for id, e := range pendingInbounds {
+				if e.startTime.Before(cutoff) {
+					delete(pendingInbounds, id)
+					log.Printf("[OTEL] Evicted zombie pending inbound %s (age > %v)", id, pendingInboundTTL)
+				}
+			}
+			activeInboundMu.Unlock()
+		}
+	}()
+}
 
 const maxResponseBodyBytes = 1 * 1024 * 1024
 
@@ -300,6 +350,7 @@ type otelStreamState struct {
 	hasDestName   bool          // true when destination.name was resolved from path hint or registry
 	hasSystemName bool          // true when gen_ai.system was resolved from path hint or registry
 	inboundEntry  *inboundEntry // non-nil for inbound streams; shared pointer for session.id propagation
+	pendingID     string        // key in pendingInbounds; used for cleanup on response-end or stream close
 }
 
 func truncateString(s string, maxBytes int) string {
@@ -416,6 +467,12 @@ func (p *processor) handleInbound(headers *core.HeaderMap) (*v3.ProcessingRespon
 			}
 		}
 	}
+	// x-telemetry-caller is injected by the sending sidecar (see handleOutbound) and is
+	// infrastructure-owned. Use it as source.name when JWT azp is not present.
+	callerHeader := getHeaderValue(headers.Headers, "x-telemetry-caller")
+	if callerHeader != "" && sourceService == "" {
+		sourceService = callerHeader
+	}
 
 	// Extract traceparent + W3C baggage (upstream sidecar may have injected session.id).
 	prop := propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{})
@@ -460,7 +517,7 @@ func (p *processor) handleInbound(headers *core.HeaderMap) (*v3.ProcessingRespon
 	}
 	span.SetAttributes(attrs...)
 
-	entry := &inboundEntry{ctx: spanCtx}
+	entry := &inboundEntry{ctx: spanCtx, startTime: time.Now()}
 	// Upstream sidecar may have injected session.id via W3C Baggage; pick it up immediately
 	// so outbound calls made before body parsing can already carry the session ID.
 	if m := baggage.FromContext(parentCtx).Member("session.id"); m.Key() != "" {
@@ -470,18 +527,19 @@ func (p *processor) handleInbound(headers *core.HeaderMap) (*v3.ProcessingRespon
 			attribute.String("session.id", m.Value()),
 		)
 	}
+	pendingID := uuid.New().String()
 	traceID := span.SpanContext().TraceID()
 	activeInboundMu.Lock()
 	traceInbound[traceID] = entry
-	activeInbound = entry
+	pendingInbounds[pendingID] = entry
 	activeInboundMu.Unlock()
 
-	otelState := &otelStreamState{span: span, ctx: spanCtx, isInbound: true, inboundEntry: entry}
-	log.Printf("[OTEL] Started span %s for user %q", spanName, userID)
+	otelState := &otelStreamState{span: span, ctx: spanCtx, isInbound: true, inboundEntry: entry, pendingID: pendingID}
+	log.Printf("[OTEL] Started span %s for user %q (pendingID=%s)", spanName, userID, pendingID)
 
 	// Inject our traceparent into the inbound request so OTel-instrumented agents inherit
 	// this trace-id. handleOutbound can then look up the inbound entry by trace-id, giving
-	// correct session.id under concurrent requests without relying on the timing-based global.
+	// correct session.id under concurrent requests without relying on timing.
 	injectCarrier := &headerCarrier{headers: headers.Headers, injected: make(map[string]string)}
 	propagation.TraceContext{}.Inject(spanCtx, injectCarrier)
 	var injectHeaders []*core.HeaderValueOption
@@ -495,7 +553,11 @@ func (p *processor) handleInbound(headers *core.HeaderMap) (*v3.ProcessingRespon
 		Response: &v3.ProcessingResponse_RequestHeaders{
 			RequestHeaders: &v3.HeadersResponse{
 				Response: &v3.CommonResponse{
-					HeaderMutation: &v3.HeaderMutation{SetHeaders: injectHeaders},
+					HeaderMutation: &v3.HeaderMutation{
+						SetHeaders: injectHeaders,
+						// Strip the sidecar-to-sidecar caller header before forwarding to the app.
+						RemoveHeaders: []string{"x-telemetry-caller"},
+					},
 				},
 			},
 		},
@@ -557,18 +619,19 @@ func (p *processor) handleOutbound(headers *core.HeaderMap) (*v3.ProcessingRespo
 			// matching the flat network-level view rather than nesting under SDK spans.
 			parentCtx = e.ctx
 			sessionID = e.sessionID
-		} else if activeInbound != nil {
+		} else if e := pickPendingInbound(); e != nil {
 			// Agent's traceparent is from a foreign trace (e.g. MLflow auto-instrumentation) →
-			// re-parent to the active inbound span so outbound stays in the same thread.
-			parentCtx = activeInbound.ctx
-			sessionID = activeInbound.sessionID
+			// re-parent to the best pending inbound (deterministic when unambiguous).
+			parentCtx = e.ctx
+			sessionID = e.sessionID
 		} else {
 			parentCtx = extractedCtx
 		}
-	} else if activeInbound != nil {
-		// Non-OTel agent: fall back to timing-based global (safe for sequential agents).
-		parentCtx = activeInbound.ctx
-		sessionID = activeInbound.sessionID
+	} else if e := pickPendingInbound(); e != nil {
+		// Non-OTel agent: use pending inbound set — deterministic when exactly one request
+		// is in-flight, heuristic (most-recent) under true concurrency.
+		parentCtx = e.ctx
+		sessionID = e.sessionID
 	}
 	activeInboundMu.Unlock()
 	// Baggage session.id from upstream sidecar (2nd+ agent in chain) takes highest precedence.
@@ -662,6 +725,14 @@ func (p *processor) handleOutbound(headers *core.HeaderMap) (*v3.ProcessingRespo
 	for k, v := range carrier.injected {
 		setHeaders = append(setHeaders, &core.HeaderValueOption{
 			Header: &core.HeaderValue{Key: k, RawValue: []byte(v)},
+		})
+	}
+	// Stamp the sender's identity on every outbound request. This is infrastructure-owned
+	// (injected by the sidecar, not the app) and stripped by the receiving sidecar's inbound
+	// handler before forwarding to the target app, so it cannot be forged by app code.
+	if agentServiceName != "" {
+		setHeaders = append(setHeaders, &core.HeaderValueOption{
+			Header: &core.HeaderValue{Key: "x-telemetry-caller", RawValue: []byte(agentServiceName)},
 		})
 	}
 
@@ -985,8 +1056,8 @@ func (p *processor) handleResponseBody(body *v3.HttpBody, state *otelStreamState
 		if state.isInbound {
 			activeInboundMu.Lock()
 			delete(traceInbound, state.span.SpanContext().TraceID())
-			if activeInbound == state.inboundEntry {
-				activeInbound = nil
+			if state.pendingID != "" {
+				delete(pendingInbounds, state.pendingID)
 			}
 			activeInboundMu.Unlock()
 		}
@@ -1044,8 +1115,8 @@ func (p *processor) Process(stream v3.ExternalProcessor_ProcessServer) error {
 			if otelState.isInbound {
 				activeInboundMu.Lock()
 				delete(traceInbound, otelState.span.SpanContext().TraceID())
-				if activeInbound == otelState.inboundEntry {
-					activeInbound = nil
+				if otelState.pendingID != "" {
+					delete(pendingInbounds, otelState.pendingID)
 				}
 				activeInboundMu.Unlock()
 			}
@@ -1151,6 +1222,7 @@ func main() {
 			agentServiceName = resolveAgentServiceName()
 			initLocalPodIP()
 			initLLMRegistry()
+			startPendingInboundTTL()
 			log.Printf("[OTEL] Enabled, exporting spans to %s (service: otel-sidecar, agent: %s, podIP: %s)", otelEndpoint, agentServiceName, localPodIP)
 		}
 	} else {
