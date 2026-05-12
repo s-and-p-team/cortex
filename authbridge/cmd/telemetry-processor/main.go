@@ -43,9 +43,10 @@ var localPodIP string
 // sessionID is written once after request body parsing (before the agent makes any outbound
 // calls, guaranteed by Envoy's BUFFERED request body mode) and read by outbound streams.
 type inboundEntry struct {
-	ctx       context.Context
-	sessionID string
-	startTime time.Time // for TTL eviction and recency ordering
+	ctx         context.Context
+	sessionID   string
+	principalID string // original authorizing principal (from JWT sub), propagated immutably
+	startTime   time.Time // for TTL eviction and recency ordering
 }
 
 // pendingInbounds holds all currently in-flight inbound requests keyed by a sidecar-generated
@@ -484,7 +485,7 @@ func (p *processor) handleInbound(headers *core.HeaderMap) (*v3.ProcessingRespon
 		return passthrough, nil
 	}
 
-	var userID, sourceService string
+	var userID, sourceService, principalID string
 	authHeader := getHeaderValue(headers.Headers, "authorization")
 	if authHeader != "" {
 		tokenString := strings.TrimPrefix(authHeader, "Bearer ")
@@ -495,6 +496,13 @@ func (p *processor) handleInbound(headers *core.HeaderMap) (*v3.ProcessingRespon
 			} else if sub, ok := claims["sub"].(string); ok {
 				userID = sub
 			}
+			if sub, ok := claims["sub"].(string); ok && sub != "" {
+				principalID = sub
+			}
+			// Fall back to preferred_username when sub is absent (e.g., certain Keycloak clients)
+			if principalID == "" && userID != "" {
+				principalID = userID
+			}
 			if azp, ok := claims["azp"].(string); ok {
 				sourceService = azp
 			}
@@ -502,9 +510,27 @@ func (p *processor) handleInbound(headers *core.HeaderMap) (*v3.ProcessingRespon
 	}
 	// x-telemetry-caller is injected by the sending sidecar (see handleOutbound) and is
 	// infrastructure-owned. Use it as source.name when JWT azp is not present.
+	// Fall back to X-Kagenti-From, which the A2A client interceptor stamps on every
+	// outbound message/send and message/sendSubscribe call. It is app-level (not
+	// infrastructure-owned) but sufficient for telemetry when the sidecar header is absent.
 	callerHeader := getHeaderValue(headers.Headers, "x-telemetry-caller")
+	if callerHeader == "" {
+		callerHeader = getHeaderValue(headers.Headers, "x-kagenti-from")
+	}
 	if callerHeader != "" && sourceService == "" {
 		sourceService = callerHeader
+	}
+	// If an upstream sidecar already stamped x-principal-id, propagate it unchanged.
+	// callerHeader presence indicates the request came from a peer sidecar (not a raw client),
+	// making the incoming principal trustworthy for propagation purposes.
+	if incomingPID := getHeaderValue(headers.Headers, "x-principal-id"); incomingPID != "" && callerHeader != "" {
+		principalID = incomingPID
+	}
+	// x-caller-id is the trust-facing sender identity (see handleOutbound).
+	// Fall back to x-telemetry-caller which carries the equivalent value.
+	callerID := getHeaderValue(headers.Headers, "x-caller-id")
+	if callerID == "" {
+		callerID = callerHeader
 	}
 
 	// Extract traceparent + W3C baggage (upstream sidecar may have injected session.id).
@@ -550,7 +576,27 @@ func (p *processor) handleInbound(headers *core.HeaderMap) (*v3.ProcessingRespon
 	}
 	span.SetAttributes(attrs...)
 
-	entry := &inboundEntry{ctx: spanCtx, startTime: time.Now()}
+	// Trust provenance attributes consumed by the lineage service.
+	var trustAttrs []attribute.KeyValue
+	if principalID != "" {
+		trustAttrs = append(trustAttrs, attribute.String("trust.principal_id", principalID))
+	}
+	if callerID != "" {
+		trustAttrs = append(trustAttrs, attribute.String("trust.caller_id", callerID))
+	}
+	if agentServiceName != "" {
+		trustAttrs = append(trustAttrs, attribute.String("trust.target_id", agentServiceName))
+	}
+	if callerID == "" {
+		trustAttrs = append(trustAttrs, attribute.String("trust.hop_kind", "principal_to_agent"))
+	} else {
+		trustAttrs = append(trustAttrs, attribute.String("trust.hop_kind", "agent_to_agent"))
+	}
+	if len(trustAttrs) > 0 {
+		span.SetAttributes(trustAttrs...)
+	}
+
+	entry := &inboundEntry{ctx: spanCtx, principalID: principalID, startTime: time.Now()}
 	// Upstream sidecar may have injected session.id via W3C Baggage; pick it up immediately
 	// so outbound calls made before body parsing can already carry the session ID.
 	if m := baggage.FromContext(parentCtx).Member("session.id"); m.Key() != "" {
@@ -581,6 +627,13 @@ func (p *processor) handleInbound(headers *core.HeaderMap) (*v3.ProcessingRespon
 			Header: &core.HeaderValue{Key: k, RawValue: []byte(v)},
 		})
 	}
+	// Stamp sidecar-owned trust headers. We always strip first (RemoveHeaders below) then
+	// re-inject so that app-supplied values cannot be forwarded to downstream services.
+	if principalID != "" {
+		injectHeaders = append(injectHeaders, &core.HeaderValueOption{
+			Header: &core.HeaderValue{Key: "x-principal-id", RawValue: []byte(principalID)},
+		})
+	}
 
 	return &v3.ProcessingResponse{
 		Response: &v3.ProcessingResponse_RequestHeaders{
@@ -588,8 +641,9 @@ func (p *processor) handleInbound(headers *core.HeaderMap) (*v3.ProcessingRespon
 				Response: &v3.CommonResponse{
 					HeaderMutation: &v3.HeaderMutation{
 						SetHeaders: injectHeaders,
-						// Strip the sidecar-to-sidecar caller header before forwarding to the app.
-						RemoveHeaders: []string{"x-telemetry-caller"},
+						// Strip sidecar-to-sidecar headers before forwarding to the app.
+						// x-principal-id is stripped then re-injected above (our value wins).
+						RemoveHeaders: []string{"x-telemetry-caller", "x-principal-id", "x-caller-id"},
 					},
 				},
 			},
@@ -644,6 +698,7 @@ func (p *processor) handleOutbound(headers *core.HeaderMap) (*v3.ProcessingRespo
 
 	var parentCtx context.Context
 	var sessionID string
+	var principalID string
 	activeInboundMu.Lock()
 	if sc := trace.SpanFromContext(extractedCtx).SpanContext(); sc.IsValid() {
 		if e, ok := traceInbound[sc.TraceID()]; ok {
@@ -652,11 +707,13 @@ func (p *processor) handleOutbound(headers *core.HeaderMap) (*v3.ProcessingRespo
 			// matching the flat network-level view rather than nesting under SDK spans.
 			parentCtx = e.ctx
 			sessionID = e.sessionID
+			principalID = e.principalID
 		} else if e := pickPendingInbound(); e != nil {
 			// Agent's traceparent is from a foreign trace (e.g. MLflow auto-instrumentation) →
 			// re-parent to the best pending inbound (deterministic when unambiguous).
 			parentCtx = e.ctx
 			sessionID = e.sessionID
+			principalID = e.principalID
 		} else {
 			parentCtx = extractedCtx
 		}
@@ -665,6 +722,7 @@ func (p *processor) handleOutbound(headers *core.HeaderMap) (*v3.ProcessingRespo
 		// is in-flight, heuristic (most-recent) under true concurrency.
 		parentCtx = e.ctx
 		sessionID = e.sessionID
+		principalID = e.principalID
 	}
 	activeInboundMu.Unlock()
 	// Baggage session.id from upstream sidecar (2nd+ agent in chain) takes highest precedence.
@@ -742,6 +800,29 @@ func (p *processor) handleOutbound(headers *core.HeaderMap) (*v3.ProcessingRespo
 		)
 	}
 
+	// Trust provenance attributes consumed by the lineage service.
+	var trustHopKind string
+	switch spanKind {
+	case "LLM":
+		trustHopKind = "agent_to_llm"
+	case "TOOL":
+		trustHopKind = "agent_to_tool"
+	default:
+		trustHopKind = "agent_to_agent"
+	}
+	var outboundTrustAttrs []attribute.KeyValue
+	if principalID != "" {
+		outboundTrustAttrs = append(outboundTrustAttrs, attribute.String("trust.principal_id", principalID))
+	}
+	if agentServiceName != "" {
+		outboundTrustAttrs = append(outboundTrustAttrs, attribute.String("trust.caller_id", agentServiceName))
+	}
+	if destShortName != "" {
+		outboundTrustAttrs = append(outboundTrustAttrs, attribute.String("trust.target_id", destShortName))
+	}
+	outboundTrustAttrs = append(outboundTrustAttrs, attribute.String("trust.hop_kind", trustHopKind))
+	span.SetAttributes(outboundTrustAttrs...)
+
 	var injectCtx context.Context = spanCtx
 	if sessionID != "" {
 		if m, err := baggage.NewMember("session.id", sessionID); err == nil {
@@ -760,12 +841,20 @@ func (p *processor) handleOutbound(headers *core.HeaderMap) (*v3.ProcessingRespo
 			Header: &core.HeaderValue{Key: k, RawValue: []byte(v)},
 		})
 	}
-	// Stamp the sender's identity on every outbound request. This is infrastructure-owned
+	// Stamp the sender's identity on every outbound request. These headers are infrastructure-owned
 	// (injected by the sidecar, not the app) and stripped by the receiving sidecar's inbound
-	// handler before forwarding to the target app, so it cannot be forged by app code.
+	// handler before forwarding to the target app, so they cannot be forged by app code.
 	if agentServiceName != "" {
 		setHeaders = append(setHeaders, &core.HeaderValueOption{
 			Header: &core.HeaderValue{Key: "x-telemetry-caller", RawValue: []byte(agentServiceName)},
+		})
+		setHeaders = append(setHeaders, &core.HeaderValueOption{
+			Header: &core.HeaderValue{Key: "x-caller-id", RawValue: []byte(agentServiceName)},
+		})
+	}
+	if principalID != "" {
+		setHeaders = append(setHeaders, &core.HeaderValueOption{
+			Header: &core.HeaderValue{Key: "x-principal-id", RawValue: []byte(principalID)},
 		})
 	}
 
