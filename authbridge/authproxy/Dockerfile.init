@@ -1,8 +1,10 @@
 FROM docker.io/library/alpine:3.23
 
-# Installs both iptables-legacy and iptables-nft; init-iptables.sh auto-detects
-# the correct backend at runtime (prefers legacy for Kind/kubeadm compatibility)
-RUN apk add --no-cache iptables
+# Install both iptables-nft and iptables-legacy; init-iptables.sh auto-detects
+# the correct backend at runtime (prefers legacy for Kind/kubeadm compatibility).
+# The separate 'iptables-legacy' package is required — Alpine's base 'iptables'
+# only provides nft binaries since Alpine 3.20+.
+RUN apk add --no-cache iptables iptables-legacy
 
 COPY init-iptables.sh /usr/local/bin/init-iptables.sh
 

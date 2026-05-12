@@ -11,7 +11,9 @@ that doesn't require token exchange. For a more advanced demo showing outbound
 token exchange and scope-based access control, see the
 [GitHub Issue Agent demo](../github-issue/demo.md). For the same weather images
 with **token exchange and AuthBridge on the tool** (plus a CI-style verify script),
-see [Weather Agent — Advanced](demo-ui-advanced.md).
+see [Weather Agent — Advanced](demo-ui-advanced.md). To observe the
+plugin pipeline in real time while chatting with the agent, see
+[Weather Agent with `abctl`](demo-with-abctl.md).
 
 ## What This Demo Shows
 
@@ -665,21 +667,17 @@ without redeploying.
 
 ### Toggle debug logging at runtime
 
-Send `SIGUSR1` to the authbridge process using an ephemeral debug container:
+Send `SIGUSR1` to the authbridge process. The container image is minimal (no
+standalone `kill` or `grep` binaries), so use bash builtins to locate the PID:
 
 ```bash
-POD=$(kubectl get pod -n team1 -l app.kubernetes.io/name=weather-service \
-  --no-headers | grep Running | head -1 | awk '{print $1}')
-
 # For envoy-sidecar mode:
-kubectl debug -n team1 "$POD" \
-  --image=ghcr.io/kagenti/kagenti-extensions/proxy-init:latest \
-  --target=envoy-proxy -- kill -USR1 1
+kubectl exec deploy/weather-service -n team1 -c envoy-proxy -- \
+  bash -c 'for f in /proc/[0-9]*/cmdline; do [ -r "$f" ] || continue; c=$(<"$f"); [[ "$c" == /usr/local/bin/authbridge* ]] && kill -USR1 "${f//[!0-9]/}" && break; done'
 
 # For proxy-sidecar mode:
-kubectl debug -n team1 "$POD" \
-  --image=ghcr.io/kagenti/kagenti-extensions/proxy-init:latest \
-  --target=authbridge-proxy -- kill -USR1 1
+kubectl exec deploy/weather-service -n team1 -c authbridge-proxy -- \
+  bash -c 'for f in /proc/[0-9]*/cmdline; do [ -r "$f" ] || continue; c=$(<"$f"); [[ "$c" == /usr/local/bin/authbridge* ]] && kill -USR1 "${f//[!0-9]/}" && break; done'
 ```
 
 Send `SIGUSR1` again to toggle back to INFO level.

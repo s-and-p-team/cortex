@@ -1,5 +1,5 @@
 # AuthBridge Demo Deployment (No SPIFFE)
-# 
+#
 # This is a simplified version that doesn't require SPIRE.
 # The caller uses a static client ID instead of SPIFFE ID.
 #
@@ -117,6 +117,7 @@ data:
                   grpc_service:
                     envoy_grpc:
                       cluster_name: go_processor
+                  allow_mode_override: true
                   processing_mode:
                     request_header_mode: SEND
                     response_header_mode: SEND
@@ -303,10 +304,10 @@ spec:
               while [ ! -f /shared/client-secret.txt ] || [ ! -f /shared/client-id.txt ]; do
                 sleep 2
               done
-              
+
               CLIENT_ID=$(cat /shared/client-id.txt)
               CLIENT_SECRET=$(cat /shared/client-secret.txt)
-              
+
               echo ""
               echo "============================================"
               echo "Client registered with Keycloak!"

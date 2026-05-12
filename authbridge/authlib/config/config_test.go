@@ -1,10 +1,15 @@
 package config
 
 import (
+	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/kagenti/kagenti-extensions/authbridge/authlib/pipeline"
 )
 
 // --- Preset Tests ---
@@ -12,67 +17,44 @@ import (
 func TestApplyPreset_EnvoySidecar(t *testing.T) {
 	cfg := &Config{Mode: ModeEnvoySidecar}
 	ApplyPreset(cfg)
-	if cfg.Identity.Type != "spiffe" {
-		t.Errorf("identity.type = %q, want spiffe", cfg.Identity.Type)
-	}
-	if cfg.Outbound.DefaultPolicy != "passthrough" {
-		t.Errorf("default_policy = %q, want passthrough", cfg.Outbound.DefaultPolicy)
-	}
 	if cfg.Listener.ExtProcAddr != ":9090" {
 		t.Errorf("ext_proc_addr = %q, want :9090", cfg.Listener.ExtProcAddr)
 	}
-	if len(cfg.Bypass.InboundPaths) == 0 {
-		t.Error("expected default bypass paths")
+	if cfg.Listener.SessionAPIAddr != ":9094" {
+		t.Errorf("session_api_addr = %q, want :9094", cfg.Listener.SessionAPIAddr)
 	}
 }
 
 func TestApplyPreset_Waypoint(t *testing.T) {
 	cfg := &Config{Mode: ModeWaypoint}
 	ApplyPreset(cfg)
-	if cfg.Identity.Type != "client-secret" {
-		t.Errorf("identity.type = %q, want client-secret", cfg.Identity.Type)
+	if cfg.Listener.ExtAuthzAddr != ":9090" {
+		t.Errorf("ext_authz_addr = %q, want :9090", cfg.Listener.ExtAuthzAddr)
 	}
-	if cfg.Outbound.DefaultPolicy != "exchange" {
-		t.Errorf("default_policy = %q, want exchange", cfg.Outbound.DefaultPolicy)
+	if cfg.Listener.ForwardProxyAddr != ":8080" {
+		t.Errorf("forward_proxy_addr = %q, want :8080", cfg.Listener.ForwardProxyAddr)
 	}
 }
 
 func TestApplyPreset_ProxySidecar(t *testing.T) {
 	cfg := &Config{Mode: ModeProxySidecar}
 	ApplyPreset(cfg)
-	if cfg.Identity.Type != "spiffe" {
-		t.Errorf("identity.type = %q, want spiffe", cfg.Identity.Type)
-	}
 	if cfg.Listener.ReverseProxyAddr != ":8080" {
 		t.Errorf("reverse_proxy_addr = %q, want :8080", cfg.Listener.ReverseProxyAddr)
+	}
+	if cfg.Listener.ForwardProxyAddr != ":8081" {
+		t.Errorf("forward_proxy_addr = %q, want :8081", cfg.Listener.ForwardProxyAddr)
 	}
 }
 
 func TestApplyPreset_UserOverride(t *testing.T) {
 	cfg := &Config{
-		Mode: ModeEnvoySidecar,
-		Identity: IdentityConfig{Type: "client-secret"}, // user override
+		Mode:     ModeEnvoySidecar,
+		Listener: ListenerConfig{ExtProcAddr: ":19090"}, // user override
 	}
 	ApplyPreset(cfg)
-	if cfg.Identity.Type != "client-secret" {
-		t.Errorf("user override lost: identity.type = %q", cfg.Identity.Type)
-	}
-}
-
-func TestNoTokenPolicyForMode(t *testing.T) {
-	tests := []struct {
-		mode   string
-		want string
-	}{
-		{ModeEnvoySidecar, "client-credentials"},
-		{ModeWaypoint, "allow"},
-		{ModeProxySidecar, "deny"},
-		{"unknown", "deny"},
-	}
-	for _, tt := range tests {
-		if got := NoTokenPolicyForMode(tt.mode); got != tt.want {
-			t.Errorf("NoTokenPolicyForMode(%q) = %q, want %q", tt.mode, got, tt.want)
-		}
+	if cfg.Listener.ExtProcAddr != ":19090" {
+		t.Errorf("user override lost: ext_proc_addr = %q", cfg.Listener.ExtProcAddr)
 	}
 }
 
@@ -92,77 +74,126 @@ func TestValidate_InvalidMode(t *testing.T) {
 	}
 }
 
-func TestValidate_MissingRequired(t *testing.T) {
-	base := Config{
-		Mode:     ModeWaypoint,
-		Identity: IdentityConfig{Type: "client-secret", ClientID: "c", ClientSecret: "s"},
-	}
-
-	// Missing issuer
-	cfg := base
-	cfg.Inbound = InboundConfig{JWKSURL: "http://jwks"}
-	cfg.Outbound = OutboundConfig{TokenURL: "http://token"}
-	if err := Validate(&cfg); err == nil {
-		t.Error("expected error for missing issuer")
-	}
-
-	// Missing jwks_url
-	cfg = base
-	cfg.Inbound = InboundConfig{Issuer: "http://issuer"}
-	cfg.Outbound = OutboundConfig{TokenURL: "http://token"}
-	if err := Validate(&cfg); err == nil {
-		t.Error("expected error for missing jwks_url")
-	}
-
-	// Missing token_url
-	cfg = base
-	cfg.Inbound = InboundConfig{JWKSURL: "http://jwks", Issuer: "http://issuer"}
-	if err := Validate(&cfg); err == nil {
-		t.Error("expected error for missing token_url")
-	}
-}
-
-func TestValidate_SpiffeIdentityRequiresPath(t *testing.T) {
-	cfg := validEnvoySidecarConfig()
-	cfg.Identity = IdentityConfig{Type: "spiffe"}
-	if err := Validate(cfg); err == nil {
-		t.Error("expected error for spiffe without path")
-	}
-}
-
 func TestValidate_InvalidListenerCombo(t *testing.T) {
-	cfg := validEnvoySidecarConfig()
-	cfg.Listener.ReverseProxyAddr = ":8080" // invalid for envoy-sidecar
+	cfg := &Config{
+		Mode:     ModeEnvoySidecar,
+		Listener: ListenerConfig{ReverseProxyAddr: ":8080"}, // invalid for envoy-sidecar
+	}
 	if err := Validate(cfg); err == nil {
 		t.Error("expected error for envoy-sidecar + reverse_proxy_addr")
 	}
 }
 
 func TestValidate_WaypointRejectsExtProc(t *testing.T) {
-	cfg := validWaypointConfig()
-	cfg.Listener.ExtProcAddr = ":9090"
+	cfg := &Config{
+		Mode:     ModeWaypoint,
+		Listener: ListenerConfig{ExtProcAddr: ":9090"},
+	}
 	if err := Validate(cfg); err == nil {
 		t.Error("expected error for waypoint + ext_proc_addr")
 	}
 }
 
 func TestValidate_ProxySidecarRequiresBackend(t *testing.T) {
-	cfg := validProxySidecarConfig()
-	cfg.Listener.ReverseProxyBackend = ""
+	cfg := &Config{Mode: ModeProxySidecar}
 	if err := Validate(cfg); err == nil {
 		t.Error("expected error for proxy-sidecar without backend")
 	}
 }
 
-func TestValidate_ValidConfig(t *testing.T) {
+func TestValidate_ValidConfigs(t *testing.T) {
+	withPipeline := func(c *Config) *Config {
+		c.Pipeline = PipelineConfig{
+			Inbound:  PipelineStageConfig{Plugins: []PluginEntry{{Name: "jwt-validation"}}},
+			Outbound: PipelineStageConfig{Plugins: []PluginEntry{{Name: "token-exchange"}}},
+		}
+		return c
+	}
 	for _, cfg := range []*Config{
-		validEnvoySidecarConfig(),
-		validWaypointConfig(),
-		validProxySidecarConfig(),
+		withPipeline(&Config{Mode: ModeEnvoySidecar}),
+		withPipeline(&Config{Mode: ModeWaypoint}),
+		withPipeline(&Config{Mode: ModeProxySidecar, Listener: ListenerConfig{ReverseProxyBackend: "http://upstream"}}),
 	} {
 		if err := Validate(cfg); err != nil {
 			t.Errorf("unexpected error for mode %s: %v", cfg.Mode, err)
 		}
+	}
+}
+
+// TestValidate_EmptyPipelineRejected guards the "open proxy" failure
+// mode: before this check, an operator who kept the pre-migration
+// top-level schema (inbound:, outbound:, identity:, bypass:, routes:)
+// in their ConfigMap would upgrade the image, land on a config where
+// yaml.v3 silently dropped the unknown top-level keys, end up with an
+// empty Pipeline, and boot successfully. Listeners would then run
+// pipelines with zero plugins — every request would pass through
+// without JWT validation or token exchange.
+//
+// Empty pipelines being a configuration error forces the operator to
+// either migrate to the new shape or leave the old image tagged. The
+// error message names the offending section and points at the new
+// schema.
+func TestValidate_EmptyPipelineRejected(t *testing.T) {
+	cfg := &Config{Mode: ModeEnvoySidecar}
+	err := Validate(cfg)
+	if err == nil {
+		t.Fatal("expected error for empty pipeline")
+	}
+	if !strings.Contains(err.Error(), "pipeline.inbound.plugins is empty") {
+		t.Errorf("error does not name the offending section: %q", err)
+	}
+}
+
+func TestValidate_EmptyOutboundPipelineRejected(t *testing.T) {
+	cfg := &Config{
+		Mode: ModeEnvoySidecar,
+		Pipeline: PipelineConfig{
+			Inbound: PipelineStageConfig{Plugins: []PluginEntry{{Name: "jwt-validation"}}},
+			// Outbound intentionally empty
+		},
+	}
+	err := Validate(cfg)
+	if err == nil {
+		t.Fatal("expected error for empty outbound pipeline")
+	}
+	if !strings.Contains(err.Error(), "pipeline.outbound.plugins is empty") {
+		t.Errorf("error does not name the offending section: %q", err)
+	}
+}
+
+// PluginEntry's UnmarshalYAML treats `config: null` as no config at
+// all. A literal null must not be forwarded to Configurable-gate as
+// four bytes "null" — that would spuriously reject non-Configurable
+// plugins that the operator explicitly authored with a null config
+// (e.g. to emphasize "no settings").
+func TestPluginEntry_NullConfigIsTreatedAsUnset(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := `mode: envoy-sidecar
+pipeline:
+  inbound:
+    plugins:
+      - name: jwt-validation
+      - name: a2a-parser
+        config: null
+  outbound:
+    plugins:
+      - token-exchange
+`
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	entries := cfg.Pipeline.Inbound.Plugins
+	if len(entries) != 2 {
+		t.Fatalf("entries len = %d, want 2", len(entries))
+	}
+	if len(entries[1].Config) != 0 {
+		t.Errorf("a2a-parser Config = %q, want empty after config: null normalization",
+			entries[1].Config)
 	}
 }
 
@@ -172,21 +203,14 @@ func TestLoad(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")
 	content := `mode: waypoint
-inbound:
-  jwks_url: "${TEST_JWKS_URL}"
-  issuer: "http://issuer"
-outbound:
-  token_url: "http://token"
-identity:
-  type: client-secret
-  client_id: "svc"
-  client_secret: "secret"
+listener:
+  ext_authz_addr: "${TEST_ADDR}"
 `
 	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
 		t.Fatal(err)
 	}
-	os.Setenv("TEST_JWKS_URL", "http://expanded-jwks")
-	defer os.Unsetenv("TEST_JWKS_URL")
+	os.Setenv("TEST_ADDR", ":19090")
+	defer os.Unsetenv("TEST_ADDR")
 
 	cfg, err := Load(path)
 	if err != nil {
@@ -195,144 +219,297 @@ identity:
 	if cfg.Mode != ModeWaypoint {
 		t.Errorf("mode = %q, want waypoint", cfg.Mode)
 	}
-	if cfg.Inbound.JWKSURL != "http://expanded-jwks" {
-		t.Errorf("jwks_url = %q, want expanded value", cfg.Inbound.JWKSURL)
+	if cfg.Listener.ExtAuthzAddr != ":19090" {
+		t.Errorf("ext_authz_addr = %q, want expanded value", cfg.Listener.ExtAuthzAddr)
 	}
 }
 
-// --- RouteConfig backwards compat ---
+// --- PluginEntry YAML parsing ---
 
-func TestRouteConfig_LegacyPassthrough(t *testing.T) {
-	rc := RouteConfig{Host: "internal", Passthrough: true}
-	// Simulate what resolve.go does
-	action := rc.Action
-	if action == "" && rc.Passthrough {
-		action = "passthrough"
-	}
-	if action != "passthrough" {
-		t.Errorf("expected passthrough, got %q", action)
-	}
-}
-
-// --- Keycloak URL derivation ---
-
-func TestDeriveKeycloakURLs(t *testing.T) {
-	cfg := &Config{
-		Mode:     ModeWaypoint,
-		Outbound: OutboundConfig{KeycloakURL: "http://keycloak:8080", KeycloakRealm: "kagenti"},
-		Identity: IdentityConfig{Type: "client-secret", ClientID: "svc", ClientSecret: "secret"},
-	}
-	deriveKeycloakURLs(cfg)
-	if cfg.Outbound.TokenURL != "http://keycloak:8080/realms/kagenti/protocol/openid-connect/token" {
-		t.Errorf("token_url = %q", cfg.Outbound.TokenURL)
-	}
-	if cfg.Inbound.Issuer != "http://keycloak:8080/realms/kagenti" {
-		t.Errorf("issuer = %q", cfg.Inbound.Issuer)
-	}
-}
-
-func TestDeriveKeycloakURLs_ExplicitTakesPrecedence(t *testing.T) {
-	cfg := &Config{
-		Inbound:  InboundConfig{Issuer: "http://explicit-issuer"},
-		Outbound: OutboundConfig{TokenURL: "http://explicit-token", KeycloakURL: "http://keycloak:8080", KeycloakRealm: "kagenti"},
-	}
-	deriveKeycloakURLs(cfg)
-	if cfg.Outbound.TokenURL != "http://explicit-token" {
-		t.Errorf("explicit token_url should not be overridden, got %q", cfg.Outbound.TokenURL)
-	}
-	if cfg.Inbound.Issuer != "http://explicit-issuer" {
-		t.Errorf("explicit issuer should not be overridden, got %q", cfg.Inbound.Issuer)
-	}
-}
-
-// --- JWKS URL derivation ---
-
-func TestDeriveJWKSURL(t *testing.T) {
-	cfg := &Config{
-		Outbound: OutboundConfig{TokenURL: "http://keycloak:8080/realms/kagenti/protocol/openid-connect/token"},
-	}
-	deriveJWKSURL(cfg)
-	if cfg.Inbound.JWKSURL != "http://keycloak:8080/realms/kagenti/protocol/openid-connect/certs" {
-		t.Errorf("jwks_url = %q", cfg.Inbound.JWKSURL)
-	}
-}
-
-func TestDeriveJWKSURL_ExplicitTakesPrecedence(t *testing.T) {
-	cfg := &Config{
-		Inbound:  InboundConfig{JWKSURL: "http://explicit-jwks"},
-		Outbound: OutboundConfig{TokenURL: "http://keycloak:8080/realms/kagenti/protocol/openid-connect/token"},
-	}
-	deriveJWKSURL(cfg)
-	if cfg.Inbound.JWKSURL != "http://explicit-jwks" {
-		t.Errorf("explicit jwks_url should not be overridden, got %q", cfg.Inbound.JWKSURL)
-	}
-}
-
-// --- Credential file validation ---
-
-func TestValidate_ClientIDFile(t *testing.T) {
-	cfg := &Config{
-		Mode:     ModeWaypoint,
-		Inbound:  InboundConfig{JWKSURL: "http://jwks", Issuer: "http://issuer"},
-		Outbound: OutboundConfig{TokenURL: "http://token"},
-		Identity: IdentityConfig{Type: "client-secret", ClientIDFile: "/shared/client-id.txt", ClientSecretFile: "/shared/client-secret.txt"},
-	}
-	// Should pass validation — file paths accepted as alternatives
-	if err := Validate(cfg); err != nil {
-		t.Errorf("unexpected error: %v", err)
-	}
-}
-
-// --- Credential file reading ---
-
-func TestWaitAndReadFile(t *testing.T) {
+// Pipeline configs continue to accept bare plugin names. Bare names
+// mean "this plugin with no config," which is the right behavior for
+// parsers (a2a-parser / mcp-parser / inference-parser) — they don't
+// implement Configurable and have nothing to configure.
+func TestPluginEntry_BareStringForm(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "client-id.txt")
-	if err := os.WriteFile(path, []byte("  my-agent  \n"), 0600); err != nil {
+	path := filepath.Join(dir, "config.yaml")
+	content := `mode: envoy-sidecar
+pipeline:
+  inbound:
+    plugins:
+      - jwt-validation
+      - a2a-parser
+  outbound:
+    plugins:
+      - token-exchange
+`
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
 		t.Fatal(err)
 	}
-	var dest string
-	if err := waitAndReadFile(path, &dest, 5*time.Second); err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
 	}
-	if dest != "my-agent" {
-		t.Errorf("got %q, want trimmed value", dest)
+	inbound := cfg.Pipeline.Inbound.Plugins
+	if len(inbound) != 2 {
+		t.Fatalf("inbound len = %d, want 2", len(inbound))
+	}
+	if inbound[0].Name != "jwt-validation" || len(inbound[0].Config) != 0 {
+		t.Errorf("inbound[0] = %+v, want {jwt-validation, nil config}", inbound[0])
+	}
+	if inbound[1].Name != "a2a-parser" || len(inbound[1].Config) != 0 {
+		t.Errorf("inbound[1] = %+v, want {a2a-parser, nil config}", inbound[1])
 	}
 }
 
-func TestWaitForFile_Timeout(t *testing.T) {
-	err := waitForFile("/nonexistent/file", 1*time.Second)
+// The richer form captures config as a raw JSON subtree. The framework
+// doesn't interpret it; the plugin decodes against its own typed
+// struct. Assert the bytes round-trip the operator's YAML faithfully
+// (scalars preserved, nested maps intact) because that's the contract
+// plugins rely on for DisallowUnknownFields decoding.
+func TestPluginEntry_FullForm(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := `mode: envoy-sidecar
+pipeline:
+  inbound:
+    plugins:
+      - name: jwt-validation
+        id: jwt-validation
+        config:
+          issuer: "http://keycloak.example/realms/kagenti"
+          bypass_paths:
+            - /healthz
+            - /.well-known/*
+          nested:
+            count: 3
+            enabled: true
+`
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	entries := cfg.Pipeline.Inbound.Plugins
+	if len(entries) != 1 {
+		t.Fatalf("entries len = %d, want 1", len(entries))
+	}
+	e := entries[0]
+	if e.Name != "jwt-validation" || e.ID != "jwt-validation" {
+		t.Errorf("name/id = %q/%q, want jwt-validation/jwt-validation", e.Name, e.ID)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(e.Config, &decoded); err != nil {
+		t.Fatalf("config JSON parse: %v\nbytes: %s", err, e.Config)
+	}
+	if decoded["issuer"] != "http://keycloak.example/realms/kagenti" {
+		t.Errorf("issuer round-trip lost: %v", decoded["issuer"])
+	}
+	paths, ok := decoded["bypass_paths"].([]any)
+	if !ok || len(paths) != 2 {
+		t.Errorf("bypass_paths = %v, want 2-element list", decoded["bypass_paths"])
+	}
+	nested, ok := decoded["nested"].(map[string]any)
+	if !ok {
+		t.Fatalf("nested lost shape: %v", decoded["nested"])
+	}
+	if got, want := nested["count"], float64(3); got != want {
+		t.Errorf("nested.count = %v, want 3", got)
+	}
+	if nested["enabled"] != true {
+		t.Errorf("nested.enabled = %v, want true", nested["enabled"])
+	}
+}
+
+// ID stays empty when omitted; callers default to Name themselves (at
+// Build time, which this test does not exercise).
+func TestPluginEntry_IDOmittedStaysEmpty(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := `mode: envoy-sidecar
+pipeline:
+  inbound:
+    plugins:
+      - name: jwt-validation
+`
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	e := cfg.Pipeline.Inbound.Plugins[0]
+	if e.ID != "" {
+		t.Errorf("omitted id = %q, want empty (defaulting happens at Build)", e.ID)
+	}
+}
+
+// --- Credential file helpers ---
+
+func TestReadCredentialFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "client-id.txt")
+	if err := os.WriteFile(path, []byte("  my-client-id\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	v, err := ReadCredentialFile(path)
+	if err != nil {
+		t.Fatalf("ReadCredentialFile: %v", err)
+	}
+	if v != "my-client-id" {
+		t.Errorf("got %q, want %q (trimmed)", v, "my-client-id")
+	}
+}
+
+func TestReadCredentialFile_Missing(t *testing.T) {
+	_, err := ReadCredentialFile(filepath.Join(t.TempDir(), "does-not-exist"))
 	if err == nil {
-		t.Error("expected timeout error")
+		t.Error("expected error for missing file")
 	}
 }
 
-// --- Helpers ---
-
-func validEnvoySidecarConfig() *Config {
-	return &Config{
-		Mode:     ModeEnvoySidecar,
-		Inbound:  InboundConfig{JWKSURL: "http://jwks", Issuer: "http://issuer"},
-		Outbound: OutboundConfig{TokenURL: "http://token"},
-		Identity: IdentityConfig{Type: "spiffe", JWTSVIDPath: "/opt/svid.token", ClientID: "agent"},
+func TestReadCredentialFile_Empty(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "empty.txt")
+	if err := os.WriteFile(path, []byte{}, 0600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := ReadCredentialFile(path)
+	if err == nil {
+		t.Error("expected error for empty file")
 	}
 }
 
-func validWaypointConfig() *Config {
-	return &Config{
-		Mode:     ModeWaypoint,
-		Inbound:  InboundConfig{JWKSURL: "http://jwks", Issuer: "http://issuer"},
-		Outbound: OutboundConfig{TokenURL: "http://token"},
-		Identity: IdentityConfig{Type: "client-secret", ClientID: "svc", ClientSecret: "secret"},
+func TestWaitForCredentialFile_ContextCancel(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	_, err := WaitForCredentialFile(ctx, filepath.Join(t.TempDir(), "never"))
+	if err == nil {
+		t.Error("expected error when ctx cancels before file appears")
 	}
 }
 
-func validProxySidecarConfig() *Config {
-	return &Config{
-		Mode:     ModeProxySidecar,
-		Inbound:  InboundConfig{JWKSURL: "http://jwks", Issuer: "http://issuer"},
-		Outbound: OutboundConfig{TokenURL: "http://token"},
-		Identity: IdentityConfig{Type: "spiffe", JWTSVIDPath: "/opt/svid.token", ClientID: "agent"},
-		Listener: ListenerConfig{ReverseProxyBackend: "http://localhost:8081"},
+// TestWaitForCredentialFile_HeartbeatFires verifies that the
+// heartbeat log path is reachable while the file is absent. The actual
+// slog output isn't captured (stdlib slog has no test hook without a
+// handler swap) — this test just ensures the heartbeat branch in the
+// select loop is wired up, by lowering the interval and letting ctx
+// time out after a heartbeat has fired.
+func TestWaitForCredentialFile_HeartbeatFires(t *testing.T) {
+	orig := heartbeatInterval
+	heartbeatInterval = 50 * time.Millisecond
+	defer func() { heartbeatInterval = orig }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	// 200ms is enough for at least one heartbeat tick even under CI
+	// load. The assertion below is indirect: if the heartbeat branch
+	// panicked (missing slog import, nil deref on the ticker, etc.),
+	// the goroutine would crash and the test harness would surface it.
+	_, err := WaitForCredentialFile(ctx, filepath.Join(t.TempDir(), "never"))
+	if err == nil {
+		t.Error("expected error when ctx cancels before file appears")
+	}
+}
+
+// --- SessionConfig tri-state ---
+
+func TestSessionConfig_SessionEnabled(t *testing.T) {
+	trueP := func(b bool) *bool { return &b }
+
+	tests := []struct {
+		name string
+		cfg  SessionConfig
+		want bool
+	}{
+		{"unset defaults to true", SessionConfig{Enabled: nil}, true},
+		{"explicit true", SessionConfig{Enabled: trueP(true)}, true},
+		{"explicit false", SessionConfig{Enabled: trueP(false)}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.cfg.SessionEnabled(); got != tt.want {
+				t.Errorf("got %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestPluginEntry_OnError covers the three accepted policy values plus
+// the omitted case. An invalid policy must fail loud at YAML parse
+// time so operators catch typos before the pod boots.
+func TestPluginEntry_OnError(t *testing.T) {
+	cases := []struct {
+		name     string
+		yaml     string
+		want     pipeline.ErrorPolicy
+		wantFail bool
+	}{
+		{"enforce explicit", "enforce", pipeline.ErrorPolicyEnforce, false},
+		{"observe", "observe", pipeline.ErrorPolicyObserve, false},
+		{"off", "off", pipeline.ErrorPolicyOff, false},
+		{"typo rejected", "observer", "", true},
+		{"upper rejected", "ENFORCE", "", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "config.yaml")
+			content := "mode: envoy-sidecar\n" +
+				"pipeline:\n" +
+				"  inbound:\n" +
+				"    plugins:\n" +
+				"      - name: custom-guardrail\n" +
+				"        on_error: " + c.yaml + "\n"
+			if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := Load(path)
+			if c.wantFail {
+				if err == nil {
+					t.Fatalf("expected parse error for on_error=%q", c.yaml)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			got := cfg.Pipeline.Inbound.Plugins[0].OnError
+			if got != c.want {
+				t.Errorf("OnError = %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
+// TestPluginEntry_OnError_Omitted verifies the empty-string default.
+// Resolved() should treat an absent on_error as enforce; the parsed
+// field itself stays empty so round-tripping YAML doesn't invent a
+// value the operator didn't write.
+func TestPluginEntry_OnError_Omitted(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := "mode: envoy-sidecar\n" +
+		"pipeline:\n" +
+		"  inbound:\n" +
+		"    plugins:\n" +
+		"      - name: custom-guardrail\n"
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	got := cfg.Pipeline.Inbound.Plugins[0].OnError
+	if got != "" {
+		t.Errorf("omitted OnError parsed as %q, want empty", got)
+	}
+	if got.Resolved() != pipeline.ErrorPolicyEnforce {
+		t.Errorf("Resolved() of empty = %q, want enforce", got.Resolved())
 	}
 }

@@ -4,25 +4,36 @@
 package forwardproxy
 
 import (
-	"encoding/json"
+	"bytes"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
-	"github.com/kagenti/kagenti-extensions/authbridge/authlib/auth"
+	"github.com/kagenti/kagenti-extensions/authbridge/authlib/pipeline"
+	"github.com/kagenti/kagenti-extensions/authbridge/authlib/session"
 )
 
+const maxBodySize = 1 << 20 // 1MB — matches Envoy's default per_stream_buffer_limit_bytes
+
 // Server is an HTTP forward proxy that performs token exchange on outbound requests.
+//
+// OutboundPipeline is a holder so the bound pipeline can be hot-swapped
+// under the running listener; each handleRequest Loads through it so
+// in-flight requests finish on the pipeline they started with.
 type Server struct {
-	Auth   *auth.Auth
-	Client *http.Client
+	OutboundPipeline *pipeline.Holder
+	Sessions         *session.Store // nil when session tracking is disabled
+	Client           *http.Client
 }
 
 // NewServer creates a forward proxy server with a default HTTP client.
-func NewServer(a *auth.Auth) *Server {
+func NewServer(outbound *pipeline.Holder, sessions *session.Store) *Server {
 	return &Server{
-		Auth: a,
+		OutboundPipeline: outbound,
+		Sessions:         sessions,
 		Client: &http.Client{
 			Timeout: 30 * time.Second,
 			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
@@ -38,23 +49,86 @@ func (s *Server) Handler() http.Handler {
 }
 
 func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
-	// Reject CONNECT (HTTPS tunneling) — only handle plain HTTP
 	if r.Method == http.MethodConnect {
 		http.Error(w, `{"error":"HTTPS CONNECT not supported — only HTTP proxy"}`, http.StatusMethodNotAllowed)
 		return
 	}
 
-	result := s.Auth.HandleOutbound(r.Context(), r.Header.Get("Authorization"), r.Host)
+	pctx := &pipeline.Context{
+		Direction: pipeline.Outbound,
+		Scheme:    r.URL.Scheme,
+		Host:      r.Host,
+		Path:      r.URL.Path,
+		Headers:   r.Header.Clone(),
+		StartedAt: time.Now(),
+	}
 
-	switch result.Action {
-	case auth.ActionDeny:
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(result.DenyStatus)
-		body, _ := json.Marshal(map[string]string{"error": result.DenyReason})
-		w.Write(body)
+	// Finisher dispatch runs after every exit path. RunFinish is a
+	// no-op when pctx.dispatched is empty (pre-pipeline rejects), so
+	// this defer is safe on every path including the body-too-large
+	// early return.
+	defer func() {
+		s.OutboundPipeline.RunFinish(r.Context(), pctx, pipeline.OutcomeFromContext(pctx))
+	}()
+
+	if s.OutboundPipeline.NeedsBody() && r.Body != nil {
+		r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			slog.Warn("forward-proxy: request body too large or unreadable", "host", r.Host, "error", err)
+			http.Error(w, `{"error":"request body too large"}`, http.StatusRequestEntityTooLarge)
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		pctx.Body = body
+		slog.Debug("forward-proxy: buffered request body", "host", r.Host, "bodyLen", len(body))
+	}
+
+	if s.Sessions != nil {
+		if aid := s.Sessions.ActiveSession(); aid != "" {
+			pctx.Session = s.Sessions.View(aid)
+		}
+	}
+
+	originalAuth := pctx.Headers.Get("Authorization")
+	action := s.OutboundPipeline.Run(r.Context(), pctx)
+
+	if action.Type == pipeline.Reject {
+		s.recordOutboundReject(pctx, action)
+		writeRejection(w, action)
 		return
-	case auth.ActionReplaceToken:
-		r.Header.Set("Authorization", "Bearer "+result.Token)
+	}
+
+	if s.Sessions != nil {
+		sid := s.Sessions.ActiveSession()
+		if sid == "" {
+			sid = session.DefaultSessionID
+		}
+		ev := pipeline.SessionEvent{
+			At:        time.Now(),
+			Direction: pipeline.Outbound,
+			Phase:     pipeline.SessionRequest,
+			MCP:       pctx.Extensions.MCP,
+			Inference: pctx.Extensions.Inference,
+		}
+		if ev.MCP != nil || ev.Inference != nil {
+			s.Sessions.Append(sid, ev)
+		}
+	}
+
+	newAuth := pctx.Headers.Get("Authorization")
+	if newAuth != originalAuth {
+		r.Header.Set("Authorization", "Bearer "+extractBearer(newAuth))
+	}
+
+	// If a WritesBody plugin rewrote pctx.Body, ship the new bytes
+	// upstream and clear Content-Encoding (see forwardproxy response
+	// path for the rationale).
+	if pctx.BodyMutated() {
+		r.Body = io.NopCloser(bytes.NewReader(pctx.Body))
+		r.ContentLength = int64(len(pctx.Body))
+		r.Header.Set("Content-Length", fmt.Sprintf("%d", len(pctx.Body)))
+		r.Header.Del("Content-Encoding")
 	}
 
 	// Remove hop-by-hop headers
@@ -78,6 +152,61 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
+	// Response phase: populate pctx and run plugins in reverse order.
+	pctx.StatusCode = resp.StatusCode
+	pctx.ResponseHeaders = resp.Header.Clone()
+
+	if s.OutboundPipeline.NeedsBody() && resp.Body != nil {
+		respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxBodySize+1))
+		if err != nil {
+			slog.Warn("forward-proxy: response body read error", "host", r.Host, "error", err)
+			http.Error(w, `{"error":"response body read error"}`, http.StatusBadGateway)
+			return
+		}
+		if len(respBody) > maxBodySize {
+			slog.Warn("forward-proxy: response body too large", "host", r.Host, "len", len(respBody))
+			http.Error(w, `{"error":"response body too large"}`, http.StatusBadGateway)
+			return
+		}
+		pctx.ResponseBody = respBody
+		resp.Body = io.NopCloser(bytes.NewReader(respBody))
+	}
+
+	respAction := s.OutboundPipeline.RunResponse(r.Context(), pctx)
+	if respAction.Type == pipeline.Reject {
+		writeRejection(w, respAction)
+		return
+	}
+
+	// A plugin that called pctx.SetResponseBody flipped the mutation flag.
+	// Use the replaced bytes and rewrite Content-Length so the downstream
+	// client gets a consistent response. Content-Encoding is cleared
+	// because the framework can't know if the plugin also decompressed;
+	// safer to ship plain bytes than a broken archive.
+	if pctx.ResponseBodyMutated() {
+		resp.Body = io.NopCloser(bytes.NewReader(pctx.ResponseBody))
+		resp.ContentLength = int64(len(pctx.ResponseBody))
+		resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(pctx.ResponseBody)))
+		resp.Header.Del("Content-Encoding")
+	}
+
+	if s.Sessions != nil {
+		sid := s.Sessions.ActiveSession()
+		if sid == "" {
+			sid = session.DefaultSessionID
+		}
+		ev := pipeline.SessionEvent{
+			At:        time.Now(),
+			Direction: pipeline.Outbound,
+			Phase:     pipeline.SessionResponse,
+			MCP:       pctx.Extensions.MCP,
+			Inference: pctx.Extensions.Inference,
+		}
+		if ev.MCP != nil || ev.Inference != nil {
+			s.Sessions.Append(sid, ev)
+		}
+	}
+
 	for key, values := range resp.Header {
 		for _, value := range values {
 			w.Header().Add(key, value)
@@ -87,4 +216,70 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 	if _, err := io.Copy(w, resp.Body); err != nil {
 		slog.Debug("response copy error", "host", r.Host, "error", err)
 	}
+}
+
+// recordOutboundReject emits a SessionDenied event for outbound
+// requests a pipeline plugin rejected. Symmetric to the accept path's
+// session recording (above). Lets guardrail plugins (rate-limit,
+// intent-based, content policy) show operators what was blocked and
+// why via /v1/sessions and abctl, instead of the block appearing only
+// as a 4xx/5xx on the agent side.
+//
+// Skips when no Invocations were appended — the deny came from a
+// plugin that didn't contribute diagnostic context, and a content-free
+// SessionDenied event would be noise without attribution.
+func (s *Server) recordOutboundReject(pctx *pipeline.Context, action pipeline.Action) {
+	if s.Sessions == nil || pctx.Extensions.Invocations == nil {
+		return
+	}
+	sid := s.Sessions.ActiveSession()
+	if sid == "" {
+		sid = session.DefaultSessionID
+	}
+	var status int
+	var code, message string
+	if action.Violation != nil {
+		status = action.Violation.Status
+		if status == 0 {
+			status = pipeline.StatusFromCode(action.Violation.Code)
+		}
+		code = action.Violation.Code
+		message = action.Violation.Reason
+	}
+	ev := pipeline.SessionEvent{
+		At:          time.Now(),
+		Direction:   pipeline.Outbound,
+		Phase:       pipeline.SessionDenied,
+		Invocations: pctx.Extensions.Invocations.FilteredByPhase(pipeline.InvocationPhaseRequest),
+		Host:        pctx.Host,
+		StatusCode:  status,
+		Error: &pipeline.EventError{
+			Kind:    "policy",
+			Code:    code,
+			Message: message,
+		},
+	}
+	s.Sessions.Append(sid, ev)
+}
+
+func extractBearer(authHeader string) string {
+	if len(authHeader) > 7 && strings.EqualFold(authHeader[:7], "bearer ") {
+		return authHeader[7:]
+	}
+	return ""
+}
+
+// writeRejection renders a pipeline Reject to the http.ResponseWriter.
+// Preserves the plugin's status, headers, and body — the old flat
+// {"error":reason} is gone; plugins now control the wire shape via
+// action.Violation.
+func writeRejection(w http.ResponseWriter, action pipeline.Action) {
+	status, headers, body := action.Violation.Render()
+	for k, vs := range headers {
+		for _, v := range vs {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(status)
+	_, _ = w.Write(body)
 }

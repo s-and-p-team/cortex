@@ -69,17 +69,17 @@ flowchart TB
                 extproc["ext-proc<br/>(inbound: JWT validation)<br/>(outbound HTTP: token exchange)<br/>(outbound HTTPS: TLS passthrough)"]
             end
         end
-        
+
         subgraph TargetPod["AUTH-TARGET POD<br/>(namespace: authbridge)"]
             target["auth-target<br/>:8081<br/>validates aud: auth-target"]
         end
     end
-    
+
     subgraph External["EXTERNAL SERVICES"]
         spire["SPIRE<br/>(namespace: spire)<br/>Provides SVIDs"]
         keycloak["KEYCLOAK<br/>(namespace: keycloak)<br/>kagenti realm + token exchange"]
     end
-    
+
     spire --> spiffe
     spiffe --> clientreg
     clientreg --> keycloak
@@ -87,7 +87,7 @@ flowchart TB
     envoy --> extproc
     extproc --> keycloak
     envoy --> target
-    
+
     style AgentPod fill:#e3f2fd
     style TargetPod fill:#e8f5e9
     style Sidecar fill:#fff3e0
@@ -197,15 +197,15 @@ sequenceDiagram
         Note over Agent,Target: RUNTIME PHASE
         Agent->>KC: Get token (client_credentials grant)
         KC-->>Agent: Token (aud: SPIFFE ID)
-        
+
         Agent->>Envoy: HTTP request + Bearer token
         Note over Envoy: Intercepts outbound traffic
-        
+
         Envoy->>ExtProc: Process request headers
         ExtProc->>KC: Token Exchange (RFC 8693)
         KC-->>ExtProc: New token (aud: auth-target)
         ExtProc-->>Envoy: Replace Authorization header
-        
+
         Envoy->>Target: Request + exchanged token
         Target->>Target: Validate token (aud: auth-target)
         Target-->>Envoy: "authorized"

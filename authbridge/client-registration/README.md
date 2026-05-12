@@ -101,18 +101,18 @@ sequenceDiagram
     Note over Helper,SPIRE: Pod Startup
     SPIRE->>Helper: Issue JWT SVID
     Helper->>Helper: Write to /opt/jwt_svid.token
-    
+
     Reg->>Reg: Wait for SVID file
     Reg->>Reg: Extract SPIFFE ID from JWT
-    
+
     Reg->>KC: Register client (SPIFFE ID)
     KC-->>Reg: Client created
-    
+
     Reg->>KC: Get client secret
     KC-->>Reg: Secret value
-    
+
     Reg->>Reg: Write to /shared/client-secret.txt
-    
+
     App->>App: Read secret from shared volume
     App->>KC: Authenticate with credentials
 ```
@@ -183,7 +183,7 @@ spec:
           volumeMounts:
             - name: shared-data
               mountPath: /shared
-        
+
         # SPIFFE Helper - obtains SVID from SPIRE
         - name: spiffe-helper
           image: ghcr.io/spiffe/spiffe-helper:nightly
@@ -195,7 +195,7 @@ spec:
               mountPath: /spiffe-workload-api
             - name: svid-output
               mountPath: /opt
-        
+
         # Client Registration - registers with Keycloak
         - name: client-registration
           image: ghcr.io/kagenti/kagenti-extensions/client-registration:latest
@@ -226,7 +226,7 @@ spec:
               mountPath: /shared
             - name: svid-output
               mountPath: /opt
-      
+
       volumes:
         - name: shared-data
           emptyDir: {}

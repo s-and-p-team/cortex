@@ -10,16 +10,17 @@ Keycloak remains the source of truth - this script only proposes changes.
 
 import argparse
 import sys
-import yaml
 from dataclasses import dataclass
 from typing import Optional
 
+import yaml
 from keycloak import KeycloakAdmin
 
 
 @dataclass
 class RouteTarget:
     """A target from routes.yaml that needs reconciliation."""
+
     host: str
     audience: str
     scopes: list[str]
@@ -29,6 +30,7 @@ class RouteTarget:
 @dataclass
 class ReconcileResult:
     """Summary of reconciliation actions."""
+
     targets_checked: int = 0
     clients_created: int = 0
     clients_skipped: int = 0
@@ -46,8 +48,13 @@ class KeycloakReconciler:
 
     HOSTNAME_ATTRIBUTE = "authbridge.hostname"
 
-    def __init__(self, keycloak_admin: KeycloakAdmin, dry_run: bool = False,
-                 auto_yes: bool = False, agent_client: Optional[str] = None):
+    def __init__(
+        self,
+        keycloak_admin: KeycloakAdmin,
+        dry_run: bool = False,
+        auto_yes: bool = False,
+        agent_client: Optional[str] = None,
+    ):
         self.kc = keycloak_admin
         self.dry_run = dry_run
         self.auto_yes = auto_yes
@@ -102,7 +109,7 @@ class KeycloakReconciler:
         client_id = self.kc.get_client_id(audience)
 
         if client_id:
-            print(f"  [OK] Client exists")
+            print("  [OK] Client exists")
             return client_id
 
         print(f"  [MISSING] Client '{audience}' not found in Keycloak")
@@ -152,7 +159,7 @@ class KeycloakReconciler:
                 if self._prompt(f"    Add audience mapper for '{audience}'?"):
                     self._add_audience_mapper(scope["id"], scope_name, audience)
             else:
-                print(f"  [OK] Audience mapper correctly configured")
+                print("  [OK] Audience mapper correctly configured")
 
             # Assign scope to agent client if specified
             if self.agent_client_uuid:
@@ -165,7 +172,7 @@ class KeycloakReconciler:
         current_host = attributes.get(self.HOSTNAME_ATTRIBUTE)
 
         if current_host is None:
-            print(f"  [WARN] No hostname attribute set")
+            print("  [WARN] No hostname attribute set")
             if self._prompt(f"    Set hostname to '{expected_host}'?"):
                 self._set_hostname_attribute(client_id, expected_host)
                 self.result.hostnames_set += 1
@@ -181,7 +188,7 @@ class KeycloakReconciler:
                 print("    --> Skipped")
                 self.result.hostnames_skipped += 1
         else:
-            print(f"  [OK] Hostname attribute matches")
+            print("  [OK] Hostname attribute matches")
 
     # --- Keycloak operations ---
 
@@ -287,7 +294,7 @@ class KeycloakReconciler:
     def _add_audience_mapper(self, scope_id: str, mapper_name: str, audience: str):
         """Add an audience mapper to a scope."""
         if self.dry_run:
-            print(f"    --> [DRY RUN] Would add audience mapper")
+            print("    --> [DRY RUN] Would add audience mapper")
             return
 
         mapper_payload = {
@@ -304,7 +311,7 @@ class KeycloakReconciler:
         }
         try:
             self.kc.add_mapper_to_client_scope(scope_id, mapper_payload)
-            print(f"    --> Added audience mapper")
+            print("    --> Added audience mapper")
         except Exception as e:
             print(f"    --> Error adding mapper: {e}")
 
@@ -319,7 +326,7 @@ class KeycloakReconciler:
             attributes = client.get("attributes", {})
             attributes[self.HOSTNAME_ATTRIBUTE] = hostname
             self.kc.update_client(client_id, {"attributes": attributes})
-            print(f"    --> Set hostname attribute")
+            print("    --> Set hostname attribute")
         except Exception as e:
             print(f"    --> Error setting hostname: {e}")
 
@@ -389,12 +396,14 @@ def load_routes(path: str) -> list[RouteTarget]:
             continue  # Skip routes without audience (e.g., passthrough-only)
 
         scopes = route.get("token_scopes", "").split()
-        targets.append(RouteTarget(
-            host=route.get("host", ""),
-            audience=route["target_audience"],
-            scopes=scopes,
-            passthrough=route.get("passthrough", False),
-        ))
+        targets.append(
+            RouteTarget(
+                host=route.get("host", ""),
+                audience=route["target_audience"],
+                scopes=scopes,
+                passthrough=route.get("passthrough", False),
+            )
+        )
 
     return targets
 
@@ -405,7 +414,7 @@ def print_summary(result: ReconcileResult):
     print("Summary:")
     print(f"  {result.targets_checked} targets checked")
     if result.agent_client_created:
-        print(f"  Agent client created")
+        print("  Agent client created")
     if result.clients_created:
         print(f"  {result.clients_created} clients created")
     if result.clients_skipped:
@@ -425,48 +434,20 @@ def print_summary(result: ReconcileResult):
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Reconcile routes.yaml with Keycloak configuration"
-    )
+    parser = argparse.ArgumentParser(description="Reconcile routes.yaml with Keycloak configuration")
     parser.add_argument(
-        "--config", "-c",
+        "--config",
+        "-c",
         default="/etc/authproxy/routes.yaml",
-        help="Path to routes.yaml (default: /etc/authproxy/routes.yaml)"
+        help="Path to routes.yaml (default: /etc/authproxy/routes.yaml)",
     )
-    parser.add_argument(
-        "--keycloak-url",
-        default="http://keycloak.localtest.me:8080",
-        help="Keycloak server URL"
-    )
-    parser.add_argument(
-        "--realm",
-        default="kagenti",
-        help="Keycloak realm (default: kagenti)"
-    )
-    parser.add_argument(
-        "--admin-user",
-        default="admin",
-        help="Keycloak admin username"
-    )
-    parser.add_argument(
-        "--admin-password",
-        default="admin",
-        help="Keycloak admin password"
-    )
-    parser.add_argument(
-        "--dry-run", "-n",
-        action="store_true",
-        help="Show what would be done without making changes"
-    )
-    parser.add_argument(
-        "--yes", "-y",
-        action="store_true",
-        help="Answer yes to all prompts"
-    )
-    parser.add_argument(
-        "--agent-client",
-        help="Client ID of the agent to assign scopes to (optional)"
-    )
+    parser.add_argument("--keycloak-url", default="http://keycloak.localtest.me:8080", help="Keycloak server URL")
+    parser.add_argument("--realm", default="kagenti", help="Keycloak realm (default: kagenti)")
+    parser.add_argument("--admin-user", default="admin", help="Keycloak admin username")
+    parser.add_argument("--admin-password", default="admin", help="Keycloak admin password")
+    parser.add_argument("--dry-run", "-n", action="store_true", help="Show what would be done without making changes")
+    parser.add_argument("--yes", "-y", action="store_true", help="Answer yes to all prompts")
+    parser.add_argument("--agent-client", help="Client ID of the agent to assign scopes to (optional)")
 
     args = parser.parse_args()
 
@@ -514,11 +495,13 @@ def main():
                 print(f"  --> [DRY RUN] Would create realm '{args.realm}'")
             else:
                 try:
-                    master_kc.create_realm({
-                        "realm": args.realm,
-                        "enabled": True,
-                        "displayName": args.realm,
-                    })
+                    master_kc.create_realm(
+                        {
+                            "realm": args.realm,
+                            "enabled": True,
+                            "displayName": args.realm,
+                        }
+                    )
                     print(f"  --> Created realm '{args.realm}'")
                 except Exception as e:
                     print(f"  --> Error creating realm: {e}")
@@ -547,12 +530,7 @@ def main():
     if args.agent_client:
         print(f"Agent client: {args.agent_client}")
 
-    reconciler = KeycloakReconciler(
-        kc,
-        dry_run=args.dry_run,
-        auto_yes=args.yes,
-        agent_client=args.agent_client
-    )
+    reconciler = KeycloakReconciler(kc, dry_run=args.dry_run, auto_yes=args.yes, agent_client=args.agent_client)
     result = reconciler.reconcile(targets)
 
     print_summary(result)

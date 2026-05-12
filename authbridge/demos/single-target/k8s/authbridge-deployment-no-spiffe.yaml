@@ -144,6 +144,7 @@ data:
                     envoy_grpc:
                       cluster_name: ext_proc_cluster
                     timeout: 30s
+                  allow_mode_override: true
                   processing_mode:
                     request_header_mode: SEND
                     response_header_mode: SKIP
@@ -195,6 +196,7 @@ data:
                     envoy_grpc:
                       cluster_name: ext_proc_cluster
                     timeout: 30s
+                  allow_mode_override: true
                   processing_mode:
                     request_header_mode: SEND
                     response_header_mode: SKIP
@@ -370,10 +372,10 @@ spec:
               while [ ! -f /shared/client-secret.txt ] || [ ! -f /shared/client-id.txt ]; do
                 sleep 2
               done
-              
+
               CLIENT_ID=$(cat /shared/client-id.txt)
               CLIENT_SECRET=$(cat /shared/client-secret.txt)
-              
+
               echo ""
               echo "============================================"
               echo "Client registered with Keycloak!"

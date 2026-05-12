@@ -1,15 +1,23 @@
 package config
 
-import (
-	"fmt"
-	"log/slog"
-)
+import "fmt"
 
-// Validate checks the configuration for errors and warnings.
-// Returns an error for invalid configurations that would fail at runtime.
-// Logs warnings for unusual-but-valid combinations.
+// Validate checks the top-level runtime config: mode, listener combo,
+// and that the pipeline composition is populated. Plugin-specific
+// validation (issuer, token URL, identity type) lives inside each
+// plugin's Configure and runs at pipeline build time.
+//
+// Empty pipelines are rejected. Under the per-plugin config shape,
+// a valid runtime config always names at least one inbound plugin
+// (jwt-validation) and one outbound plugin (token-exchange). Silently
+// accepting empty pipelines caused the whole point of authbridge to
+// disappear — inbound traffic passing without JWT validation, outbound
+// passing without token exchange. Operators upgrading from the old
+// top-level-block schema ("inbound:", "outbound:", etc.) whose YAML
+// does not yet include a pipeline section fail loudly here rather
+// than shipping an open proxy. See the schema migration note in
+// cmd/authbridge/README.md.
 func Validate(cfg *Config) error {
-	// Mode is required
 	switch cfg.Mode {
 	case ModeEnvoySidecar, ModeWaypoint, ModeProxySidecar:
 		// valid
@@ -18,57 +26,23 @@ func Validate(cfg *Config) error {
 	default:
 		return fmt.Errorf("unknown mode %q (valid: envoy-sidecar, waypoint, proxy-sidecar)", cfg.Mode)
 	}
-
-	// Required fields
-	if cfg.Inbound.Issuer == "" {
-		return fmt.Errorf("inbound.issuer is required")
-	}
-	if cfg.Inbound.JWKSURL == "" {
-		return fmt.Errorf("inbound.jwks_url is required")
-	}
-	if cfg.Outbound.TokenURL == "" {
-		// token_url may have been derived from keycloak_url + keycloak_realm in Resolve()
-		return fmt.Errorf("outbound.token_url is required (or set keycloak_url + keycloak_realm)")
-	}
-
-	// Identity validation
-	if err := validateIdentity(cfg); err != nil {
-		return err
-	}
-
-	// Mode-specific listener validation
 	if err := validateListeners(cfg); err != nil {
 		return err
 	}
-
-	// Warnings for unusual combinations
-	warnUnusual(cfg)
-
-	return nil
+	return validatePipeline(cfg)
 }
 
-func validateIdentity(cfg *Config) error {
-	switch cfg.Identity.Type {
-	case "spiffe":
-		if cfg.Identity.SocketPath == "" && cfg.Identity.JWTSVIDPath == "" {
-			return fmt.Errorf("identity.type=spiffe requires socket_path or jwt_svid_path")
-		}
-		if cfg.Identity.ClientID == "" && cfg.Identity.ClientIDFile == "" {
-			return fmt.Errorf("identity.type=spiffe requires client_id or client_id_file")
-		}
-	case "client-secret":
-		if cfg.Identity.ClientID == "" && cfg.Identity.ClientIDFile == "" {
-			return fmt.Errorf("identity.type=client-secret requires client_id or client_id_file")
-		}
-		if cfg.Identity.ClientSecret == "" && cfg.Identity.ClientSecretFile == "" {
-			return fmt.Errorf("identity.type=client-secret requires client_secret or client_secret_file")
-		}
-	case "k8s-sa":
-		// Future: validate service account token path
-	case "":
-		return fmt.Errorf("identity.type is required")
-	default:
-		return fmt.Errorf("unknown identity.type %q (valid: spiffe, client-secret, k8s-sa)", cfg.Identity.Type)
+func validatePipeline(cfg *Config) error {
+	if len(cfg.Pipeline.Inbound.Plugins) == 0 {
+		return fmt.Errorf("pipeline.inbound.plugins is empty; specify at least one plugin " +
+			"(typically jwt-validation) — see cmd/authbridge/README.md. " +
+			"If you see this after an upgrade, your config.yaml is using the old top-level shape " +
+			"(inbound:, outbound:, identity:, bypass:, routes:) — move those settings under " +
+			"pipeline.*.plugins[].config")
+	}
+	if len(cfg.Pipeline.Outbound.Plugins) == 0 {
+		return fmt.Errorf("pipeline.outbound.plugins is empty; specify at least one plugin " +
+			"(typically token-exchange) — see cmd/authbridge/README.md")
 	}
 	return nil
 }
@@ -102,29 +76,3 @@ func validateListeners(cfg *Config) error {
 	}
 	return nil
 }
-
-func warnUnusual(cfg *Config) {
-	warnings := []string{}
-
-	if cfg.Mode == ModeEnvoySidecar && cfg.Identity.Type == "client-secret" {
-		warnings = append(warnings, "envoy-sidecar with client-secret identity is unusual (typically uses spiffe)")
-	}
-	if cfg.Mode == ModeWaypoint && cfg.Identity.Type == "spiffe" {
-		warnings = append(warnings, "waypoint with spiffe identity is unusual (typically uses client-secret)")
-	}
-
-	for _, w := range warnings {
-		slog.Warn(w)
-	}
-}
-
-// ValidateOutboundPolicy checks that default_policy is a valid value.
-func ValidateOutboundPolicy(policy string) error {
-	switch policy {
-	case "exchange", "passthrough", "":
-		return nil
-	default:
-		return fmt.Errorf("unknown outbound.default_policy %q (valid: exchange, passthrough)", policy)
-	}
-}
-

@@ -1,5 +1,5 @@
 # AuthBridge Demo Deployment (with SPIFFE)
-# 
+#
 # This deployment demonstrates:
 # 1. Agent pod with automatic client registration using SPIFFE ID
 # 2. AuthProxy sidecar intercepts outgoing requests and exchanges tokens
@@ -146,6 +146,7 @@ data:
                   grpc_service:
                     envoy_grpc:
                       cluster_name: go_processor
+                  allow_mode_override: true
                   processing_mode:
                     request_header_mode: SEND
                     response_header_mode: SEND
@@ -279,7 +280,7 @@ spec:
                 sleep 2
               done
               echo "SPIFFE credentials ready!"
-              
+
               # Extract and save the client ID (SPIFFE ID) from the JWT
               # JWT format: header.payload.signature - we need the payload
               JWT_PAYLOAD=$(cat /opt/jwt_svid.token | cut -d'.' -f2)
@@ -287,7 +288,7 @@ spec:
               CLIENT_ID=$(echo "$JWT_PAYLOAD"== | base64 -d 2>/dev/null | python -c "import sys,json; print(json.load(sys.stdin).get('sub',''))")
               echo "$CLIENT_ID" > /shared/client-id.txt
               echo "Client ID (SPIFFE ID): $CLIENT_ID"
-              
+
               echo "Starting client registration..."
               python client_registration.py
               echo "Client registration complete!"
@@ -352,10 +353,10 @@ spec:
               while [ ! -f /shared/client-secret.txt ] || [ ! -f /shared/client-id.txt ]; do
                 sleep 2
               done
-              
+
               CLIENT_ID=$(cat /shared/client-id.txt)
               CLIENT_SECRET=$(cat /shared/client-secret.txt)
-              
+
               echo ""
               echo "============================================"
               echo "Agent registered with Keycloak!"

@@ -181,4 +181,3 @@ func (c *Client) doTokenRequest(ctx context.Context, tokenURL string, form url.V
 		ExpiresIn:   tokenResp.ExpiresIn,
 	}, nil
 }
-

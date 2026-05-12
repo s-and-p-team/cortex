@@ -17,6 +17,7 @@ Idempotent:
 import os
 import re
 from typing import Any
+
 import jwt
 from keycloak import KeycloakAdmin, KeycloakPostError
 
@@ -45,7 +46,7 @@ def derive_keycloak_config_from_token_url(token_url: str) -> tuple[str | None, s
     Returns (None, None) if parsing fails.
     """
     # Pattern: <base_url>/realms/<realm>/protocol/openid-connect/token
-    match = re.match(r'^(https?://[^/]+)/realms/([^/]+)/', token_url)
+    match = re.match(r"^(https?://[^/]+)/realms/([^/]+)/", token_url)
     if match:
         return match.group(1), match.group(2)
     return None, None
@@ -134,9 +135,7 @@ def get_client_id() -> str:
     return decoded["sub"]
 
 
-def get_or_create_audience_scope(
-    keycloak_admin: KeycloakAdmin, scope_name: str, audience: str
-) -> str | None:
+def get_or_create_audience_scope(keycloak_admin: KeycloakAdmin, scope_name: str, audience: str) -> str | None:
     """
     Create a client scope with an audience mapper if it doesn't exist.
     Returns the scope ID, or None on failure.
@@ -180,7 +179,7 @@ def get_or_create_audience_scope(
         keycloak_admin.add_mapper_to_client_scope(scope_id, mapper_payload)
         print(f'Added audience mapper for "{audience}" to scope "{scope_name}"')
     except Exception as e:
-        print(f'Note: Could not add audience mapper (might already exist): {e}')
+        print(f"Note: Could not add audience mapper (might already exist): {e}")
 
     return scope_id
 
@@ -199,28 +198,17 @@ def add_scope_to_platform_clients(
     for platform_client_id in platform_client_ids:
         internal_id = keycloak_admin.get_client_id(platform_client_id)
         if not internal_id:
-            print(
-                f'Platform client "{platform_client_id}" not found in realm. '
-                f'Skipping scope assignment.'
-            )
+            print(f'Platform client "{platform_client_id}" not found in realm. Skipping scope assignment.')
             continue
         try:
-            keycloak_admin.add_client_default_client_scope(
-                internal_id, scope_id, {}
-            )
-            print(
-                f'Added scope "{scope_name}" to platform client "{platform_client_id}".'
-            )
+            keycloak_admin.add_client_default_client_scope(internal_id, scope_id, {})
+            print(f'Added scope "{scope_name}" to platform client "{platform_client_id}".')
         except Exception as e:
             # 409 Conflict means it's already assigned — that's fine
             if "409" in str(e) or "already" in str(e).lower():
-                print(
-                    f'Scope "{scope_name}" already assigned to "{platform_client_id}".'
-                )
+                print(f'Scope "{scope_name}" already assigned to "{platform_client_id}".')
             else:
-                print(
-                    f'Could not add scope "{scope_name}" to "{platform_client_id}": {e}'
-                )
+                print(f'Could not add scope "{scope_name}" to "{platform_client_id}": {e}')
 
 
 client_name = get_env_var("CLIENT_NAME")
@@ -248,26 +236,21 @@ try:
     # Try explicit env var first, then fall back to derived value from TOKEN_URL
     KEYCLOAK_URL = get_env_var("KEYCLOAK_URL", DERIVED_KEYCLOAK_URL)
     KEYCLOAK_REALM = get_env_var("KEYCLOAK_REALM", DERIVED_KEYCLOAK_REALM)
-    KEYCLOAK_TOKEN_EXCHANGE_ENABLED = (
-        get_env_var("KEYCLOAK_TOKEN_EXCHANGE_ENABLED", "true").lower() == "true"
-    )
-    KEYCLOAK_CLIENT_REGISTRATION_ENABLED = (
-        get_env_var("KEYCLOAK_CLIENT_REGISTRATION_ENABLED", "true").lower() == "true"
-    )
+    KEYCLOAK_TOKEN_EXCHANGE_ENABLED = get_env_var("KEYCLOAK_TOKEN_EXCHANGE_ENABLED", "true").lower() == "true"
+    KEYCLOAK_CLIENT_REGISTRATION_ENABLED = get_env_var("KEYCLOAK_CLIENT_REGISTRATION_ENABLED", "true").lower() == "true"
     # CLIENT_AUTH_TYPE controls how the client authenticates to Keycloak:
     # - "client-secret": Traditional client_secret authentication (default)
     # - "federated-jwt": JWT-SVID authentication via SPIFFE identity provider
     CLIENT_AUTH_TYPE = get_env_var("CLIENT_AUTH_TYPE", "client-secret")
 except ValueError as e:
-    print(
-        f"Expected environment variable missing. Skipping client registration of {client_id}."
-    )
+    print(f"Expected environment variable missing. Skipping client registration of {client_id}.")
     print(e)
     exit(1)
 
 if not KEYCLOAK_CLIENT_REGISTRATION_ENABLED:
     print(
-        f"Client registration (KEYCLOAK_CLIENT_REGISTRATION_ENABLED=false) disabled. Skipping registration of {client_id}."
+        "Client registration (KEYCLOAK_CLIENT_REGISTRATION_ENABLED=false) disabled."
+        f" Skipping registration of {client_id}."
     )
     exit(0)
 
@@ -290,29 +273,31 @@ client_payload = {
     "publicClient": False,  # Enable client authentication
     # Enable token exchange for this client.
     # Token exchange allows this client to exchange tokens for other tokens, potentially across different clients.
-    # Use case: [EXPLAIN THE SPECIFIC USE CASE HERE, e.g., "Required for service-to-service authentication in microservices architecture."]
-    # Security considerations: Ensure only trusted clients have this capability, restrict scopes and permissions as needed,
+    # Use case: [EXPLAIN THE SPECIFIC USE CASE HERE, e.g.,
+    #   "Required for service-to-service authentication in microservices architecture."]
+    # Security considerations: Ensure only trusted clients have this capability,
+    #   restrict scopes and permissions as needed,
     # and audit usage to prevent privilege escalation or unauthorized access.
     "attributes": {
-        "standard.token.exchange.enabled": str(
-            KEYCLOAK_TOKEN_EXCHANGE_ENABLED
-        ).lower(),  # Enable token exchange
+        "standard.token.exchange.enabled": str(KEYCLOAK_TOKEN_EXCHANGE_ENABLED).lower(),  # Enable token exchange
     },
 }
 
 # Configure client authentication type
 if CLIENT_AUTH_TYPE == "federated-jwt":
-    print(f"Configuring client for JWT-SVID authentication (federated-jwt)")
+    print("Configuring client for JWT-SVID authentication (federated-jwt)")
     client_payload["clientAuthenticatorType"] = "federated-jwt"
     # Add federated JWT attributes for SPIFFE authentication
     # These tell Keycloak to validate JWT-SVIDs from the SPIFFE identity provider
     spiffe_idp_alias = get_env_var("SPIFFE_IDP_ALIAS", "spire-spiffe")
-    client_payload["attributes"].update({
-        "jwt.credential.issuer": spiffe_idp_alias,
-        "jwt.credential.sub": client_id,  # Must match JWT sub claim (SPIFFE ID)
-    })
+    client_payload["attributes"].update(
+        {
+            "jwt.credential.issuer": spiffe_idp_alias,
+            "jwt.credential.sub": client_id,  # Must match JWT sub claim (SPIFFE ID)
+        }
+    )
 else:
-    print(f"Configuring client for client-secret authentication")
+    print("Configuring client for client-secret authentication")
     client_payload["clientAuthenticatorType"] = "client-secret"
 
 internal_client_id = register_client(
@@ -326,7 +311,9 @@ try:
 except ValueError:
     secret_file_path = "/shared/client-secret.txt"
 print(
-    f'Writing secret for client ID: "{client_id}" (internal client ID: "{internal_client_id}") to file: "{secret_file_path}"'
+    f'Writing secret for client ID: "{client_id}"'
+    f' (internal client ID: "{internal_client_id}")'
+    f' to file: "{secret_file_path}"'
 )
 write_client_secret(
     keycloak_admin,
@@ -338,9 +325,7 @@ write_client_secret(
 # --- Audience scope management ---
 # Create an audience scope for this agent and add it to platform clients
 # so their tokens include this agent's audience (required by AuthBridge).
-AUDIENCE_SCOPE_ENABLED = (
-    get_env_var("KEYCLOAK_AUDIENCE_SCOPE_ENABLED", "true").lower() == "true"
-)
+AUDIENCE_SCOPE_ENABLED = get_env_var("KEYCLOAK_AUDIENCE_SCOPE_ENABLED", "true").lower() == "true"
 
 if AUDIENCE_SCOPE_ENABLED:
     # Derive scope name from client_name (namespace/sa → agent-namespace-sa-aud)
@@ -360,16 +345,14 @@ if AUDIENCE_SCOPE_ENABLED:
 
         # Add to platform clients (e.g., the UI client)
         platform_clients_raw = get_env_var("PLATFORM_CLIENT_IDS", "kagenti")
-        platform_client_ids = [
-            c.strip() for c in platform_clients_raw.split(",") if c.strip()
-        ]
+        platform_client_ids = [c.strip() for c in platform_clients_raw.split(",") if c.strip()]
         if platform_client_ids:
             print(f"Adding scope to platform clients: {platform_client_ids}")
-            add_scope_to_platform_clients(
-                keycloak_admin, scope_id, scope_name, platform_client_ids
-            )
+            add_scope_to_platform_clients(keycloak_admin, scope_id, scope_name, platform_client_ids)
     else:
-        print(f'Warning: Could not create audience scope "{scope_name}". '
-              f'Platform clients will not automatically include this agent\'s audience.')
+        print(
+            f'Warning: Could not create audience scope "{scope_name}". '
+            f"Platform clients will not automatically include this agent's audience."
+        )
 
 print("Client registration complete.")

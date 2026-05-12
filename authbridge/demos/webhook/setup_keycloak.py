@@ -42,8 +42,9 @@ Security Note:
 """
 
 import argparse
-import sys
 import os
+import sys
+
 from keycloak import KeycloakAdmin, KeycloakPostError
 
 # Default configuration
@@ -73,7 +74,7 @@ DEMO_USER = {
     "email": "alice@example.com",
     "firstName": "Alice",
     "lastName": "Demo",
-    "password": "alice123"
+    "password": "alice123",
 }
 
 
@@ -87,14 +88,16 @@ def get_or_create_realm(keycloak_admin, realm_name):
     try:
         realms = keycloak_admin.get_realms()
         for realm in realms:
-            if realm['realm'] == realm_name:
+            if realm["realm"] == realm_name:
                 print(f"Realm '{realm_name}' already exists.")
                 return
-        keycloak_admin.create_realm({
-            "realm": realm_name,
-            "enabled": True,
-            "displayName": realm_name,
-        })
+        keycloak_admin.create_realm(
+            {
+                "realm": realm_name,
+                "enabled": True,
+                "displayName": realm_name,
+            }
+        )
         print(f"Created realm '{realm_name}'.")
     except Exception as e:
         print(f"Error checking/creating realm: {e}")
@@ -102,7 +105,7 @@ def get_or_create_realm(keycloak_admin, realm_name):
 
 def get_or_create_client(keycloak_admin, client_payload):
     """Create client if doesn't exist, return internal client ID."""
-    client_id = client_payload['clientId']
+    client_id = client_payload["clientId"]
     existing_client_id = keycloak_admin.get_client_id(client_id)
     if existing_client_id:
         print(f"Client '{client_id}' already exists.")
@@ -117,9 +120,9 @@ def get_or_create_client_scope(keycloak_admin, scope_payload):
     scope_name = scope_payload.get("name")
     scopes = keycloak_admin.get_client_scopes()
     for scope in scopes:
-        if scope['name'] == scope_name:
+        if scope["name"] == scope_name:
             print(f"Client scope '{scope_name}' already exists with ID: {scope['id']}")
-            return scope['id']
+            return scope["id"]
 
     try:
         scope_id = keycloak_admin.create_client_scope(scope_payload)
@@ -141,10 +144,10 @@ def add_audience_mapper(keycloak_admin, scope_id, mapper_name, audience):
             "included.custom.audience": audience,
             "id.token.claim": "false",
             "access.token.claim": "true",
-            "userinfo.token.claim": "false"
-        }
+            "userinfo.token.claim": "false",
+        },
     }
-    
+
     try:
         keycloak_admin.add_mapper_to_client_scope(scope_id, mapper_payload)
         print(f"Added audience mapper '{mapper_name}' for audience '{audience}'")
@@ -156,28 +159,26 @@ def add_audience_mapper(keycloak_admin, scope_id, mapper_name, audience):
 def get_or_create_user(keycloak_admin, user_config):
     """Create a demo user if it doesn't exist."""
     username = user_config["username"]
-    
+
     # Check if user exists
     users = keycloak_admin.get_users({"username": username})
     if users:
         print(f"User '{username}' already exists.")
         return users[0]["id"]
-    
+
     # Create user
     try:
-        user_id = keycloak_admin.create_user({
-            "username": username,
-            "email": user_config["email"],
-            "firstName": user_config["firstName"],
-            "lastName": user_config["lastName"],
-            "enabled": True,
-            "emailVerified": True,
-            "credentials": [{
-                "type": "password",
-                "value": user_config["password"],
-                "temporary": False
-            }]
-        })
+        user_id = keycloak_admin.create_user(
+            {
+                "username": username,
+                "email": user_config["email"],
+                "firstName": user_config["firstName"],
+                "lastName": user_config["lastName"],
+                "enabled": True,
+                "emailVerified": True,
+                "credentials": [{"type": "password", "value": user_config["password"], "temporary": False}],
+            }
+        )
         print(f"Created user '{username}' with ID: {user_id}")
         return user_id
     except KeycloakPostError as e:
@@ -186,18 +187,18 @@ def get_or_create_user(keycloak_admin, user_config):
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Setup Keycloak for AuthBridge webhook deployments"
-    )
+    parser = argparse.ArgumentParser(description="Setup Keycloak for AuthBridge webhook deployments")
     parser.add_argument(
-        "--namespace", "-n",
+        "--namespace",
+        "-n",
         default=DEFAULT_NAMESPACE,
-        help=f"Kubernetes namespace for the agent (default: {DEFAULT_NAMESPACE})"
+        help=f"Kubernetes namespace for the agent (default: {DEFAULT_NAMESPACE})",
     )
     parser.add_argument(
-        "--service-account", "-s",
+        "--service-account",
+        "-s",
         default=DEFAULT_SERVICE_ACCOUNT,
-        help=f"Service account name for the agent (default: {DEFAULT_SERVICE_ACCOUNT})"
+        help=f"Service account name for the agent (default: {DEFAULT_SERVICE_ACCOUNT})",
     )
     args = parser.parse_args()
 
@@ -211,7 +212,7 @@ def main():
     print(f"\nNamespace:       {namespace}")
     print(f"Service Account: {service_account}")
     print(f"SPIFFE ID:       {agent_spiffe_id}")
-    
+
     # Connect to Keycloak master realm first
     print(f"\nConnecting to Keycloak at {KEYCLOAK_URL}...")
     try:
@@ -220,7 +221,7 @@ def main():
             username=KEYCLOAK_ADMIN_USERNAME,
             password=KEYCLOAK_ADMIN_PASSWORD,
             realm_name="master",
-            user_realm_name="master"
+            user_realm_name="master",
         )
     except Exception as e:
         print(f"Failed to connect to Keycloak: {e}")
@@ -229,87 +230,88 @@ def main():
         print("\nIf using port-forward, run:")
         print("  kubectl port-forward service/keycloak-service -n keycloak 8080:8080")
         sys.exit(1)
-    
+
     # Create demo realm if needed
     print(f"\n--- Setting up realm: {KEYCLOAK_REALM} ---")
     get_or_create_realm(master_admin, KEYCLOAK_REALM)
-    
+
     # Switch to demo realm
     keycloak_admin = KeycloakAdmin(
         server_url=KEYCLOAK_URL,
         username=KEYCLOAK_ADMIN_USERNAME,
         password=KEYCLOAK_ADMIN_PASSWORD,
         realm_name=KEYCLOAK_REALM,
-        user_realm_name="master"
+        user_realm_name="master",
     )
-    
+
     # Create auth-target client (required as token exchange audience target)
     print("\n--- Creating auth-target client ---")
     print("This client is required as the target audience for token exchange")
-    get_or_create_client(keycloak_admin, {
-        "clientId": "auth-target",
-        "name": "Auth Target",
-        "enabled": True,
-        "publicClient": False,
-        "standardFlowEnabled": False,
-        "serviceAccountsEnabled": True,
-        "attributes": {
-            "standard.token.exchange.enabled": "true"
-        }
-    })
-    
+    get_or_create_client(
+        keycloak_admin,
+        {
+            "clientId": "auth-target",
+            "name": "Auth Target",
+            "enabled": True,
+            "publicClient": False,
+            "standardFlowEnabled": False,
+            "serviceAccountsEnabled": True,
+            "attributes": {"standard.token.exchange.enabled": "true"},
+        },
+    )
+
     # Create client scopes
     print("\n--- Creating client scopes ---")
-    
+
     # agent-spiffe-aud scope - adds Agent's SPIFFE ID to token audience (realm default)
     scope_name = f"agent-{namespace}-{service_account}-aud"
     print(f"\nCreating scope for Agent's SPIFFE ID audience: {scope_name}")
-    agent_spiffe_scope_id = get_or_create_client_scope(keycloak_admin, {
-        "name": scope_name,
-        "protocol": "openid-connect",
-        "attributes": {
-            "include.in.token.scope": "true",
-            "display.on.consent.screen": "true"
-        }
-    })
+    agent_spiffe_scope_id = get_or_create_client_scope(
+        keycloak_admin,
+        {
+            "name": scope_name,
+            "protocol": "openid-connect",
+            "attributes": {"include.in.token.scope": "true", "display.on.consent.screen": "true"},
+        },
+    )
     add_audience_mapper(keycloak_admin, agent_spiffe_scope_id, scope_name, agent_spiffe_id)
-    
+
     # auth-target-aud scope - added to exchanged tokens
-    auth_target_scope_id = get_or_create_client_scope(keycloak_admin, {
-        "name": "auth-target-aud",
-        "protocol": "openid-connect",
-        "attributes": {
-            "include.in.token.scope": "true",
-            "display.on.consent.screen": "true"
-        }
-    })
+    auth_target_scope_id = get_or_create_client_scope(
+        keycloak_admin,
+        {
+            "name": "auth-target-aud",
+            "protocol": "openid-connect",
+            "attributes": {"include.in.token.scope": "true", "display.on.consent.screen": "true"},
+        },
+    )
     add_audience_mapper(keycloak_admin, auth_target_scope_id, "auth-target-aud", "auth-target")
-    
+
     # Assign scopes
     print("\n--- Assigning scopes ---")
-    
+
     try:
         keycloak_admin.add_default_default_client_scope(agent_spiffe_scope_id)
         print(f"Added '{scope_name}' as realm default scope.")
     except Exception as e:
         print(f"Note: Could not add '{scope_name}' as realm default (might already exist): {e}")
-    
+
     try:
         keycloak_admin.add_default_optional_client_scope(auth_target_scope_id)
         print("Added 'auth-target-aud' as realm OPTIONAL scope.")
     except Exception as e:
         print(f"Note: Could not add 'auth-target-aud' as optional scope (might already exist): {e}")
-    
+
     # Create demo user
     print("\n--- Creating demo user ---")
     print("This user demonstrates subject preservation during token exchange")
     get_or_create_user(keycloak_admin, DEMO_USER)
-    
+
     # Print summary and next steps
     print("\n" + "=" * 70)
     print("SETUP COMPLETE")
     print("=" * 70)
-    
+
     print("\n" + "=" * 70)
     print("REQUIRED CONFIGMAPS")
     print("=" * 70)
@@ -431,7 +433,8 @@ USER_TOKEN=$(curl -sX POST http://keycloak-service.keycloak.svc:8080/realms/kage
   -d 'password={DEMO_USER["password"]}' | jq -r '.access_token')
 
 # Check alice's subject is preserved
-echo $USER_TOKEN | cut -d'.' -f2 | tr '_-' '/+' | {{ read p; echo "${{p}}=="; }} | base64 -d | jq '{{sub, preferred_username, aud}}'
+echo $USER_TOKEN | cut -d'.' -f2 | tr '_-' '/+' | \
+  {{ read p; echo "${{p}}=="; }} | base64 -d | jq '{{sub, preferred_username, aud}}'
 """)
 
 

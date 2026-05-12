@@ -385,7 +385,7 @@ kubectl get pods -n team1
 ```
 
 Expected output depends on how the **kagenti-operator** feature gate
-[`combinedSidecar`](https://github.com/kagenti/kagenti/blob/main/docs/authbridge-combined-sidecar.md)
+[`combinedSidecar`](https://github.com/kagenti/kagenti/blob/main/docs/authbridge/deployment-guide.md)
 is set (cluster-wide Helm / `kagenti-feature-gates` ConfigMap — not the import UI).
 
 **Legacy separate sidecars** (`combinedSidecar: false`, default in many installs):
@@ -746,7 +746,7 @@ exit
 Check the ext_proc logs to confirm both inbound validation and outbound token
 exchange are working. Envoy and authbridge log to the **`envoy-proxy`** container in
 legacy mode, or to **`authbridge`** when
-[`combinedSidecar`](https://github.com/kagenti/kagenti/blob/main/docs/authbridge-combined-sidecar.md)
+[`combinedSidecar`](https://github.com/kagenti/kagenti/blob/main/docs/authbridge/deployment-guide.md)
 is enabled — replace `-c envoy-proxy` with `-c authbridge` below.
 
 **Inbound validation logs:**

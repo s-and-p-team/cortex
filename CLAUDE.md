@@ -66,7 +66,7 @@ A **single binary** providing transparent traffic interception for both inbound 
 - `authproxy/init-iptables.sh` — Traffic interception setup (Istio ambient mesh compatible)
 - `authproxy/Dockerfile.init` — Init container image
 
-**Ports:** 15123 (outbound), 15124 (inbound), 9090 (ext-proc/ext-authz), 9901 (admin)
+**Ports:** 15123 (outbound), 15124 (inbound), 9090 (ext-proc/ext-authz), 9901 (admin), 9093 (stats and config)
 
 ### 2. Client Registration (Python)
 

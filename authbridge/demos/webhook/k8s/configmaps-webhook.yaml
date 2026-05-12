@@ -159,9 +159,10 @@ data:
                     envoy_grpc:
                       cluster_name: ext_proc_cluster
                     timeout: 30s
+                  allow_mode_override: true
                   processing_mode:
                     request_header_mode: SEND
-                    response_header_mode: SKIP
+                    response_header_mode: SEND
                     request_body_mode: NONE
                     response_body_mode: NONE
               - name: envoy.filters.http.ext_proc
@@ -230,9 +231,10 @@ data:
                     envoy_grpc:
                       cluster_name: ext_proc_cluster
                     timeout: 30s
+                  allow_mode_override: true
                   processing_mode:
                     request_header_mode: SEND
-                    response_header_mode: SKIP
+                    response_header_mode: SEND
                     request_body_mode: NONE
                     response_body_mode: NONE
               - name: envoy.filters.http.ext_proc

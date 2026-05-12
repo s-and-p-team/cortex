@@ -111,25 +111,24 @@ with protocol-specific listeners in `cmd/authbridge/listener/`:
 - Routes file is loaded once at startup; restart the pod to pick up changes
 
 **Configuration loading:**
-- YAML config with `${ENV_VAR}` expansion, mode presets, and startup validation
-- Supports `keycloak_url` + `keycloak_realm` derivation for operator compatibility
-- Waits up to 60s for credential files from client-registration
-- Reads `CLIENT_ID` from `/shared/client-id.txt` (file) or `CLIENT_ID` env var (fallback)
-- Reads `CLIENT_SECRET` from `/shared/client-secret.txt` (file) or `CLIENT_SECRET` env var (fallback)
-- `TOKEN_URL`: explicit env var, or auto-derived from `KEYCLOAK_URL` + `KEYCLOAK_REALM` (i.e. `{KEYCLOAK_URL}/realms/{KEYCLOAK_REALM}/protocol/openid-connect/token`)
-- `ISSUER`: explicit env var, or auto-derived from `KEYCLOAK_URL` + `KEYCLOAK_REALM` (i.e. `{KEYCLOAK_URL}/realms/{KEYCLOAK_REALM}`)
-- Inbound audience validation uses `CLIENT_ID` (from `/shared/client-id.txt` or `CLIENT_ID` env var) -- automatic, per-agent
-- Outbound route config from `/etc/authproxy/routes.yaml` (default; override with `ROUTES_CONFIG_PATH` env var in standalone deployments). Target audience and scopes are configured per-route only.
-- Default outbound policy from `DEFAULT_OUTBOUND_POLICY` env var: `"passthrough"` (default) or `"exchange"`
-- JWKS URL is derived from TOKEN_URL: replaces `/token` suffix with `/certs`
+- YAML config with `${ENV_VAR}` expansion, mode presets, and startup validation.
+- Plugin settings are local to each plugin under `pipeline.*.plugins[].config`; the runtime YAML itself only carries `mode`, `listener`, `session`, `stats`, and the pipeline composition. See [`cmd/authbridge/README.md`](cmd/authbridge/README.md) for the per-mode YAML shape and [`docs/plugin-reference.md`](docs/plugin-reference.md) for the per-plugin decode pattern.
+- The operator-supplied env vars (`KEYCLOAK_URL`, `KEYCLOAK_REALM`, `TOKEN_URL`, `ISSUER`, `DEFAULT_OUTBOUND_POLICY`, `CLIENT_ID`) are consumed by the default `authbridge-combined.yaml` via `${VAR}` expansion — they land inside the appropriate plugin's `config:` block rather than a top-level section.
+- `jwt-validation` derives `jwks_url` from `issuer` when omitted (appends `/protocol/openid-connect/certs`).
+- `token-exchange` derives `token_url` from `keycloak_url + keycloak_realm` when omitted (Keycloak convention).
+- Credential files: `client-registration` writes `/shared/client-id.txt` and `/shared/client-secret.txt`; `spiffe-helper` writes `/opt/jwt_svid.token`. `jwt-validation` reads the audience from `/shared/client-id.txt` via `audience_file`; `token-exchange` reads client credentials via `client_id_file` / `client_secret_file` / `jwt_svid_path`. Each plugin attempts a synchronous read at Configure time and falls back to a background poll from its `Init` goroutine if the file isn't yet readable.
+- Outbound route config: `token-exchange` reads `/etc/authproxy/routes.yaml` by default (path is per-plugin, configured via `routes.file` in its config block); inline rules can be declared under `routes.rules`.
+- Outbound `default_policy`: `passthrough` (default) or `exchange`, configured per-plugin (no top-level `DEFAULT_OUTBOUND_POLICY` field anymore; the env var is still expanded into the plugin config by `authbridge-combined.yaml`).
 
 **Key library packages (authlib/):**
-- `authlib/validation/` -- JWKS-backed JWT verifier
-- `authlib/exchange/` -- RFC 8693 token exchange client
+- `authlib/validation/` -- JWKS-backed JWT verifier (used internally by `jwt-validation` plugin)
+- `authlib/exchange/` -- RFC 8693 token exchange client (used internally by `token-exchange` plugin)
 - `authlib/cache/` -- SHA-256 keyed token cache
-- `authlib/routing/` -- Host-to-audience route resolver
-- `authlib/auth/` -- `HandleInbound` + `HandleOutbound` composition
-- `authlib/config/` -- Mode presets, YAML config, validation
+- `authlib/routing/` -- Host-to-audience route resolver (used internally by `token-exchange` plugin)
+- `authlib/auth/` -- `HandleInbound` + `HandleOutbound` composition; each plugin instance constructs its own `auth.Auth` from its own local config
+- `authlib/config/` -- Mode presets, YAML config loader, credential-file waiters, top-level (mode + listener + session) validation
+- `authlib/pipeline/` -- Plugin interface + lifecycle (`Configurable`, `Initializer`, `Shutdowner`); see [`docs/framework-architecture.md`](docs/framework-architecture.md)
+- `authlib/plugins/` -- The concrete plugins + registry; see [`docs/plugin-reference.md`](docs/plugin-reference.md) for the per-plugin config convention
 
 ### init-iptables.sh
 
@@ -290,10 +289,104 @@ kubectl apply -f k8s/auth-target-deployment-webhook.yaml     # Target service
 | 15123 | Envoy | TCP | Outbound listener (iptables redirects app traffic here) |
 | 15124 | Envoy | TCP | Inbound listener (iptables redirects incoming traffic here) |
 | 9090 | authbridge | gRPC | Ext-proc server (called by Envoy) |
+| 9093 | authbridge | HTTP | Stats + config inspection (`/stats`, `/config`, `/reload/status`) |
+| 9094 | authbridge | HTTP | Session events API (JSON snapshots + SSE stream) |
 | 9901 | Envoy | HTTP | Admin interface (bound to 127.0.0.1) |
 | 8080 | auth-proxy | HTTP | Example app (NOT part of sidecar) |
 | 8081 | demo-app | HTTP | Demo target (JWT validation) |
 | 8443 | demo-app | HTTPS | Demo target (TLS echo, no JWT) |
+
+## Session Events API (`:9094`)
+
+When `session.enabled` is true (default) and `listener.session_api_addr` is non-empty (default `:9094`), the authbridge binary exposes the captured session store over HTTP. Intended for operators debugging the plugin pipeline via `kubectl port-forward` and for the `abctl` TUI.
+
+**Trust model:** no authentication. Bind only on in-cluster addresses, never behind ingress. Payloads may contain raw user messages, LLM completions, and tool results.
+
+### Endpoints
+
+| Method & Path | Format | Purpose |
+|---|---|---|
+| `GET /v1/sessions` | `application/json` | List active sessions: `{sessions: [{id, createdAt, updatedAt, eventCount, active}]}`. |
+| `GET /v1/sessions/{id}` | `application/json` | Full snapshot of one session's events. 404 if unknown/expired. |
+| `GET /v1/events` | `text/event-stream` | SSE stream of new events. Optional `?session=<id>` filters to one session. Heartbeat every 30s. |
+| `GET /healthz` | text | Liveness probe. |
+
+### Quick examples
+
+```sh
+# Port-forward to an agent pod
+POD=$(kubectl get pod -n team1 -l app.kubernetes.io/name=weather-agent \
+  -o jsonpath='{.items[0].metadata.name}')
+kubectl port-forward -n team1 $POD 9094:9094 &
+
+# List sessions
+curl -s http://localhost:9094/v1/sessions | jq
+
+# Snapshot the most recently updated session
+SID=$(curl -s http://localhost:9094/v1/sessions | jq -r '.sessions[0].id')
+curl -s "http://localhost:9094/v1/sessions/$SID" | jq
+
+# Live tail every event
+curl -N http://localhost:9094/v1/events
+
+# Live tail a single session
+curl -N "http://localhost:9094/v1/events?session=$SID"
+```
+
+### Event schema
+
+Every event on `/v1/sessions/{id}` and `/v1/events` carries:
+
+- `at`, `direction`, `phase` — when, which side, what stage. `phase` is one of `"request"`, `"response"`, or `"denied"` (terminal denial from a pipeline plugin — typically a jwt-validation failure).
+- `a2a` / `mcp` / `inference` — protocol parser payloads (one at most).
+- `invocations` — per-plugin invocation records for every plugin that ran on the pipeline pass. Structured as `{inbound: [...], outbound: [...]}`; each entry carries `plugin`, `action` (one of 5 values — see below), `reason` (machine-stable code), and optional plugin-specific context (expected issuer, target audience, cache-hit flag, path, etc.). abctl renders one row per invocation, so operators see an explicit per-plugin timeline.
+- `plugins` — escape-hatch map for plugin-specific observability. Keys are plugin names; values are the raw JSON each plugin emitted. Unknown plugins render as opaque JSON in abctl. See [`docs/plugin-reference.md`](docs/plugin-reference.md#emitting-session-events) for the producer contract.
+- `identity`, `host`, `statusCode`, `error`, `durationMs` — request-level context.
+
+### Invocation action vocabulary
+
+Every plugin emits one of these 5 action values per invocation, so operators can scan a timeline without memorizing plugin-specific verbs:
+
+| `action` | Meaning | Example |
+|---|---|---|
+| `allow` | Gate plugin permitted the request | jwt-validation on valid token |
+| `deny` | Gate plugin rejected the request; pipeline stops | jwt-validation on bad token, token-exchange on IdP failure |
+| `skip` | Plugin ran but didn't act on this message | jwt-validation on a bypass path; parser whose body didn't match |
+| `modify` | Plugin mutated the message | token-exchange replaced the Authorization header |
+| `observe` | Plugin attached diagnostic data without changing flow | a2a-parser, mcp-parser, inference-parser when they match |
+
+Use `reason` to discriminate within an action — e.g. `skip/path_bypass` vs `skip/no_matching_route` tell different stories at the detail-pane level but both scan as "skip" in the at-a-glance timeline.
+
+> **Producer-side contract:** the authoritative definition of the 5-value vocabulary, the `Invocation` struct fields, and which diagnostic fields each plugin type populates lives in [`docs/plugin-reference.md`](docs/plugin-reference.md#emitting-session-events). Edit that file when the vocabulary changes; this table is the consumer-side summary.
+
+### Gotcha: denied requests
+
+Rejected requests (401 / 503) land as `phase: "denied"` events in `/v1/sessions` when at least one pipeline plugin appended an Invocation before rejecting. If you're debugging an unauthorized-access pattern, the default-session bucket (`GET /v1/sessions/default`) is where denial events aggregate.
+
+### Disabling
+
+Set `session.enabled: false` in the runtime config to turn off the store (and implicitly the API). Setting `listener.session_api_addr: ""` alone is not currently supported as a selective disable — the preset refills it; if you need store-on-API-off, raise an issue.
+
+## Config Hot-Reload (`:9093/reload/status`)
+
+The authbridge binary watches its config file (`/etc/authbridge/config.yaml`) via `authlib/reloader`. When the ConfigMap changes, kubelet syncs the new content into the mount (~60s), the watcher detects it, and the binary rebuilds + atomically swaps the plugin pipelines without a pod restart. In-flight requests finish on the previous pipeline; new requests go to the new one.
+
+**What reloads:** any plugin list change (add/remove/reorder) and any plugin `config:` subtree edit.
+
+**What doesn't reload (pod restart required):** `mode`, any `listener.*` address, and the session store parameters (`session.ttl`, `session.max_events`, `session.max_sessions`).
+
+**Bad YAML stays safe:** if Load/Validate/Build/Start fails, the active pipeline keeps serving and the error is exposed on `/reload/status` with `reloads_failed` incremented. The pod never goes unhealthy from a bad edit.
+
+Operator workflow:
+
+```sh
+kubectl edit configmap authbridge-config-<agent> -n <ns>
+kubectl port-forward -n <ns> deploy/<agent> 9093:9093 &
+curl http://localhost:9093/reload/status  # last_success, reloads_ok, active_config_sha256
+curl http://localhost:9093/config         # now-active config (ConfigProvider closure)
+```
+
+See [`docs/framework-architecture.md`](docs/framework-architecture.md#9-config-hot-reload) §9 for the reload lifecycle, debounce / symlink-swap handling, and the drain-window behavior.
 
 ## Code Conventions
 
@@ -353,7 +446,7 @@ kubectl apply -f k8s/auth-target-deployment-webhook.yaml     # Target service
 
 ## Gotchas and Known Issues
 
-1. **Credential file race condition**: Authbridge waits up to 60s for `/shared/client-id.txt` and `/shared/client-secret.txt`. If client-registration takes longer (e.g., Keycloak slow to start), authbridge will fall back to env vars which may be empty.
+1. **Credential file race condition**: Each plugin that reads a credential file (jwt-validation's `audience_file`, token-exchange's `client_id_file` / `client_secret_file` / `jwt_svid_path`) tries a synchronous read at Configure time and, on miss, spawns an Init goroutine that polls indefinitely — emitting a WARN every ~60s while the file is still missing. OnRequest returns 503 until the file arrives. If the file never shows up (wrong path, missing volume mount), the pod stays unready for outbound traffic; follow the WARN lines to the misconfigured path.
 
 2. **ISSUER vs TOKEN_URL**: `ISSUER` must be the Keycloak **frontend URL** (what appears in the `iss` claim of tokens), while `TOKEN_URL` is the **internal service URL**. These are often different in Kubernetes (e.g., `http://keycloak.localtest.me:8080` vs `http://keycloak-service.keycloak.svc:8080`).
 

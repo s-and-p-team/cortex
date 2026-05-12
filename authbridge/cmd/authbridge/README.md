@@ -77,54 +77,117 @@ The `--mode` flag can also be set in the YAML config. The flag overrides the con
 
 YAML with `${ENV_VAR}` expansion. Undefined env vars are preserved as-is (not expanded to empty).
 
+The runtime config is intentionally thin — it covers the mode, the listener addresses, session tracking, and the plugin pipeline. Everything a plugin needs (issuer, token URL, credentials, routes, bypass paths) lives under its own `config:` block inside the pipeline entry. See [`docs/plugin-reference.md`](../../docs/plugin-reference.md) for the per-plugin decode / defaults / validate convention.
+
 ### envoy-sidecar mode
 
 Drop-in replacement for `envoy-with-processor`. Used as a sidecar alongside Envoy in each agent pod.
 
+Minimum viable config — every Kagenti-convention default applies:
+
 ```yaml
 mode: envoy-sidecar
-inbound:
-  jwks_url: "${JWKS_URL}"                    # or derived from token_url
-  issuer: "${ISSUER}"                        # or derived from keycloak_url + keycloak_realm
-outbound:
-  token_url: "${TOKEN_URL}"                  # or derived from keycloak_url + keycloak_realm
-  keycloak_url: "${KEYCLOAK_URL}"            # alternative to explicit token_url
-  keycloak_realm: "${KEYCLOAK_REALM}"        # used with keycloak_url
-  default_policy: "passthrough"              # passthrough (default) or exchange
-identity:
-  type: spiffe                               # spiffe or client-secret
-  client_id: "${CLIENT_ID}"                  # or use client_id_file
-  client_id_file: "/shared/client-id.txt"    # read from file (waits up to 60s)
-  client_secret_file: "/shared/client-secret.txt"
-  jwt_svid_path: "/opt/jwt_svid.token"       # for SPIFFE JWT-SVID auth
-bypass:
-  inbound_paths:                             # defaults: /.well-known/*, /healthz, /readyz, /livez
-    - "/.well-known/*"
-    - "/healthz"
-routes:
-  file: "/etc/authproxy/routes.yaml"         # load routes from file
-  rules:                                     # or inline
-    - host: "target-service.**"
-      target_audience: "target"
-      token_scopes: "openid target-aud"
+
+pipeline:
+  inbound:
+    plugins:
+      - name: jwt-validation
+        config:
+          issuer: "${ISSUER}"
+
+  outbound:
+    plugins:
+      - name: token-exchange
+        config:
+          keycloak_url: "${KEYCLOAK_URL}"
+          keycloak_realm: "${KEYCLOAK_REALM}"
+          identity:
+            type: spiffe                           # spiffe or client-secret
+```
+
+Defaults filled in by the plugins (override any by setting them explicitly):
+
+| Plugin | Default | Value |
+|---|---|---|
+| jwt-validation | `jwks_url` | `<issuer>/protocol/openid-connect/certs` |
+| jwt-validation | `audience_file` | `/shared/client-id.txt` (client-registration convention) |
+| jwt-validation | `bypass_paths` | `/.well-known/*`, `/healthz`, `/readyz`, `/livez` |
+| jwt-validation | `audience_mode` | `static` |
+| token-exchange | `token_url` | `<keycloak_url>/realms/<realm>/protocol/openid-connect/token` |
+| token-exchange | `default_policy` | `passthrough` |
+| token-exchange | `no_token_policy` | `deny` |
+| token-exchange | `routes.file` | `/etc/authproxy/routes.yaml` |
+| token-exchange | `identity.client_id_file` | `/shared/client-id.txt` (both types) |
+| token-exchange | `identity.client_secret_file` | `/shared/client-secret.txt` (client-secret type) |
+| token-exchange | `identity.jwt_svid_path` | `/opt/jwt_svid.token` (spiffe type) |
+
+Full form — every field spelled out, for deployments that diverge from defaults:
+
+```yaml
+mode: envoy-sidecar
+
+pipeline:
+  inbound:
+    plugins:
+      - name: jwt-validation
+        config:
+          issuer: "${ISSUER}"
+          jwks_url: "${JWKS_URL}"                  # optional; derived from issuer
+          audience_file: "/shared/client-id.txt"   # audience written by client-registration
+          bypass_paths:
+            - "/.well-known/*"
+            - "/healthz"
+            - "/readyz"
+            - "/livez"
+
+  outbound:
+    plugins:
+      - name: token-exchange
+        config:
+          token_url: "${TOKEN_URL}"                # or derived from keycloak_url + keycloak_realm
+          keycloak_url: "${KEYCLOAK_URL}"
+          keycloak_realm: "${KEYCLOAK_REALM}"
+          default_policy: "passthrough"            # passthrough (default) or exchange
+          no_token_policy: "deny"                  # deny (default), allow, or client-credentials
+          identity:
+            type: spiffe                           # spiffe or client-secret
+            client_id_file: "/shared/client-id.txt"
+            client_secret_file: "/shared/client-secret.txt"
+            jwt_svid_path: "/opt/jwt_svid.token"
+          routes:
+            file: "/etc/authproxy/routes.yaml"     # loaded when present, ignored when absent
+            rules:                                 # inline; merged with file
+              - host: "target-service.**"
+                target_audience: "target"
+                token_scopes: "openid target-aud"
 ```
 
 ### waypoint mode
 
-Shared service for Istio ambient mesh. Derives audience from destination hostname automatically.
+Shared service for Istio ambient mesh. `jwt-validation` derives audience from destination hostname when `audience_mode: per-host` is set.
 
 ```yaml
 mode: waypoint
-inbound:
-  issuer: "${ISSUER}"
-outbound:
-  keycloak_url: "${KEYCLOAK_URL}"
-  keycloak_realm: "${KEYCLOAK_REALM}"
-  default_policy: "exchange"
-identity:
-  type: client-secret
-  client_id: "token-exchange-service"
-  client_secret: "${CLIENT_SECRET}"
+
+pipeline:
+  inbound:
+    plugins:
+      - name: jwt-validation
+        config:
+          issuer: "${ISSUER}"
+          audience_mode: per-host                  # derive from pctx.Host per request
+
+  outbound:
+    plugins:
+      - name: token-exchange
+        config:
+          keycloak_url: "${KEYCLOAK_URL}"
+          keycloak_realm: "${KEYCLOAK_REALM}"
+          default_policy: "exchange"
+          identity:
+            type: client-secret
+            client_id: "token-exchange-service"
+            client_secret: "${CLIENT_SECRET}"
 ```
 
 ### proxy-sidecar mode
@@ -133,34 +196,58 @@ Sidecar without Envoy. Reverse proxy validates inbound, forward proxy exchanges 
 
 ```yaml
 mode: proxy-sidecar
+
 listener:
   reverse_proxy_backend: "http://localhost:8081"
-inbound:
-  issuer: "${ISSUER}"
-outbound:
-  keycloak_url: "${KEYCLOAK_URL}"
-  keycloak_realm: "${KEYCLOAK_REALM}"
-identity:
-  type: spiffe
-  client_id: "${CLIENT_ID}"
-  jwt_svid_path: "/opt/jwt_svid.token"
+
+pipeline:
+  inbound:
+    plugins:
+      - name: jwt-validation
+        config:
+          issuer: "${ISSUER}"
+          audience_file: "/shared/client-id.txt"
+
+  outbound:
+    plugins:
+      - name: token-exchange
+        config:
+          keycloak_url: "${KEYCLOAK_URL}"
+          keycloak_realm: "${KEYCLOAK_REALM}"
+          identity:
+            type: spiffe
+            client_id_file: "/shared/client-id.txt"
+            jwt_svid_path: "/opt/jwt_svid.token"
 ```
 
-## URL Derivation
+### Bare-name plugin entries
 
-When explicit URLs are not set, they are derived automatically:
+Parsers and any other plugin that doesn't take configuration can appear as a bare name:
+
+```yaml
+pipeline:
+  outbound:
+    plugins:
+      - name: token-exchange
+        config: { ... }
+      - mcp-parser        # equivalent to { name: mcp-parser }
+      - inference-parser
+```
+
+### URL Derivation
+
+Each plugin derives missing URLs from what you supply:
 
 | Missing field | Derived from | Example |
 |---|---|---|
-| `token_url` | `keycloak_url` + `keycloak_realm` | `http://keycloak:8080/realms/kagenti/protocol/openid-connect/token` |
-| `issuer` | `keycloak_url` + `keycloak_realm` | `http://keycloak:8080/realms/kagenti` |
-| `jwks_url` | `token_url` | `.../openid-connect/token` becomes `.../openid-connect/certs` |
+| `jwt-validation.jwks_url` | `jwt-validation.issuer` | `<issuer>/protocol/openid-connect/certs` |
+| `token-exchange.token_url` | `token-exchange.keycloak_url` + `keycloak_realm` | `http://keycloak:8080/realms/kagenti/protocol/openid-connect/token` |
 
 Explicit values always take precedence over derived values.
 
-## Credential File Waiting
+### Credential File Waiting
 
-When `client_id_file`, `client_secret_file`, or `jwt_svid_path` are configured, the binary polls for the file to exist (up to 60 seconds) before starting. This handles the startup race with client-registration and spiffe-helper sidecars.
+When `audience_file` (jwt-validation) or `client_id_file` / `client_secret_file` / `jwt_svid_path` (token-exchange) are configured, the plugin first attempts a synchronous read at Configure time. If the file isn't readable yet (the common case during pod boot while client-registration is still provisioning), the plugin's `Init` spawns a background poll; once the file appears, `auth.UpdateIdentity` swaps the credentials into the live handler atomically. OnRequest returns 503 for traffic that arrives before credentials land.
 
 ## Logging
 
@@ -183,7 +270,10 @@ LOG_LEVEL=debug authbridge --config /etc/authbridge/config.yaml
 Send `SIGUSR1` to toggle between `info` and `debug`:
 
 ```bash
-kubectl exec deploy/weather-service -n team1 -c authbridge-proxy -- kill -USR1 1
+# The container has no standalone kill/grep binaries — use bash builtins only.
+# Match on the full binary path to skip the entrypoint script (also at PID 1).
+kubectl exec deploy/weather-service -n team1 -c envoy-proxy -- \
+  bash -c 'for f in /proc/[0-9]*/cmdline; do [ -r "$f" ] || continue; c=$(<"$f"); [[ "$c" == /usr/local/bin/authbridge* ]] && kill -USR1 "${f//[!0-9]/}" && break; done'
 ```
 
 Send again to toggle back. The current level is logged on each toggle.

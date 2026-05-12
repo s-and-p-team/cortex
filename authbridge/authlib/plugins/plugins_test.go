@@ -1,0 +1,194 @@
+package plugins_test
+
+import (
+	"context"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/kagenti/kagenti-extensions/authbridge/authlib/config"
+	"github.com/kagenti/kagenti-extensions/authbridge/authlib/pipeline"
+	"github.com/kagenti/kagenti-extensions/authbridge/authlib/plugins"
+	// Side-effect imports register the bundled plugins. Same pattern
+	// main.go uses — ensures Build("jwt-validation") / Build("token-exchange")
+	// resolve during tests.
+	jwtvalidation "github.com/kagenti/kagenti-extensions/authbridge/authlib/plugins/jwtvalidation"
+	_ "github.com/kagenti/kagenti-extensions/authbridge/authlib/plugins/tokenbroker"
+	tokenexchange "github.com/kagenti/kagenti-extensions/authbridge/authlib/plugins/tokenexchange"
+)
+
+// TestAuthbridgeCombinedYAML_Loads asserts that the in-repo default
+// config consumed by the combined sidecar image parses and produces
+// working pipelines. A future rename of any plugin default constant
+// that silently breaks the shipped image fails this test first.
+func TestAuthbridgeCombinedYAML_Loads(t *testing.T) {
+	yamlPath := filepath.Join("..", "..", "authproxy", "authbridge-combined.yaml")
+	if _, err := os.Stat(yamlPath); err != nil {
+		t.Skipf("authbridge-combined.yaml not found (repo layout changed?): %v", err)
+	}
+
+	envs := map[string]string{
+		"ISSUER":                  "http://keycloak.localtest.me:8080/realms/kagenti",
+		"KEYCLOAK_URL":            "http://keycloak-service.keycloak.svc:8080",
+		"KEYCLOAK_REALM":          "kagenti",
+		"DEFAULT_OUTBOUND_POLICY": "passthrough",
+		"TOKEN_URL":               "",
+	}
+	for k, v := range envs {
+		t.Setenv(k, v)
+	}
+
+	cfg, err := config.Load(yamlPath)
+	if err != nil {
+		t.Fatalf("Load(%s): %v", yamlPath, err)
+	}
+	if cfg.Mode != config.ModeEnvoySidecar {
+		t.Errorf("mode = %q, want %q", cfg.Mode, config.ModeEnvoySidecar)
+	}
+	if err := config.Validate(cfg); err != nil {
+		t.Errorf("Validate: %v", err)
+	}
+	if _, err := plugins.Build(cfg.Pipeline.Inbound.Plugins); err != nil {
+		t.Errorf("Build inbound: %v", err)
+	}
+	if _, err := plugins.Build(cfg.Pipeline.Outbound.Plugins); err != nil {
+		t.Errorf("Build outbound: %v", err)
+	}
+}
+
+// --- Stats aggregation ---
+
+func TestCollectStats_CollectsOnlyStatsSources(t *testing.T) {
+	jwt := jwtvalidation.NewJWTValidation()
+	if err := jwt.Configure([]byte(`{"issuer":"http://ex","audience":"a"}`)); err != nil {
+		t.Fatalf("jwt Configure: %v", err)
+	}
+	tok := tokenexchange.NewTokenExchange()
+	if err := tok.Configure([]byte(`{"token_url":"http://t","identity":{"type":"client-secret","client_id":"c","client_secret":"s"}}`)); err != nil {
+		t.Fatalf("tok Configure: %v", err)
+	}
+	// Need at least one non-StatsSource plugin to prove the filter works;
+	// Build a pipeline with a2a-parser (registered by side-effect import
+	// of plugins package's self-registering parsers).
+	entries := []config.PluginEntry{
+		{Name: "a2a-parser"},
+	}
+	withParser, err := plugins.Build(entries)
+	if err != nil {
+		t.Fatalf("Build(a2a-parser): %v", err)
+	}
+	// Stitch jwt + a2a-parser + tok into a test pipeline via pipeline.New
+	// directly (bypassing the registry for this artificial combo).
+	p, err := pipeline.New(append([]pipeline.Plugin{jwt}, append(withParser.Plugins(), tok)...))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	got := plugins.CollectStats(p)
+	if len(got) != 2 {
+		t.Errorf("len(CollectStats) = %d, want 2 (jwt + tok, parser skipped)", len(got))
+	}
+}
+
+func TestCollectStats_NilPipeline(t *testing.T) {
+	if got := plugins.CollectStats(nil); got != nil {
+		t.Errorf("CollectStats(nil) = %v, want nil", got)
+	}
+}
+
+// --- Registry / Build ---
+
+func TestBuild_ValidNames(t *testing.T) {
+	p, err := plugins.Build([]config.PluginEntry{
+		{Name: "a2a-parser"},
+		{Name: "mcp-parser"},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if p == nil {
+		t.Fatal("expected non-nil pipeline")
+	}
+}
+
+func TestBuild_UnknownName(t *testing.T) {
+	if _, err := plugins.Build([]config.PluginEntry{{Name: "nonexistent-plugin"}}); err == nil {
+		t.Fatal("expected error for unknown plugin name")
+	}
+}
+
+func TestBuild_EmptyList(t *testing.T) {
+	p, err := plugins.Build([]config.PluginEntry{})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	action := p.Run(context.Background(), &pipeline.Context{Headers: http.Header{}})
+	if action.Type != pipeline.Continue {
+		t.Errorf("empty pipeline got %v, want Continue", action.Type)
+	}
+}
+
+func TestBuild_ConfigForNonConfigurablePlugin(t *testing.T) {
+	_, err := plugins.Build([]config.PluginEntry{
+		{Name: "a2a-parser", Config: []byte(`{"unused":true}`)},
+	})
+	if err == nil {
+		t.Fatal("expected error for config on non-Configurable plugin")
+	}
+	if !strings.Contains(err.Error(), "does not accept configuration") {
+		t.Errorf("error %q does not match contract", err)
+	}
+}
+
+func TestBuild_ConfigureError(t *testing.T) {
+	_, err := plugins.Build([]config.PluginEntry{
+		{Name: "jwt-validation", Config: []byte(`{}`)},
+	})
+	if err == nil {
+		t.Fatal("expected error for invalid jwt-validation config")
+	}
+	if !strings.Contains(err.Error(), "jwt-validation") {
+		t.Errorf("error %q does not name the offending plugin", err)
+	}
+}
+
+// TestBuild_TokenExchangeAndTokenBroker_ConflictingClaims exercises the
+// concrete case from issue #398: configuring both token-exchange and
+// token-broker on the same outbound chain is now rejected at Build
+// time because they both claim ClaimAuthorizationHeader.
+func TestBuild_TokenExchangeAndTokenBroker_ConflictingClaims(t *testing.T) {
+	// Configure both with valid per-plugin config so the
+	// relationship check is what fails (not some earlier Configure
+	// error). token-broker requires broker_url; token-exchange
+	// requires the keycloak_url / keycloak_realm pair.
+	_, err := plugins.Build([]config.PluginEntry{
+		{
+			Name: "token-exchange",
+			Config: []byte(`{
+				"keycloak_url": "http://keycloak.example",
+				"keycloak_realm": "test",
+				"default_policy": "passthrough",
+				"identity": {"type": "client-secret"}
+			}`),
+		},
+		{
+			Name:   "token-broker",
+			Config: []byte(`{"broker_url": "http://broker.example"}`),
+		},
+	})
+	if err == nil {
+		t.Fatal("expected relationship conflict error for token-exchange + token-broker")
+	}
+	msg := err.Error()
+	for _, want := range []string{
+		"token-exchange",
+		"token-broker",
+		"authorization_header",
+		"configure only one",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+}

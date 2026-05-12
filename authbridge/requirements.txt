@@ -1,2 +1,2 @@
 python-keycloak>=7.1.1,<8
-PyYAML>=6.0
+PyYAML>=6.0.3
