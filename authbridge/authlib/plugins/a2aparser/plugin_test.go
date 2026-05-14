@@ -1,4 +1,4 @@
-package plugins
+package a2aparser
 
 import (
 	"context"
@@ -85,6 +85,56 @@ func TestA2AParser_MessageStream(t *testing.T) {
 	}
 	if ext.SessionID != "sess-xyz" {
 		t.Errorf("SessionID = %q, want %q", ext.SessionID, "sess-xyz")
+	}
+}
+
+// The A2A Python SDK (and the kagenti backend that wraps it) places contextId
+// inside params.message on established-conversation turns — not at the
+// top-level params that the earlier extraction path looked at. Without this
+// fallback, the listener's request-phase session lookup sees an empty
+// SessionID and buckets every turn under "default" instead of the real
+// contextId, leading to a single overflowing "default" session in abctl.
+func TestA2AParser_MessageStream_ContextIDInsideMessage(t *testing.T) {
+	p := NewA2AParser()
+	pctx := &pipeline.Context{
+		Body: []byte(`{"jsonrpc":"2.0","method":"message/stream","id":"req-9","params":{"message":{"role":"user","parts":[{"kind":"text","text":"weather in ohio"}],"messageId":"msg-inside","contextId":"ctx-from-message"}}}`),
+	}
+
+	action := p.OnRequest(context.Background(), pctx)
+	if action.Type != pipeline.Continue {
+		t.Fatalf("expected Continue, got %v", action.Type)
+	}
+	ext := pctx.Extensions.A2A
+	if ext == nil {
+		t.Fatal("Extensions.A2A is nil")
+	}
+	if ext.SessionID != "ctx-from-message" {
+		t.Errorf("SessionID = %q, want %q (from params.message.contextId)",
+			ext.SessionID, "ctx-from-message")
+	}
+	if ext.MessageID != "msg-inside" {
+		t.Errorf("MessageID = %q, want %q", ext.MessageID, "msg-inside")
+	}
+}
+
+// Top-level contextId wins when both are present. Clients occasionally send
+// both fields (SDK emits one at the message level, middleware sets the other
+// at the envelope level); the A2A spec treats the envelope-level contextId
+// as the session key, and the response-phase path already prefers request-
+// side over server-minted — this test pins that ordering on the request side.
+func TestA2AParser_MessageStream_TopLevelContextIDWins(t *testing.T) {
+	p := NewA2AParser()
+	pctx := &pipeline.Context{
+		Body: []byte(`{"jsonrpc":"2.0","method":"message/stream","id":"req-10","params":{"contextId":"ctx-top-level","message":{"role":"user","parts":[{"kind":"text","text":"hi"}],"messageId":"msg-both","contextId":"ctx-inside-message"}}}`),
+	}
+
+	action := p.OnRequest(context.Background(), pctx)
+	if action.Type != pipeline.Continue {
+		t.Fatalf("expected Continue, got %v", action.Type)
+	}
+	if pctx.Extensions.A2A.SessionID != "ctx-top-level" {
+		t.Errorf("SessionID = %q, want %q (top-level params.contextId should win)",
+			pctx.Extensions.A2A.SessionID, "ctx-top-level")
 	}
 }
 

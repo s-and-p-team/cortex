@@ -5,5 +5,7 @@ use (
 	./authproxy
 	./cmd/abctl
 	./cmd/authbridge
+	./cmd/authbridge-envoy
+	./cmd/authbridge-proxy
 	./cmd/telemetry-processor
 )
