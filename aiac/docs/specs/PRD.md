@@ -37,8 +37,8 @@ layer (AuthBridge) that intercepts traffic and exchanges tokens but carries no p
 its own.
 
 The AIAC Agent subscribes to an event stream (NATS JetStream) and reacts to entity lifecycle
-events — new services, role changes, policy updates — by retrieving the current policy from a RAG
-knowledge base, querying live PDP state, and applying the minimal required diff via a dedicated
+events — new services, role changes, policy updates — by retrieving the current policy from the Policy
+Store, querying live PDP state, and applying the minimal required diff via a dedicated
 PDP Policy Writer. **Policy intent lives entirely in the PDP, not in per-pod configuration.**
 
 ---
@@ -68,16 +68,16 @@ This means `token_scopes` is absent from `authproxy-routes`. Route configuration
 **Trigger:** A Role or Keycloak Client is created, updated, or removed.
 
 The Keycloak SPI listener publishes a scoped event to the Event Broker. The AIAC Agent retrieves
-relevant context from the RAG store, reads the current OPA policy state, and asks the LLM to
+relevant context from the Policy Store, reads the current OPA policy state, and asks the LLM to
 compute the minimal permission diff scoped to the affected entity. The diff is validated by a
 second LLM pass and applied to OPA as updated Rego rules. Supports both **auto-apply** (fully
 automated, least-privilege) and **recommendation + human review** modes.
 
 ### UC-2 · Policy Update Reconciliation
 
-**Trigger:** An operator ingests updated documents into the RAG store.
+**Trigger:** An operator ingests updated documents into the Policy Store.
 
-After ingestion the RAG Ingest Service publishes a build event. The AIAC Agent retrieves all
+After ingestion the Policy Ingest Service publishes a build event. The AIAC Agent retrieves all
 relevant context, computes a full policy diff against current OPA state, and applies the delta.
 A `rebuild` variant (operator-only, direct HTTP) first clears all OPA policy rules before
 recomputing from scratch — used when policy changes are too broad for incremental diff.
@@ -102,7 +102,7 @@ Manually granted entitlements are flagged as policy-agnostic and surfaced during
 
 ## 5. Architecture Overview
 
-Nine components across five Kubernetes Pods plus a Python library layer, all implemented in Python 3.12. External dependencies: Keycloak Admin API, an LLM API, and an embedding API. The Keycloak SPI listener is defined in a separate PRD.
+Nine components across six Kubernetes Pods plus a Python library layer, all implemented in Python 3.12. External dependencies: Keycloak Admin API, an LLM API, and an embedding API. The Keycloak SPI listener is defined in a separate PRD.
 
 ### Component Summary
 
@@ -112,10 +112,10 @@ Nine components across five Kubernetes Pods plus a Python library layer, all imp
 | 2 | **PDP Policy Writer** | REST service that applies LLM-generated Rego rules to the OPA backend. Writes derived Rego packages to an `AuthorizationPolicy` Kubernetes CR. Exposed as ClusterIP service `aiac-pdp-policy-service:7072`. Python library: `aiac.pdp.policy.library`. |
 | 3 | **Policy Model Store** | REST service that owns an in-memory `PolicyModel` cache backed by SQLite as the authoritative structured policy store. Enables the Policy Computation Engine to read current `AgentPolicyModel` state for additive merging. Deployed as a dedicated single-replica StatefulSet (`aiac-policy-model-store`) at `:7074`. Python library: `aiac.policy.model_store.library`. |
 | 4 | **Policy Computation Engine** | Pure Python library module (`aiac.policy.computation`). No service, no Kubernetes deployment. Receives `list[PolicyRule]` from AIAC Agent sub-agents, queries IdP to resolve owning services, additively merges rules into `AgentPolicyModel` objects in the Policy Model Store, and pushes the updated `PolicyModel` to the PDP Policy Writer. Single entry point: `compute_and_apply(rules)`. |
-| 5 | **Policy and Domain Knowledge RAG** | ChromaDB vector store holding the access control policy and domain knowledge in persistent, queryable form, populated via a co-located RAG Ingest Service. |
-| 6 | **Policy Guardrails Agent** | Verification gate co-located with ChromaDB and the RAG Ingest Service in the RAG Pod. Every document is checked before the RAG Ingest Service writes it to ChromaDB. Reachable only on the RAG Pod's loopback network — not exposed on the RAG Pod's ClusterIP Service. One service, two API families (`policy`, `domain-knowledge`); the `policy` family runs LLM-backed hygiene + corpus-contradiction checks (defined), `domain-knowledge` specced later. |
-| 7 | **Event Broker** | NATS JetStream pod that decouples event producers (Keycloak SPI listener, RAG Ingest Service) from the AIAC Agent. Provides durable, at-least-once delivery with automatic replay on Agent pod restart. Competing consumer model ensures each event is processed exactly once. |
-| 8 | **AIAC Agent** | LangGraph-based AI agent triggered by Event Broker subscriptions (`aiac.apply.>` subjects) and directly by the operator (`rebuild` only). Retrieves the current policy from the RAG store, interprets it against live PDP state, and applies the required policy changes immediately. |
+| 5 | **Policy Store** | ChromaDB vector store holding the source-of-truth access control policy and domain knowledge in persistent, queryable form. Runs as its own stateful **Policy Store Pod** (`aiac-policy-store-service:8000`), populated by the Policy Ingest Service in the separate Policy Ingest Pod. |
+| 6 | **Policy Validation Agent** | Verification gate that is an **in-process module** of the Policy Ingest Service (Policy Ingest Pod), not a separate service. Every document is checked — via an in-process function call, no network hop — before the Policy Ingest Service writes it to ChromaDB. Always on (no bypass). Two entry-point families (`policy`, `domain-knowledge`); the `policy` family runs LLM-backed hygiene + corpus-contradiction checks (defined), `domain-knowledge` specced later. |
+| 7 | **Event Broker** | NATS JetStream pod that decouples event producers (Keycloak SPI listener, Policy Ingest Service) from the AIAC Agent. Provides durable, at-least-once delivery with automatic replay on Agent pod restart. Competing consumer model ensures each event is processed exactly once. |
+| 8 | **AIAC Agent** | LangGraph-based AI agent triggered by Event Broker subscriptions (`aiac.apply.>` subjects) and directly by the operator (`rebuild` only). Retrieves the current policy from the Policy Store, interprets it against live PDP state, and applies the required policy changes immediately. |
 | 9 | **Python library** | Python API library provides typed access to IdP and policy services via `aiac.idp.configuration`, `aiac.policy.model`, `aiac.policy.model_store.library`, `aiac.pdp.policy.library`, and `aiac.policy.computation` modules backed by generic Pydantic models. |
 
 ### High-level architecture
@@ -131,7 +131,7 @@ Nine components across five Kubernetes Pods plus a Python library layer, all imp
 │      ┌───────┴──────┐      ┌────────┴───────┐           │
 │      │  IdP Config  │      │  PDP Policy    │           │
 │      │  Service     │      │  Writer (OPA)  │           │
-│      └──────────────┘      └────────────────┘           │
+│      └───────┬──────┘      └────────┬───────┘           │
 │              ▲                      ▲                   │
 └──────────────┼──────────────────────┼───────────────────┘
                │                      │
@@ -144,36 +144,40 @@ Nine components across five Kubernetes Pods plus a Python library layer, all imp
              │ │   │  │  Policy Model Store Service   │   │
              │ │   │  │                               │   │
              │ │   │  │     (SQLite policy.db)        │   │
-             │ │   │  └───────────────────────────────┘   │
+             │ │   │  └───────────────┬───────────────┘   │
              │ │   │                  ▲                   │
              │ │   └──────────────────┼───────────────────┘
              │ │                      │
 ┌────────────┼─┼──────────────────────┼───────────────────┐  ┌────────────────────────────────┐
 │  Agent Pod │ └───────────────────┐  │                   │  │  Event Broker Pod              │
 │            │                     │  │                   │  │                                │
-│  ┌─────────┴────────────┐   ┌────────────────┐          │  │  ┌──────────────────────────┐  │
+│  ┌─────────┴────────────┐   ┌────┴──┴────────┐          │  │  ┌──────────────────────────┐  │
 │  │ Policy Compute Engn  │◄──│   AIAC Agent   │◄─────────┼──┼──│      NATS JetStream      │  │
-│  └──────────────────────┘   └────────────────┘  (𝘯𝘰𝘵𝘪𝘧𝘺) │  │  └──────────────────────────┘  │
+│  └──────────────────────┘   └────────────────┘  (𝘯𝘰𝘵𝘪𝘧𝘺) │  │  └──────┬──────────────┬────┘  │
 │                                     │                   │  │         ▲              ▲       │
 │                                     │                   │  │         │              │       │
 └─────────────────────────────────────┼───────────────────┘  └─────────┼──────────────┼───────┘
                                       │                            (𝘱𝘶𝘣𝘭𝘪𝘴𝘩)        (𝘱𝘶𝘣𝘭𝘪𝘴𝘩)
 ┌─────────────────────────────────────┼───────────────────┐            │              │
-│  Policy / Domain Knowledge RAG Pod  │                   │       (𝗞𝗲𝘆𝗰𝗹𝗼𝗮𝗸 𝗦𝗣𝗜)  (𝗥𝗔𝗚 𝗜𝗻𝗴𝗲𝘀𝘁)
+│  Policy Store Pod (ChromaDB)        │                   │       (𝗞𝗲𝘆𝗰𝗹𝗼𝗮𝗸 𝗦𝗣𝗜)  (𝗣𝗼𝗹𝗶𝗰𝘆 𝗜𝗻𝗴𝗲𝘀𝘁)
 │                                     ▼                   │
-│  ┌─────────────────────┐   ┌─────────────────────────┐  │
-│  │ RAG Ingest Service  │──►│ ChromaDB (vector store) │  │
-│  └──────────┬──────────┘   └─────────────────────────┘  │
-│             │ (verify)                   ▲ (context)    │
-│             ▼                            │              │
-│  ┌─────────────────────────┐             │              │
-│  │ Policy Guardrails Agent │─────────────┘              │
-│  └─────────────────────────┘                            │
+│         ┌───────────────────────────┴─────┐             │
+│         │     ChromaDB (vector store)     │             │
+│         └───────────────┬─────────────────┘             │
+│                         ▲                               │
+└─────────────────────────┼───────────────────────────────┘
+                          │
+┌─────────────────────────┴───────────────────────────────┐
+│  Policy Ingest Pod                                      │
+│         ┌────────────────────────────────┐              │
+│         │ Policy Ingest Service          │              │
+│         │   └─ Policy Validation Agent   │              │
+│         └────────────────────────────────┘              │
 └─────────────────────────────────────────────────────────┘
 ```
 
 All inter-pod traffic is Kubernetes ClusterIP. External access is exclusively via
-`kubectl port-forward` (operator/developer) or NATS publish (Keycloak SPI, RAG Ingest).
+`kubectl port-forward` (operator/developer) or NATS publish (Keycloak SPI, Policy Ingest).
 
 ### Call Flows
 
@@ -233,9 +237,9 @@ All inter-pod traffic is Kubernetes ClusterIP. External access is exclusively vi
  Operator
       │ 1. POST /ingest/policy/{text|file|url}
       ▼
- RAG Ingest Service
-      │ 2. verify document (pre-flight, all-or-nothing) ──► Policy Guardrails Agent
-      │ 3. upsert documents ──► ChromaDB
+ Policy Ingest Service
+      │ 2. verify document (pre-flight, all-or-nothing) ──► Policy Validation Agent (in-process)
+      │ 3. upsert documents ──► ChromaDB (Policy Store Pod, cross-pod ClusterIP)
       │ 4. publish aiac.apply.policy.build
       ▼
  NATS JetStream
@@ -287,10 +291,10 @@ All inter-pod traffic is Kubernetes ClusterIP. External access is exclusively vi
 | `aiac.policy.model` | `aiac.pdp.policy.library`, `aiac.policy.model_store.library`, `aiac.policy.computation`, AIAC Agent | — | Pydantic model definitions for policy entities (PolicyRule, AgentPolicyModel, PolicyModel) |
 | `aiac.pdp.policy.library` | `aiac.policy.computation` | PDP Policy Writer — OPA (HTTP) | None (writes Rego policy rules to AuthorizationPolicy CR) |
 | `aiac.policy.model_store.library` | `aiac.policy.computation` | Policy Model Store (HTTP) | `AgentPolicyModel` / `PolicyModel` on read; None on write/delete |
-| ChromaDB | RAG Ingest Service (writes), Policy Guardrails Agent (reads, context), AIAC Agent (reads) | — | Policy and domain knowledge vectors |
-| RAG Ingest Service | Developer (via `kubectl port-forward`) | ChromaDB, Policy Guardrails Agent, Embedding API, Event Broker | — |
-| Policy Guardrails Agent (in RAG Pod) | RAG Ingest Service | ChromaDB (context reads) | Verdict per document — contract TBD |
-| Event Broker (NATS JetStream) | Keycloak SPI listener, RAG Ingest Service (publishers); NATS JetStream (DLQ routing) | — | Durable event delivery to AIAC Agent; DLQ on max retries |
+| ChromaDB (Policy Store Pod) | Policy Ingest Service (writes, cross-pod), Policy Validation Agent (reads, context, cross-pod), AIAC Agent (reads) | — | Policy and domain knowledge vectors |
+| Policy Ingest Service (Policy Ingest Pod) | Developer (via `kubectl port-forward`) | ChromaDB (Policy Store Pod), Policy Validation Agent (in-process), Embedding API, Event Broker | — |
+| Policy Validation Agent (in-process module of Policy Ingest Service) | Policy Ingest Service | ChromaDB (context reads, cross-pod) | Verdict per document — contract TBD |
+| Event Broker (NATS JetStream) | Keycloak SPI listener, Policy Ingest Service (publishers); NATS JetStream (DLQ routing) | — | Durable event delivery to AIAC Agent; DLQ on max retries |
 | AIAC Agent | Event Broker (NATS consumer), operator (`/apply/policy/rebuild` HTTP direct) | Service Onboarding / Policy Update / Role Update orchestrators → `aiac.idp.configuration.api`, `aiac.policy.computation`, ChromaDB, LLM API, Kubernetes API | Rego policy written to AuthorizationPolicy CR; structured policy written to Policy Model Store (SQLite); provisioned service permissions/scopes (onboarding) |
 
 ### Key architectural decisions
@@ -306,18 +310,18 @@ All inter-pod traffic is Kubernetes ClusterIP. External access is exclusively vi
 - **PCE merge semantics are additive, with drift-GC and an authoritative offboard.** The default merge (`override=False`) is additive — new rules are appended to a service's SPM `inbound_rules` (dedup by `role.id + scope.id`); existing edges are preserved. Two mechanisms remove edges: (1) **reconcile drift-GC** prunes each *touched* SPM against the `get_services()` catalog on every write, dropping edges whose scope or agent-role no longer exists and collapsing churned/duplicate user-role generations (order-independent; skipped on a catalog miss so a transient outage never wipes an SPM); and (2) **`decommission(service_id)`** — the authoritative service **offboard** — deletes a decommissioned service's SPM, purges its outbound footprint from other SPMs, deletes its APM/Rego if it was an agent, and re-derives every affected agent (keyed by clientId, since an offboarded client is gone from `get_services()`). Fine-grained **single-rule** revocation is still TBD; `override=True` gives role-level replace.
 - **PDP services bind to `0.0.0.0`.** Exposed as Kubernetes ClusterIP Services so that the Agent Pod can reach them over the cluster network.
 - **RBAC via OPA Rego rules.** AIAC manages role → service permission mappings by writing `AgentPolicyModel` instances to the `AuthorizationPolicy` CR. Each agent pod's OPA plugin fetches its packages from the CR at startup.
-- **RAG Pod is a StatefulSet with persistent ChromaDB storage.** ChromaDB data is stored on a 1 Gi `ReadWriteOnce` PersistentVolumeClaim mounted at `/chroma/chroma` (ChromaDB default). On pod recreation, the StatefulSet rebinds the same PVC and ChromaDB resumes from persisted state without re-ingestion. The pod runs a single replica.
-- **RAG Pod runs ChromaDB, RAG Ingest Service, and the Policy Guardrails Agent together.** Exposed as `aiac-rag-service` on ports 8000 (ChromaDB default) and 7073 (RAG Ingest Service).
-- **The Policy Guardrails Agent is not exposed on the RAG Pod's ClusterIP Service.** It is reachable only on the pod's loopback network (`localhost:7075`), making the RAG Ingest Service structurally the only caller.
-- **Guardrails verification is a synchronous, per-document, pre-flight, fail-closed gate.** The RAG Ingest Service calls the Policy Guardrails Agent once per document before making any ChromaDB mutation; any rejection fails the whole request with nothing written, and an unreachable or erroring agent is treated the same as a rejection unless verification is explicitly disabled via `AIAC_GUARDRAILS_ENABLED`.
-- **The Policy Guardrails Agent has no Event Broker involvement.** It neither publishes nor consumes NATS subjects; the RAG Ingest Service's existing `aiac.apply.policy.build` publish is unchanged.
+- **ChromaDB runs in its own stateful Policy Store Pod, split from the stateless Policy Ingest Pod.** ChromaDB was pulled out of the former single RAG Pod into a dedicated StatefulSet (`aiac-policy-store`, ClusterIP `aiac-policy-store-service:8000`) so its persistence lifecycle is isolated from the stateless ingest path. ChromaDB data is stored on a 1 Gi `ReadWriteOnce` PersistentVolumeClaim mounted at `/chroma/chroma` (ChromaDB default). On pod recreation, the StatefulSet rebinds the same PVC and ChromaDB resumes from persisted state without re-ingestion. The Policy Store Pod runs a single replica.
+- **The Policy Ingest Service runs in a stateless single-replica Policy Ingest Pod.** Exposed as `aiac-policy-ingest-service:7073`, it holds no persistent state and reaches ChromaDB across the cluster network via `AIAC_POLICY_STORE_URL` (`aiac-policy-store-service:8000`). Because ChromaDB is now a separate pod, the ingest service being healthy no longer implies ChromaDB is up — each is probed independently.
+- **Policy Validation Agent is an in-process module of the Policy Ingest Service, not a separate service.** It was merged into the ingest container as an in-process Python module — no `:7075`, no loopback HTTP hop, no ClusterIP exposure. The Policy Ingest Service invokes it as a direct function call, making it structurally the only caller.
+- **Policy Validation Agent is a synchronous, per-document, pre-flight, fail-closed gate.** The Policy Ingest Service calls the validation module once per document before making any ChromaDB mutation; any rejection fails the whole request with nothing written, and a module that raises is treated the same as a rejection. Validation is always on — there is no bypass switch.
+- **Policy Validation Agent has no Event Broker involvement.** It neither publishes nor consumes NATS subjects; the Policy Ingest Service's existing `aiac.apply.policy.build` publish is unchanged.
 - **AIAC Agent is stateless.** Changes are applied immediately on trigger — no pending session or human confirmation step.
-- **Event Broker decouples all automated triggers from the Agent.** The Keycloak SPI listener and RAG Ingest Service publish to NATS subjects; the Agent subscribes as a durable competing consumer. This removes all direct dependencies between trigger sources and the Agent.
+- **Event Broker decouples all automated triggers from the Agent.** The Keycloak SPI listener and Policy Ingest Service publish to NATS subjects; the Agent subscribes as a durable competing consumer. This removes all direct dependencies between trigger sources and the Agent.
 - **`rebuild` bypasses the Event Broker.** It is an operator-only command issued directly via HTTP (`kubectl port-forward`). It is never published to NATS and has no NATS listener.
 - **NATS consumer is a thin adapter.** It receives events from the Event Broker and calls the same internal handler functions used by the debug HTTP endpoints. No business logic lives in the consumer.
 - **Agent HTTP endpoints are retained for debugging.** They are not the primary trigger path; the NATS consumer is. `kubectl port-forward` to the Agent is used only for `rebuild` and debugging.
 - **Event Broker uses WorkQueuePolicy.** Messages are removed from the stream after acknowledgement. Unacknowledged messages survive Agent pod restarts and are redelivered automatically. After 5 failed deliveries, messages are routed to `aiac.apply.dlq`.
-- **AIAC init container gates Agent startup.** Before the Agent container starts, the init container waits for NATS, IdP Configuration Service, PDP Policy Writer, and RAG Ingest Service to be healthy, then creates the `aiac-events` JetStream stream idempotently. _(Deferred to Phase 2 — issue 4.21; the Phase 1 Agent pod runs without it.)_
+- **AIAC init container gates Agent startup.** Before the Agent container starts, the init container waits for NATS, IdP Configuration Service, PDP Policy Writer, the Policy Ingest Service (Policy Ingest Pod), and ChromaDB (Policy Store Pod, probed independently via a TCP connect since it has no `/health`) to be healthy, then creates the `aiac-events` JetStream stream idempotently. _(Deferred to Phase 2 — issue 4.21; the Phase 1 Agent pod runs without it.)_
 - **All `__init__.py` files under `aiac.*` are empty.** Callers use explicit submodule paths: `from aiac.idp.configuration.models import Subject`, `from aiac.policy.model.models import PolicyModel`.
 - **ChromaDB hosts two collections: `aiac-policies` and `aiac-domain-knowledge`.** Collection slug to ChromaDB name mapping: `policy` → `aiac-policies`, `domain-knowledge` → `aiac-domain-knowledge`.
 - **`user/{id}` trigger not implemented.** OPA rules are role-scoped; individual user creation/update does not require agent intervention — OPA rule evaluation resolves entitlements from the caller's role automatically.
@@ -403,7 +407,7 @@ Python package at `aiac/src/`. Clean `idp` / `pdp` / `policy` namespace split:
 
 ### 7.6 Event Broker
 
-NATS JetStream pod (`aiac-event-broker-service:4222`). Decouples event producers (Keycloak SPI listener, RAG Ingest Service) from the AIAC Agent. Provides at-least-once delivery, replay on pod restart via `WorkQueuePolicy`, and a dead-letter subject (`aiac.apply.dlq`) after 5 failed deliveries. No authentication — ClusterIP network isolation is the access control mechanism. Stream: `aiac-events`, subjects `aiac.apply.>`, consumer group `aiac-agent-consumer`.
+NATS JetStream pod (`aiac-event-broker-service:4222`). Decouples event producers (Keycloak SPI listener, Policy Ingest Service) from the AIAC Agent. Provides at-least-once delivery, replay on pod restart via `WorkQueuePolicy`, and a dead-letter subject (`aiac.apply.dlq`) after 5 failed deliveries. No authentication — ClusterIP network isolation is the access control mechanism. Stream: `aiac-events`, subjects `aiac.apply.>`, consumer group `aiac-agent-consumer`.
 
 **Full spec:** [components/event-broker.md](components/event-broker.md)
 
@@ -425,27 +429,27 @@ All sub-agent `StateGraph` instances are logically separated modules running wit
 
 ---
 
-### 7.8 RAG Knowledge Base
+### 7.8 Policy Store
 
-ChromaDB vector store (`aiac-rag-service:8000`) hosting two collections: `aiac-policies` (access control policy rules) and `aiac-domain-knowledge` (org/business context such as team rosters, application ownership, and department mappings). Both collections are managed by the RAG Ingest Service and read by the AIAC Agent. Co-located with the RAG Ingest Service in the RAG Pod. ChromaDB data is persisted on a 1 Gi PVC mounted at `/chroma/chroma`; the RAG Pod is a StatefulSet.
+ChromaDB vector store (`aiac-policy-store-service:8000`) hosting two collections: `aiac-policies` (access control policy rules) and `aiac-domain-knowledge` (org/business context such as team rosters, application ownership, and department mappings). Both collections are managed by the Policy Ingest Service (in the separate Policy Ingest Pod, reaching ChromaDB across the cluster network) and read by the AIAC Agent. Runs in its own stateful **Policy Store Pod** — a single-replica StatefulSet (`aiac-policy-store`) with ChromaDB data persisted on a 1 Gi PVC mounted at `/chroma/chroma`, decoupled from the stateless ingest path.
 
-**Full spec:** [components/rag-knowledge-base.md](components/rag-knowledge-base.md)
-
----
-
-### 7.9 RAG Ingest Service
-
-FastAPI service (`0.0.0.0:7073`) co-located with ChromaDB. Thirteen collection-parameterized endpoints across three semantics: complete collection replacement (`POST /ingest/{collection}/{text|file|url}`), document-level upsert (`POST /ingest/{collection}/update/{text|file|url}`), and explicit removal (`DELETE /ingest/{collection}/{doc_id}`). The `{collection}` slug is validated against `AIAC_RAG_COLLECTIONS` (default: `policy,domain-knowledge`). After every successful ingest the service publishes to `aiac.apply.policy.build` on the Event Broker (`NATS_URL`). Developer access via `kubectl port-forward`.
-
-**Full spec:** [components/rag-ingest-service.md](components/rag-ingest-service.md)
+**Full spec:** [components/policy-store.md](components/policy-store.md)
 
 ---
 
-### 7.10 Policy Guardrails Agent
+### 7.9 Policy Ingest Service
 
-FastAPI service (`0.0.0.0:7075`) co-located with ChromaDB and the RAG Ingest Service in the **RAG Pod**. Verifies each document before the RAG Ingest Service writes it to ChromaDB — one verification call per document, pre-flight (before any ChromaDB mutation), all-or-nothing (any rejection fails the whole ingest request, nothing is written), fail-closed (an unreachable or erroring agent is treated as a rejection unless verification is disabled via `AIAC_GUARDRAILS_ENABLED`). Reachable only on the RAG Pod's loopback network — not exposed on `aiac-rag-service`, so the RAG Ingest Service is structurally the only caller. May read ChromaDB for evaluation context. Neither publishes nor consumes Event Broker subjects. One service exposing two independently-developed API families (`policy`, `domain-knowledge`) selected by collection slug. The `policy` family is defined — LangGraph agent running **policy hygiene** (on-topic/well-formed, actionable/translatable, internally consistent) and **contradiction against the persistent corpus** (`update` only; `replace` gets hygiene only), returning a two-level-severity verdict; the `domain-knowledge` family is specced independently later.
+FastAPI service (`0.0.0.0:7073`) in its own stateless single-replica **Policy Ingest Pod** (`aiac-policy-ingest-service:7073`), reaching ChromaDB across the cluster network via `CHROMA_URL` (`aiac-policy-store-service:8000`). Bundles **Policy Validation Agent** as an in-process module (§7.10). Thirteen collection-parameterized endpoints across three semantics: complete collection replacement (`POST /ingest/{collection}/{text|file|url}`), document-level upsert (`POST /ingest/{collection}/update/{text|file|url}`), and explicit removal (`DELETE /ingest/{collection}/{doc_id}`). The `{collection}` slug is validated against `AIAC_RAG_COLLECTIONS` (default: `policy,domain-knowledge`). After every successful ingest the service publishes to `aiac.apply.policy.build` on the Event Broker (`NATS_URL`). Developer access via `kubectl port-forward`.
 
-**Full spec:** [components/policy-guardrails-agent.md](components/policy-guardrails-agent.md)
+**Full spec:** [components/policy-ingest-service.md](components/policy-ingest-service.md)
+
+---
+
+### 7.10 Policy Validation Agent
+
+An **in-process Python module** of the Policy Ingest Service (Policy Ingest Pod) — not a separate service, no `:7075`, no HTTP hop. Verifies each document before the Policy Ingest Service writes it to ChromaDB — invoked as a direct function call, one verification per document, pre-flight (before any ChromaDB mutation), all-or-nothing (any rejection fails the whole ingest request, nothing is written), fail-closed (a module that raises is treated as a rejection). Always on — there is no bypass switch. Structurally the only caller is the Policy Ingest Service that hosts it. May read ChromaDB (cross-pod, `aiac-policy-store-service:8000`) for evaluation context. Neither publishes nor consumes Event Broker subjects. Two independently-developed entry-point families (`policy`, `domain-knowledge`) selected by collection slug. The `policy` family is defined — a LangGraph graph running **policy hygiene** (on-topic/well-formed, actionable/translatable, internally consistent) and **contradiction against the persistent corpus** (`update` only; `replace` gets hygiene only; an empty corpus short-circuits the contradiction check to accept), returning a two-level-severity verdict; the `domain-knowledge` family is specced independently later.
+
+**Full spec:** [components/policy-validation-agent.md](components/policy-validation-agent.md)
 
 ---
 
@@ -467,7 +471,7 @@ A custom Keycloak Event Listener SPI (Java) that listens to Keycloak's internal 
 
 ### Kubernetes manifests
 
-Four separate manifest files:
+Separate manifest files, one per pod:
 
 | File | Contents |
 |------|----------|
@@ -475,7 +479,8 @@ Four separate manifest files:
 | `aiac/k8s/policy-model-store-statefulset.yaml` | `aiac-policy-model-store` StatefulSet (Policy Model Store container) + `volumeClaimTemplate` (1 Gi, `ReadWriteOnce`, mounted at `/data`) + headless Service + `aiac-policy-model-store-service:7074` ClusterIP Service |
 | `aiac/k8s/agent-deployment.yaml` | Agent Pod Deployment (AIAC Agent container) + ClusterIP Service _(Phase 1; `aiac-init` init container added in Phase 2, issue 4.21)_ |
 | `aiac/k8s/event-broker-deployment.yaml` _(pending)_ | Event Broker Pod Deployment (NATS JetStream) + ClusterIP Service |
-| `aiac/k8s/rag-statefulset.yaml` _(pending)_ | RAG StatefulSet (ChromaDB + RAG Ingest Service + Policy Guardrails Agent containers) + 1 Gi PVC template + ClusterIP Service (ChromaDB + RAG Ingest Service ports only — the Policy Guardrails Agent is pod-local, not on the ClusterIP Service) |
+| `aiac/k8s/policy-store-statefulset.yaml` | `aiac-policy-store` StatefulSet (ChromaDB container) + 1 Gi PVC template (mounted at `/chroma/chroma`) + headless Service + `aiac-policy-store-service:8000` ClusterIP Service |
+| `aiac/k8s/policy-ingest-deployment.yaml` | `aiac-policy-ingest-config` ConfigMap + `aiac-policy-ingest` Deployment (single container: Policy Ingest Service with Policy Validation Agent folded in as an in-process module) + `aiac-policy-ingest-service:7073` ClusterIP Service |
 
 Both Interface Pod containers mount `aiac-pdp-config` (KEYCLOAK_URL, KEYCLOAK_REALM, KEYCLOAK_ADMIN_REALM) as env vars; only the IdP Configuration Service container also mounts `keycloak-admin-secret` (KEYCLOAK_ADMIN_USERNAME, KEYCLOAK_ADMIN_PASSWORD) and uses `KEYCLOAK_ADMIN_REALM` (ignoring `KEYCLOAK_REALM`). The PDP Policy Writer (`aiac-pdp-policy-opa`, the Phase 1 rego-file mock) needs no Keycloak credentials — it writes `.rego` files to `REGO_OUTPUT_DIR` (default `/rego`, an `emptyDir` volume). The Policy Model Store container mounts `aiac-policy-model-store-config` for `SERVICEPOLICY_DB_PATH` (default `/data/policy_model.db`) — no Kubernetes API access or RBAC required.
 
@@ -499,11 +504,8 @@ docker build -f aiac/src/aiac/policy/model_store/service/Dockerfile -t aiac-poli
 # Build Agent (aiac-init init container deferred to Phase 2, issue 4.21)
 docker build -f aiac/src/aiac/agent/controller/Dockerfile -t aiac-agent:latest aiac/src/
 
-# Build RAG Ingest Service
-docker build -t aiac-rag-ingest:latest aiac/rag-ingest/
-
-# Build Policy Guardrails Agent
-docker build -t aiac-policy-guardrails:latest aiac/policy-guardrails/
+# Build Policy Ingest (Policy Ingest Service with Policy Validation Agent folded in as an in-process module)
+docker build -t aiac-policy-ingest:latest aiac/rag-ingest/
 ```
 
 The Event Broker uses the official `nats` Docker image with JetStream enabled (`-js` flag). No custom build required.
@@ -524,12 +526,12 @@ data:
   AIAC_POLICY_MODEL_STORE_URL: "http://aiac-policy-model-store-service:7074"
   # Added in Phase 2 by issue 4.19 (Event Broker):
   NATS_URL: "nats://aiac-event-broker-service:4222"
-  # Added in Phase 3 by issue 4.20 (RAG Pod):
-  AIAC_RAG_INGEST_URL: "http://aiac-rag-service:7073"
-  AIAC_CHROMADB_URL: "http://aiac-rag-service:8000"
+  # Added in Phase 3 by issue 4.20 (Policy Store + Policy Ingest pods):
+  AIAC_POLICY_INGEST_URL: "http://aiac-policy-ingest-service:7073"
+  AIAC_POLICY_STORE_URL: "http://aiac-policy-store-service:8000"
 ```
 
-`SERVICEPOLICY_DB_PATH` is absent — it belongs to `aiac-policy-model-store-config` (defined in `policy-model-store-statefulset.yaml`), not to the shared ConfigMap. Likewise, `AIAC_GUARDRAILS_URL` and `AIAC_GUARDRAILS_ENABLED` (RAG Ingest Service → Policy Guardrails Agent, both pod-local) belong to the RAG Pod's own ConfigMap, not the shared `aiac-pdp-config` — no component outside the RAG Pod calls the Policy Guardrails Agent.
+`SERVICEPOLICY_DB_PATH` is absent — it belongs to `aiac-policy-model-store-config` (defined in `policy-model-store-statefulset.yaml`), not to the shared ConfigMap. Likewise, `CHROMA_URL` (Policy Ingest Pod → Policy Store, used by both the ingest write path and the in-process Policy Validation Agent) belongs to the Policy Ingest Pod's own ConfigMap, not the shared `aiac-pdp-config`.
 
 ### `aiac-policy-model-store-config` ConfigMap template
 
@@ -564,8 +566,8 @@ Tests live in `aiac/test/`.
 | `aiac.policy.computation` | `aiac.idp.configuration.api`, `aiac.policy.model_store.library`, `aiac.pdp.policy.library` (import-boundary mocks) | Correct `apply_agent_policy` calls per resolved service; additive merge preserves existing rules; no duplicate rule insertion; `apply_policy` called once after all writes; exceptions logged and re-raised (propagate to the caller) |
 | Event Broker NATS consumer | NATS message delivery (mock `nats-py` subscription) | Correct handler dispatched per subject; ack issued on success; no ack on handler exception |
 | Event Broker DLQ | NATS max redelivery exceeded | Message routed to `aiac.apply.dlq` after 5 failures |
-| Init container health-check | HTTP 4xx then 200 sequence; NATS TCP refused then connected | Exits 0 only after all four dependencies healthy; `add_stream` called with correct config |
-| Policy Guardrails Agent endpoints | ChromaDB (context reads) | TBD — pending the verification endpoint and verdict contract |
+| Init container health-check | HTTP 4xx then 200 sequence; NATS + ChromaDB TCP refused then connected | Exits 0 only after all five dependencies healthy (NATS, IdP Config, PDP Policy, Policy Ingest, Policy Store); `add_stream` called with correct config |
+| Policy Validation Agent entry points | ChromaDB (context reads) | TBD — pending the verification function and verdict contract |
 | AIAC Agent | TBD | TBD |
 
 ### Integration tests
@@ -608,8 +610,8 @@ Tracking issues: the live-Keycloak pytest integration tests in `testing/5.1-inte
 - Base Docker image: `python:3.12-slim`
 - Linting: ruff (line length 120, target py312 per root `pyproject.toml`)
 - Commits: DCO sign-off required (`git commit -s`); use `Assisted-By` not `Co-Authored-By`
-- No auth on IdP Configuration Service, PDP Policy Writer, RAG Ingest Service, Policy Guardrails Agent, or Event Broker — network isolation (ClusterIP + `kubectl port-forward`; the Policy Guardrails Agent additionally has no ClusterIP exposure at all) is the access control mechanism
-- IdP Configuration Service, PDP Policy Writer, Agent, RAG Ingest Service, Policy Guardrails Agent, and Event Broker are not registered in the repo's `build.yaml` CI matrix; they have independent build processes
+- No auth on IdP Configuration Service, PDP Policy Writer, Policy Ingest Service, ChromaDB (Policy Store Pod), or Event Broker — network isolation (ClusterIP + `kubectl port-forward`) is the access control mechanism. Policy Validation Agent is an in-process module of the Policy Ingest Service, so it has no network surface of its own at all.
+- IdP Configuration Service, PDP Policy Writer, Agent, Policy Ingest Service (with Policy Validation Agent folded in), and Event Broker are not registered in the repo's `build.yaml` CI matrix; they have independent build processes
 - `aiac/__init__.py` exists and is empty — `aiac` is a regular package, not a namespace package
 - NATS consumer must **await** handler completion before issuing ack — fire-and-forget (`asyncio.create_task`) is prohibited; premature ack breaks at-least-once delivery guarantees
 - AIAC provisioning marker: every role and client scope AIAC provisions carries the Keycloak attribute `aiac.managed` = `true`, distinguishing AIAC-provisioned entities from Keycloak's built-ins (default client scopes, `default-roles-<realm>`). Realm-role attribute values are lists (`["true"]`), client-scope values are plain strings (`"true"`). The IdP Configuration Service stamps it on create and returns full role representations so it survives reads; the Policy Computation Engine filters on it (`Role.aiac_managed` / `Scope.aiac_managed`) when embedding each agent's own roles/scopes (P2)

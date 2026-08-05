@@ -6,7 +6,7 @@ A LangGraph-based AI agent service that enforces a natural-language access contr
 
 - **Event Broker** → `aiac.apply.service.{id}` subject (originated by Keycloak SPI `CLIENT_CREATED`)
 - **Event Broker** → `aiac.apply.role.{id}` subject (originated by Keycloak SPI role created/updated)
-- **Event Broker** → `aiac.apply.policy.build` subject (originated by RAG Ingest Service post-ingest)
+- **Event Broker** → `aiac.apply.policy.build` subject (originated by Policy Ingest Service post-ingest)
 - **Operator/admin call** → `POST /apply/policy/rebuild` directly via `kubectl port-forward` (HTTP only — not routed through Event Broker)
 
 The Agent subscribes to the Event Broker as a durable competing consumer (`aiac-agent-consumer` queue group). It acknowledges each message only after successful processing — ensuring at-least-once delivery and automatic replay on pod restart.
@@ -165,7 +165,7 @@ All endpoints return bare HTTP status codes: `200 OK` on success (no response bo
 | `AIAC_PDP_CONFIG_URL` | `http://aiac-pdp-config-service:7071` | ConfigMap (`aiac-pdp-config`) — used by `aiac.idp.configuration.api` (in-process via PCE) |
 | `AIAC_PDP_POLICY_URL` | `http://aiac-pdp-policy-service:7072` | ConfigMap (`aiac-pdp-config`) — used by `aiac.pdp.policy.library` (in-process via PCE) |
 | `AIAC_POLICY_MODEL_STORE_URL` | `http://aiac-policy-model-store-service:7074` | ConfigMap (`aiac-pdp-config`) — used by `aiac.policy.model_store.library` (in-process via PCE) |
-| `AIAC_CHROMADB_URL` | `http://aiac-rag-service:8000` | ConfigMap (`aiac-pdp-config`) |
+| `AIAC_POLICY_STORE_URL` | `http://aiac-policy-store-service:8000` | ConfigMap (`aiac-pdp-config`) — ChromaDB (Policy Store Pod) |
 | `KEYCLOAK_REALM` | — | ConfigMap (`aiac-pdp-config`) |
 | `LLM_BASE_URL` | — | ConfigMap |
 | `LLM_MODEL` | — | ConfigMap |

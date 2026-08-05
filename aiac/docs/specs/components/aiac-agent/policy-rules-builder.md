@@ -172,7 +172,7 @@ retry layers, kept distinct:
 | `AIAC_POLICY_FILE` | Path to the whole-file access policy (default `/etc/aiac/policy.md`) | 1 |
 | `LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY` | LLM calls | 1 |
 | `UPSTREAM_MAX_RETRIES` | Transport retry budget for LLM (and, in Phase 2, ChromaDB) calls (tenacity, default `3`) | 1 |
-| `AIAC_CHROMADB_URL` | ChromaDB endpoint | 2 |
+| `AIAC_POLICY_STORE_URL` | ChromaDB (Policy Store Pod) endpoint | 2 |
 | `CHROMA_N_RESULTS` | Number of results per ChromaDB query (default `10`) | 2 |
 
 `MAX_AUDIT_RETRIES` (default `3`) is a module constant, not an env var.

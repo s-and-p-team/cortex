@@ -1,0 +1,119 @@
+# PHASE 3 LOCAL / KIND DEV TOPOLOGY — Policy Ingest Pod
+#
+# The Policy Ingest Pod is stateless and single-replica. It runs the Policy Ingest
+# Service (chunk + embed + write to ChromaDB) with Policy Validation Agent folded in as
+# an in-process module — there is no separate validation service, no :7075 port,
+# and no in-pod HTTP hop. It is decoupled from the (stateful) Policy Store Pod
+# for lifecycle and resource isolation — see k8s/policy-store-statefulset.yaml.
+#
+# Uses a node-local image (`localhost/...:local` + `imagePullPolicy: Never`), so
+# it only runs on a cluster preloaded with that image (e.g. `kind load`). A
+# production deployment must publish immutable, versioned images and use
+# `imagePullPolicy: IfNotPresent` via a separate overlay.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: aiac-policy-ingest-config
+  namespace: aiac-system
+data:
+  # Cross-pod now: ChromaDB lives in the Policy Store Pod. This same URL is used
+  # by the ingest write path AND by the in-process Policy Validation Agent for
+  # its evaluation-context reads.
+  CHROMA_URL: "http://aiac-policy-store-service:8000"
+  AIAC_RAG_COLLECTIONS: "policy,domain-knowledge"
+  EMBEDDING_BASE_URL: ""
+  EMBEDDING_MODEL: ""
+  # No AIAC_GUARDRAILS_* keys: Policy Validation Agent is in-process and always on.
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aiac-policy-ingest
+  namespace: aiac-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: aiac-policy-ingest
+  template:
+    metadata:
+      labels:
+        app: aiac-policy-ingest
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        # Single container: Policy Ingest Service + in-process Policy Validation Agent
+        # module (both the ingest and validation dependencies ship in this one
+        # image). Only the ingest API is exposed, on :7073.
+        - name: aiac-policy-ingest
+          image: localhost/aiac-policy-ingest:local
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 7073
+          # Stateless: writes only temp files, which land on the /tmp emptyDir
+          # while the rest of the root filesystem stays read-only.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 7073
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 7073
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          envFrom:
+            # Pod-local ingest + validation config.
+            - configMapRef:
+                name: aiac-policy-ingest-config
+            # NATS_URL for the post-ingest aiac.apply.policy.build publish.
+            - configMapRef:
+                name: aiac-pdp-config
+            # EMBEDDING_API_KEY, pre-provisioned out-of-band (never committed).
+            # Optional in this dev manifest: the embedding provider is still TBD,
+            # so the pod starts without the secret present.
+            - secretRef:
+                name: aiac-embedding-secret
+                optional: true
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aiac-policy-ingest-service
+  namespace: aiac-system
+spec:
+  selector:
+    app: aiac-policy-ingest
+  ports:
+    - name: policy-ingest
+      port: 7073
+      targetPort: 7073

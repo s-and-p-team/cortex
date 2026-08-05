@@ -10,7 +10,7 @@
 
 | Source | Subject / Path |
 |---|---|
-| Event Broker (NATS) | `aiac.apply.policy.build` (originated by RAG Ingest Service post-ingest) |
+| Event Broker (NATS) | `aiac.apply.policy.build` (originated by Policy Ingest Service post-ingest) |
 | HTTP (debug / operator) | `POST /apply/policy/build` |
 | HTTP (operator only) | `POST /apply/policy/rebuild` (not routed through Event Broker) |
 

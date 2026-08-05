@@ -1,0 +1,128 @@
+# PHASE 3 LOCAL / KIND DEV TOPOLOGY — Policy Store Pod (ChromaDB)
+#
+# The Policy Store holds the *source-of-truth* natural-language policy (and the
+# org/business domain-knowledge corpus) as ChromaDB vectors. It is its own
+# stateful pod, decoupled from the (stateless) Policy Ingest Pod for lifecycle
+# and resource isolation — see k8s/policy-ingest-deployment.yaml.
+#
+# Uses the upstream `chromadb/chroma` image pulled from a registry (unlike the
+# node-local `localhost/...:local` AIAC images), so no `kind load` is needed for
+# this workload. A production deployment should pin an immutable, versioned tag.
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: aiac-policy-store
+  namespace: aiac-system
+spec:
+  replicas: 1
+  serviceName: aiac-policy-store-headless
+  selector:
+    matchLabels:
+      app: aiac-policy-store
+  template:
+    metadata:
+      labels:
+        app: aiac-policy-store
+    spec:
+      # ChromaDB persists to the /chroma/chroma PVC. fsGroup makes that mounted
+      # volume group-writable by the non-root UID; the kubelet leaves emptyDir/PVC
+      # volumes root-owned otherwise.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: chromadb
+          # Pinned upstream ChromaDB. It writes only to PERSIST_DIRECTORY
+          # (the /chroma/chroma PVC) and to /tmp at runtime, so it tolerates
+          # non-root UID 10001 + readOnlyRootFilesystem when both are mounted
+          # writable (below). HOME is redirected to the writable /tmp so no
+          # home-dir cache write is attempted, and telemetry is disabled.
+          image: chromadb/chroma:0.5.23
+          ports:
+            - containerPort: 8000
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          env:
+            - name: IS_PERSISTENT
+              value: "TRUE"
+            - name: PERSIST_DIRECTORY
+              value: /chroma/chroma
+            - name: ANONYMIZED_TELEMETRY
+              value: "FALSE"
+            - name: HOME
+              value: /tmp
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          # ChromaDB's heartbeat path is version-coupled, so probe the listener
+          # with a TCP check rather than an HTTP path.
+          readinessProbe:
+            tcpSocket:
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          volumeMounts:
+            - name: policy-store-data
+              mountPath: /chroma/chroma
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: policy-store-data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 1Gi
+
+---
+# Headless Service for StatefulSet DNS
+apiVersion: v1
+kind: Service
+metadata:
+  name: aiac-policy-store-headless
+  namespace: aiac-system
+spec:
+  clusterIP: None
+  selector:
+    app: aiac-policy-store
+  ports:
+    - name: chromadb
+      port: 8000
+      targetPort: 8000
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aiac-policy-store-service
+  namespace: aiac-system
+spec:
+  selector:
+    app: aiac-policy-store
+  ports:
+    - name: chromadb
+      port: 8000
+      targetPort: 8000

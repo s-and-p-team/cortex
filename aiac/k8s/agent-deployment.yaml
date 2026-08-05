@@ -86,7 +86,7 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       # aiac-init init container is deferred to Phase 2 (issue 4.21).
-      # It will gate startup on NATS + IdP Config + PDP Policy + RAG Ingest health
+      # It will gate startup on NATS + IdP Config + PDP Policy + Policy Ingest health
       # and provision the aiac-events JetStream stream.
       containers:
         - name: aiac-agent
