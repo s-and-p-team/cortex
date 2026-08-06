@@ -6,7 +6,7 @@ This guide covers the full AIAC deployment in the `aiac-system` namespace.
 
 | Manifest | Contents | Port(s) |
 |---|---|---|
-| `pdp-interface-deployment.yaml` | Kagenti Interface Pod (IdP Configuration Service + PDP Policy Writer **Phase 1 rego-file mock** `aiac-pdp-policy-opa`) + 2 ClusterIP Services | 7071, 7072 |
+| `pdp-interface-deployment.yaml` | Rossoctl Interface Pod (IdP Configuration Service + PDP Policy Writer **Phase 1 rego-file mock** `aiac-pdp-policy-opa`) + 2 ClusterIP Services | 7071, 7072 |
 | `policy-model-store-statefulset.yaml` | Policy Model Store StatefulSet + 1 Gi PVC + headless Service + ClusterIP Service | 7074 |
 | `agent-deployment.yaml` | Agent Pod Deployment (AIAC Agent) + ClusterIP Service | 7070 |
 
@@ -18,7 +18,7 @@ This guide covers the full AIAC deployment in the `aiac-system` namespace.
 
 ## 1 — Build the images
 
-Run from the repo root (`kagenti-extensions/`):
+Run from the repo root (`cortex/`):
 
 ```bash
 # IdP Configuration Service (Interface Pod container 1)
@@ -33,7 +33,7 @@ docker build -f aiac/src/aiac/pdp/service/policy/opa/Dockerfile \
   -t localhost/aiac-pdp-policy-opa:local \
   aiac/src/
 
-# Policy Store
+# Policy Model Store
 docker build -f aiac/src/aiac/policy/model_store/service/Dockerfile \
   -t localhost/aiac-policy-model-store:local aiac/src/
 
@@ -108,7 +108,7 @@ Edit the `aiac-pdp-config` ConfigMap in `pdp-interface-deployment.yaml` to match
 | Key | Default | Used by |
 |-----|---------|---------|
 | `KEYCLOAK_URL` | `http://keycloak-service.keycloak.svc:8080` | IdP Configuration Service, PDP Policy Writer |
-| `KEYCLOAK_REALM` | `kagenti` | PDP Policy Writer |
+| `KEYCLOAK_REALM` | `rossoctl` | PDP Policy Writer |
 | `KEYCLOAK_ADMIN_REALM` | `master` | IdP Configuration Service |
 | `AIAC_PDP_CONFIG_URL` | `http://aiac-pdp-config-service:7071` | Agent |
 | `AIAC_PDP_POLICY_URL` | `http://aiac-pdp-policy-service:7072` | Agent |
@@ -126,10 +126,10 @@ Apply in dependency order:
 # 1. Interface Pod — creates the namespace, ConfigMap, Secret, and ClusterIP Services
 kubectl apply -f aiac/k8s/pdp-interface-deployment.yaml
 
-# 2. Policy Store — needs the aiac-system namespace
+# 2. Policy Model Store — needs the aiac-system namespace
 kubectl apply -f aiac/k8s/policy-model-store-statefulset.yaml
 
-# 3. Agent — depends on the Interface Pod + Policy Store already being healthy
+# 3. Agent — depends on the Interface Pod + Policy Model Store already being healthy
 kubectl apply -f aiac/k8s/agent-deployment.yaml
 ```
 
@@ -156,7 +156,7 @@ kubectl port-forward svc/aiac-pdp-policy-service 7072:7072 -n aiac-system &
 curl http://localhost:7072/health
 # {"status":"ok"}
 
-# Policy Store
+# Policy Model Store
 kubectl port-forward svc/aiac-policy-model-store-service 7074:7074 -n aiac-system &
 curl http://localhost:7074/health
 # {"status":"ok"}
