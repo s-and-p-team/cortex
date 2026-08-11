@@ -7,6 +7,16 @@ The generated packages are **ID-only**: the Rego ``input`` carries only
 ``{subject, source, target}`` identifiers. All role/scope mappings are
 embedded in the package, and ``allow`` resolves IDs -> roles -> scopes
 internally.
+
+**ALLOW/DENY (deny-overrides).** Each gate is emitted twice — an ``*_allow_ok``
+gate driven by the ALLOW scope maps and a symmetric ``*_deny_ok`` gate driven by
+the DENY scope maps. A request is permitted iff every ALLOW gate passes and no
+DENY gate matches::
+
+    # inbound
+    allow if { subject_allow_ok; source_allow_ok; not subject_deny_ok; not source_deny_ok }
+    # outbound
+    allow if { subject_allow_ok; target_allow_ok; not subject_deny_ok; not target_deny_ok }
 """
 
 import json
@@ -92,23 +102,57 @@ def _name_map(mapping) -> dict[str, list[str]]:
     return {key: _names(values) for key, values in mapping.items()}
 
 
-# The subject gate is identical in both packages: the subject holds a role
-# that grants at least one of the agent's own scopes.
-_SUBJECT_OK = (
-    "subject_ok if {\n"
-    "    some role in subject_roles[input.subject]\n"
-    "    some scope in role_scopes[role]\n"
-    "    scope in agent_scopes\n"
-    "}"
-)
+# --- inbound gate templates -------------------------------------------------
+#
+# Each principal (subject / source) is gated twice against the SAME shape: an
+# ``*_allow_ok`` gate reads the ALLOW scope map, a symmetric ``*_deny_ok`` gate
+# reads the DENY scope map. Both require the matched scope to be one of the
+# agent's own ``agent_scopes`` (the inbound audience). A subject/source that
+# only appears in a DENY rule still resolves because the identity maps
+# (``subject_roles`` / ``source_roles``) are effect-agnostic.
+
+
+def _subject_gate(gate: str, scope_map: str) -> str:
+    return (
+        f"{gate} if {{\n"
+        "    some role in subject_roles[input.subject]\n"
+        f"    some scope in {scope_map}[role]\n"
+        "    scope in agent_scopes\n"
+        "}"
+    )
+
+
+def _source_allow_gate() -> str:
+    # An absent source passes the ALLOW gate (source is optional inbound).
+    return (
+        "source_allow_ok if { not input.source }\n"
+        "source_allow_ok if {\n"
+        "    some role in source_roles[input.source]\n"
+        "    some scope in source_role_allow_scopes[role]\n"
+        "    scope in agent_scopes\n"
+        "}"
+    )
+
+
+def _source_deny_gate() -> str:
+    # An absent source has no roles, so the DENY gate simply never fires for it.
+    return (
+        "source_deny_ok if {\n"
+        "    some role in source_roles[input.source]\n"
+        "    some scope in source_role_deny_scopes[role]\n"
+        "    scope in agent_scopes\n"
+        "}"
+    )
 
 
 def generate_inbound_rego(model: AgentPolicyModel) -> str:
     """Render the ``authz.{slug}.inbound`` Rego package for an agent.
 
     Input is ``{subject, source}`` (ids only). ``subject`` is mandatory;
-    ``source`` is optional (absent source passes). The gate is coarse: it
-    passes when the principal holds a role granting >=1 of ``agent_scopes``.
+    ``source`` is optional (absent source passes the ALLOW gate). The decision is
+    deny-overrides: it passes when the subject *and* source ALLOW gates pass and
+    neither DENY gate matches. Each ALLOW/DENY gate is coarse — it fires when the
+    principal holds a role granting/prohibiting >=1 of ``agent_scopes``.
     """
     slug = slugify(model.agent_id)
     parts = [
@@ -116,50 +160,75 @@ def generate_inbound_rego(model: AgentPolicyModel) -> str:
         _render_list("agent_scopes", _names(model.agent_scopes)),
         _render_map("subject_roles", _name_map(model.subject_roles)),
         _render_map("source_roles", _name_map(model.source_roles)),
-        _render_map("role_scopes", _group_rules(model.inbound_rules)),
-        _SUBJECT_OK,
-        (
-            "source_ok if { not input.source }\n"
-            "source_ok if {\n"
-            "    some role in source_roles[input.source]\n"
-            "    some scope in role_scopes[role]\n"
-            "    scope in agent_scopes\n"
-            "}"
+        _render_map(
+            "subject_role_allow_scopes",
+            _group_rules(model.inbound_subject_allow_rules),
         ),
-        "default allow := false\nallow if { subject_ok; source_ok }",
+        _render_map(
+            "subject_role_deny_scopes",
+            _group_rules(model.inbound_subject_deny_rules),
+        ),
+        _render_map(
+            "source_role_allow_scopes",
+            _group_rules(model.inbound_source_allow_rules),
+        ),
+        _render_map(
+            "source_role_deny_scopes",
+            _group_rules(model.inbound_source_deny_rules),
+        ),
+        _subject_gate("subject_allow_ok", "subject_role_allow_scopes"),
+        _subject_gate("subject_deny_ok", "subject_role_deny_scopes"),
+        _source_allow_gate(),
+        _source_deny_gate(),
+        (
+            "default allow := false\n"
+            "allow if { subject_allow_ok; source_allow_ok; "
+            "not subject_deny_ok; not source_deny_ok }"
+        ),
     ]
     return "\n\n".join(parts) + "\n"
 
 
-# The outbound decision is a per-scope two-gate AND, both keyed on the requested scope
-# ``input.function_name`` (user->target, where a target is a tool or another agent):
-#   subject gate  — the user (subject) is granted the requested scope
+# --- outbound gate templates ------------------------------------------------
+#
+# The outbound decision is a per-scope two-gate AND, both keyed on the requested
+# scope ``input.function_name`` (user->target, where a target is a tool or another
+# agent):
+#   subject gate    — the user (subject) is granted the requested scope
 #   capability gate — the agent reaches the requested scope on the requested target
-# Testing the SAME function_name in both gates makes ``allow`` a genuine per-scope intersection:
-# an A/B mismatch (user reaches A, agent reaches B) denies both A and B.
-_OUTBOUND_SUBJECT_OK = (
-    "subject_ok if {\n"
-    "    some role in subject_roles[input.subject]\n"
-    "    input.function_name in subject_role_scopes[role]\n"
-    "}"
-)
+# Each gate is emitted twice (allow/deny). ``allow`` is deny-overrides: both ALLOW
+# gates pass on the requested scope and neither DENY gate matches it.
+
+
+def _outbound_subject_gate(gate: str, scope_map: str) -> str:
+    return (
+        f"{gate} if {{\n"
+        "    some role in subject_roles[input.subject]\n"
+        f"    input.function_name in {scope_map}[role]\n"
+        "}"
+    )
+
+
+def _target_gate(gate: str, scope_map: str) -> str:
+    return f"{gate} if {{\n    input.function_name in {scope_map}[input.target]\n}}"
 
 
 def generate_outbound_rego(model: AgentPolicyModel) -> str:
     """Render the ``authz.{slug}.outbound`` Rego package for an agent.
 
     Input is ``{subject, target, function_name}`` (ids only). ``function_name`` is the
-    requested target scope. ``allow`` is a **per-scope AND** on that scope: the subject
-    gate passes iff the subject holds a role granted ``function_name`` (user->target, via
-    ``subject_role_scopes`` from ``outbound_subject_rules``), AND the capability
-    gate passes iff the agent reaches ``function_name`` on the requested ``target``
-    (``target_scopes[input.target]``, built from the agent's outbound rules). Because both
-    gates test the *same* ``function_name``, ``allow`` is a genuine per-scope intersection.
+    requested target scope. ``allow`` is a deny-overrides **per-scope AND** on that scope:
+    the subject ALLOW gate passes iff the subject holds a role granted ``function_name``
+    (user->target, via ``subject_role_allow_scopes`` from ``outbound_subject_allow_rules``),
+    the capability ALLOW gate passes iff the agent reaches ``function_name`` on the requested
+    ``target`` (``target_allow_scopes[input.target]``), and neither the ``subject_role_deny_scopes``
+    nor the ``target_deny_scopes`` gate matches. Because every gate tests the *same*
+    ``function_name``, ``allow`` is a genuine per-scope intersection minus the denies.
 
-    ``target_scopes`` is used directly (target id -> scopes) -- no inversion. A target is a
-    tool the agent calls or another agent it calls. ``agent_roles`` / ``agent_role_scopes``
-    are still emitted (informational / debugging) but are not referenced by ``allow`` --
-    ``target_scopes[input.target]`` already *is* the per-scope capability gate.
+    ``target_allow_scopes`` / ``target_deny_scopes`` are used directly (target id -> scopes) --
+    no inversion. A target is a tool the agent calls or another agent it calls. ``agent_roles`` /
+    ``agent_role_scopes`` are still emitted (informational / debugging) but are not referenced by
+    ``allow`` -- ``target_allow_scopes[input.target]`` already *is* the per-scope capability gate.
     """
     slug = slugify(model.agent_id)
     parts = [
@@ -167,16 +236,26 @@ def generate_outbound_rego(model: AgentPolicyModel) -> str:
         _render_list("agent_roles", _names(model.agent_roles)),
         _render_map("subject_roles", _name_map(model.subject_roles)),
         _render_map(
-            "subject_role_scopes", _group_rules(model.outbound_subject_rules)
+            "subject_role_allow_scopes",
+            _group_rules(model.outbound_subject_allow_rules),
         ),
-        _render_map("agent_role_scopes", _group_rules(model.outbound_rules)),
-        _render_map("target_scopes", _name_map(model.target_scopes)),
-        _OUTBOUND_SUBJECT_OK,
+        _render_map(
+            "subject_role_deny_scopes",
+            _group_rules(model.outbound_subject_deny_rules),
+        ),
+        _render_map(
+            "agent_role_scopes", _group_rules(model.outbound_target_allow_rules)
+        ),
+        _render_map("target_allow_scopes", _name_map(model.target_allow_scopes)),
+        _render_map("target_deny_scopes", _name_map(model.target_deny_scopes)),
+        _outbound_subject_gate("subject_allow_ok", "subject_role_allow_scopes"),
+        _outbound_subject_gate("subject_deny_ok", "subject_role_deny_scopes"),
+        _target_gate("target_allow_ok", "target_allow_scopes"),
+        _target_gate("target_deny_ok", "target_deny_scopes"),
         (
-            "target_ok if {\n"
-            "    input.function_name in target_scopes[input.target]\n"
-            "}"
+            "default allow := false\n"
+            "allow if { subject_allow_ok; target_allow_ok; "
+            "not subject_deny_ok; not target_deny_ok }"
         ),
-        "default allow := false\nallow if { subject_ok; target_ok }",
     ]
     return "\n\n".join(parts) + "\n"

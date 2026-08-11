@@ -14,15 +14,15 @@ tokens(s) := {lower(t) | some t in regex.split(`[._-]+`, s)}
 # Tool scopes the user (subject) is entitled to on the target.
 subject_scopes contains scope if {
     some role in gen.subject_roles[input.subject]
-    some scope in gen.subject_role_scopes[role]
-    scope in gen.target_scopes[input.target]
+    some scope in gen.subject_role_allow_scopes[role]
+    scope in gen.target_allow_scopes[input.target]
 }
 
 # Tool scopes the agent is entitled to on the target.
 agent_allowed contains scope if {
     some role in gen.agent_roles
     some scope in gen.agent_role_scopes[role]
-    scope in gen.target_scopes[input.target]
+    scope in gen.target_allow_scopes[input.target]
 }
 
 default allow := false

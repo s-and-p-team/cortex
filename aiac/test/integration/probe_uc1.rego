@@ -8,7 +8,7 @@ import future.keywords
 #      scope is allowed iff BOTH the user (subject) is granted it AND the agent's own operator roles
 #      reach it. This probe binds both gates against the generated data maps. UC-1 has a single tool,
 #      so the capability gate uses the agent's own capability map (`agent_role_scopes`) directly —
-#      equivalent to the writer's `target_scopes[input.target]` for that one target — and the probe
+#      equivalent to the writer's `target_allow_scopes[input.target]` for that one target — and the probe
 #      input stays `{subject, function_name}` (no `target` key needed).
 #
 #   2. EXACT-NAME MATCH. `scenario_uc1.py` stores the FULL discovered scope names
@@ -21,7 +21,7 @@ gen := data.authz.team1_github_agent.outbound
 # Tool scopes the user (subject) is entitled to, via the generated user->tool data maps (subject gate).
 subject_scopes contains scope if {
     some role in gen.subject_roles[input.subject]
-    some scope in gen.subject_role_scopes[role]
+    some scope in gen.subject_role_allow_scopes[role]
 }
 
 # Tool scopes the agent's own operator roles reach (capability gate; single-target UC-1). Iterate

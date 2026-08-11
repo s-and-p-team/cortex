@@ -425,20 +425,20 @@ def opa_dump(rego: Path, ref: str) -> object:
 
 
 def outbound_subject_grants(rego_dir: Path) -> set[tuple[str, str]]:
-    """User->tool grant set from the outbound Rego's ``subject_role_scopes`` map (``∅`` when
+    """User->tool grant set from the outbound Rego's ``subject_role_allow_scopes`` map (``∅`` when
     no tool has been onboarded, the full ``OUTBOUND_SUBJECT_PAIRS`` once one has)."""
     m = opa_dump(
         rego_dir / OUTBOUND_REGO,
-        f"data.authz.{AGENT_SLUG}.outbound.subject_role_scopes",
+        f"data.authz.{AGENT_SLUG}.outbound.subject_role_allow_scopes",
     )
     return {(role, scope) for role, scopes in (m or {}).items() for scope in scopes}
 
 
 def inbound_grants(rego_dir: Path) -> set[tuple[str, str]]:
-    """User-role->agent-scope grant set from the inbound Rego's ``role_scopes`` restricted to the
-    published ``agent_scopes`` (a role may list scopes the agent does not expose; those don't grant)."""
+    """User-role->agent-scope grant set from the inbound Rego's ``subject_role_allow_scopes`` restricted
+    to the published ``agent_scopes`` (a role may list scopes the agent does not expose; those don't grant)."""
     rego = rego_dir / INBOUND_REGO
-    role_scopes = opa_dump(rego, f"data.authz.{AGENT_SLUG}.inbound.role_scopes") or {}
+    role_scopes = opa_dump(rego, f"data.authz.{AGENT_SLUG}.inbound.subject_role_allow_scopes") or {}
     agent_scopes = set(opa_dump(rego, f"data.authz.{AGENT_SLUG}.inbound.agent_scopes") or [])
     return {
         (role, scope)
