@@ -408,7 +408,7 @@ def test_outbound(pipeline: dict[str, dict], variant: str, subject: str, scope: 
 
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_outbound_unknown_target_denied(pipeline: dict[str, dict], variant: str) -> None:
-    """An otherwise-allowed call to an unknown target is denied (target not in target_scopes)."""
+    """An otherwise-allowed call to an unknown target is denied (target not in target_allow_scopes)."""
     rego = pipeline[variant]["rego_dir"] / "github_agent.outbound.rego"
     allowed = opa_eval(
         [rego, HERE / "probe.rego"],
