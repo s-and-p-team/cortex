@@ -687,6 +687,10 @@ func (s *Server) handleResponseBody(ctx context.Context, body []byte, pctx *pipe
 			Response: &extprocv3.ProcessingResponse_ResponseBody{
 				ResponseBody: &extprocv3.BodyResponse{
 					Response: &extprocv3.CommonResponse{
+						HeaderMutation: &extprocv3.HeaderMutation{
+							SetHeaders:    []*corev3.HeaderValueOption{contentLengthHeader(pctx.ResponseBody)},
+							RemoveHeaders: []string{"content-encoding"},
+						},
 						BodyMutation: &extprocv3.BodyMutation{
 							Mutation: &extprocv3.BodyMutation_Body{
 								Body: pctx.ResponseBody,
@@ -758,11 +762,17 @@ func passBodyResponse() *extprocv3.ProcessingResponse {
 
 // withBodyMutation optionally decorates a RequestBody ProcessingResponse
 // with an ext_proc BodyMutation when the pipeline rewrote pctx.Body.
-// Envoy replaces the buffered body with the new bytes and recomputes
-// Content-Length for the upstream. We also clear content-encoding
-// because the plugin may have decompressed + rewritten in plaintext;
-// shipping plain bytes without the old encoding header is safer than
-// shipping a malformed archive.
+// Envoy replaces the buffered body with the new bytes but does NOT
+// recompute Content-Length in BUFFERED mode with headers sent (the mode
+// requestBodyResponse selects): ProcessorState::validateContentLength
+// compares the request's existing content-length against the mutated
+// body and fails the stream with "mismatch between content length and
+// the length of the mutated body" (local reply status_on_error, 500).
+// The body response's HeaderMutation is applied before that check, so
+// we set content-length to the new length ourselves. We also clear
+// content-encoding because the plugin may have decompressed + rewritten
+// in plaintext; shipping plain bytes without the old encoding header is
+// safer than shipping a malformed archive.
 //
 // No-op when pctx.BodyMutated() is false — the common case of a
 // read-only pipeline pays no cost beyond the bool read.
@@ -784,8 +794,17 @@ func withBodyMutation(resp *extprocv3.ProcessingResponse, pctx *pipeline.Context
 	if cr.HeaderMutation == nil {
 		cr.HeaderMutation = &extprocv3.HeaderMutation{}
 	}
+	cr.HeaderMutation.SetHeaders = append(cr.HeaderMutation.SetHeaders, contentLengthHeader(pctx.Body))
 	cr.HeaderMutation.RemoveHeaders = append(cr.HeaderMutation.RemoveHeaders, "content-encoding")
 	return resp
+}
+
+// contentLengthHeader builds the content-length SetHeaders entry for a
+// mutated body. Shared by the request and response mutation paths.
+func contentLengthHeader(body []byte) *corev3.HeaderValueOption {
+	return &corev3.HeaderValueOption{
+		Header: &corev3.HeaderValue{Key: "content-length", RawValue: []byte(strconv.Itoa(len(body)))},
+	}
 }
 
 func allowBodyResponse() *extprocv3.ProcessingResponse {
