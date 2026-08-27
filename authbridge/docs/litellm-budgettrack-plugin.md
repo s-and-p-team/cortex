@@ -90,7 +90,12 @@ The spend file (`spend-authbridge.json`) is a simple JSON object:
 
 ### OnResponse (cost accumulation)
 
-1. Read `X-Litellm-Response-Cost` header from upstream response
+1. Read the cost from the **response** headers (`pctx.ResponseHeaders`):
+   `X-Litellm-Response-Cost`, falling back to `X-Litellm-Response-Cost-Original`
+   when the bare header is absent. The bare (effective, post-discount) header is
+   present on OpenAI `/v1/chat/completions` responses; the Anthropic `/v1/messages`
+   endpoint used by Claude Code — and newer LiteLLM releases — emit only the
+   pre-discount `-original` variant.
 2. If missing or non-positive → continue (no cost to track)
 3. Lock mutex, reset if new day
 4. Add cost to `total_spend`, increment `total_calls`

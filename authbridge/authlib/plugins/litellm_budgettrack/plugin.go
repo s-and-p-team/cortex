@@ -1,4 +1,4 @@
-// Package litellm_budgettrack provides an inbound pipeline plugin that tracks
+// Package litellm_budgettrack provides a pipeline plugin that tracks
 // per-request cost via the x-litellm-response-cost response header and
 // enforces a daily spending budget, rejecting requests with HTTP 429
 // when the budget is exceeded.
@@ -15,6 +15,19 @@ import (
 
 	"github.com/rossoctl/cortex/authbridge/authlib/pipeline"
 	"github.com/rossoctl/cortex/authbridge/authlib/plugins"
+)
+
+// Response cost headers emitted by LiteLLM.
+//
+// responseCostHeader is the effective (post-discount) cost and is present on
+// OpenAI-style /v1/chat/completions responses. Newer LiteLLM releases — and the
+// Anthropic /v1/messages endpoint that Claude Code uses — do not emit it, only
+// the pre-discount "-original" variant, so we fall back to that when the bare
+// header is absent. Without the fallback, budget tracking silently records $0
+// for Anthropic-format traffic.
+const (
+	responseCostHeader         = "X-Litellm-Response-Cost"
+	responseCostOriginalHeader = "X-Litellm-Response-Cost-Original"
 )
 
 type budgetTrackConfig struct {
@@ -80,7 +93,11 @@ func (p *BudgetTrack) OnRequest(_ context.Context, pctx *pipeline.Context) pipel
 
 // OnResponse reads x-litellm-response-cost and accumulates the spend.
 func (p *BudgetTrack) OnResponse(_ context.Context, pctx *pipeline.Context) pipeline.Action {
-	costStr := pctx.Headers.Get("X-Litellm-Response-Cost")
+	costStr := pctx.ResponseHeaders.Get(responseCostHeader)
+	if costStr == "" {
+		// Anthropic /v1/messages (and newer LiteLLM) omit the bare header.
+		costStr = pctx.ResponseHeaders.Get(responseCostOriginalHeader)
+	}
 	if costStr == "" {
 		return pipeline.Action{Type: pipeline.Continue}
 	}
