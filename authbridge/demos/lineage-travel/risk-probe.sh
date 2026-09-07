@@ -44,12 +44,21 @@ probe() { # <label> [host-header]
     echo ">> $label: POST http://psp-mock:9091/charge ${host:+(Host: $host)}"
     kubectl -n "$NS" exec deploy/demo-client -c client -- python3 -c "
 import json, urllib.request
-payload = {
+# The card data, once as the mock PSP's own top-level fields (so it answers
+# 200) and once as JSON-RPC tools/call arguments: the sidecar captures
+# payloads through its protocol parsers only (a2a/mcp/inference — a plain
+# HTTP body is metadata-only by design), and the mcp-parser is content-gated
+# on any JSON-RPC body, surfacing exactly params.arguments as the captured
+# input. The probe thus reads as what it simulates: a tool call carrying
+# card data off somewhere.
+card = {
     'pan': '4111 1111 1111 1111', 'expiry': '12/27', 'cvv': '123',
     'amount_cents': 320000, 'currency': 'usd', 'merchant': 'Atlas Air',
     'cardholder': 'Dana Cohen', 'email': 'dana.cohen@example.com',
     'note': 'risk-probe: deliberate PII in transit',
 }
+payload = dict(card, jsonrpc='2.0', id='1', method='tools/call',
+               params={'name': 'charge_card', 'arguments': card})
 headers = {'content-type': 'application/json',
            'traceparent': '00-$TRACE-$span-01'}
 if '$host':
