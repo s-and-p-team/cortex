@@ -18,14 +18,28 @@ import (
 	"time"
 
 	"github.com/rossoctl/cortex/authbridge/authlib/listener/httpx"
+	"github.com/rossoctl/cortex/authbridge/authlib/listener/internal/bodyread"
 	"github.com/rossoctl/cortex/authbridge/authlib/listener/internal/sseframe"
 	"github.com/rossoctl/cortex/authbridge/authlib/listener/internal/tlssniff"
+	"github.com/rossoctl/cortex/authbridge/authlib/listener/transparentproxy"
 	"github.com/rossoctl/cortex/authbridge/authlib/pipeline"
 	"github.com/rossoctl/cortex/authbridge/authlib/session"
 	"github.com/rossoctl/cortex/authbridge/authlib/spiffe"
 	authtls "github.com/rossoctl/cortex/authbridge/authlib/tls"
 )
 
+// maxBodySize bounds a buffered request or response body, and the per-frame cap
+// on the SSE reader.
+//
+// Left at Envoy's default per_stream_buffer_limit_bytes while the forward proxy
+// runs at 10MB: the bodies that forced that raise were outbound agent-to-LLM
+// requests, which do not traverse this listener in the deployments observed so
+// far. The same growth applies in principle on the inbound path — an agent
+// receiving a large request, or an in-cluster LLM route through a sidecar — so
+// raise this to match if an oversized-body rejection is ever observed here.
+// The two are deliberately independent: the inbound and outbound size profiles
+// differ, and a shared constant would tie one listener's ceiling to the other's
+// traffic. See the forward proxy's maxBodySize for the measurement behind 10MB.
 const maxBodySize = 1 << 20 // 1MB — matches Envoy's default per_stream_buffer_limit_bytes
 
 type pctxKey struct{}
@@ -56,6 +70,18 @@ type Server struct {
 	Shared          pipeline.SharedStore // process-scoped store; set by main, may be nil
 	proxy           *httputil.ReverseProxy
 	backend         string
+
+	// transparentInbound marks this as the transparent inbound shape. It does two
+	// things, and they are deliberately one flag: the Director resolves the
+	// forwarding target per connection from SO_ORIGINAL_DST, and a request with no
+	// recovered destination fails closed (502) rather than being forwarded
+	// anywhere. Set by NewTransparentServer only.
+	//
+	// The Director gate is not optional hygiene: that closure is installed by
+	// NewServer, so without it the rewrite would be live on every fixed-backend
+	// server too — safe only while nothing populates the context key without an
+	// InboundListener, which nothing enforces.
+	transparentInbound bool
 
 	// mtlsCfg is the *tls.Config wrapping the local SVID for inbound
 	// mTLS, or nil when mTLS is disabled. mtlsMode is consulted by
@@ -92,6 +118,10 @@ func NewServer(inbound *pipeline.Holder, sessions *session.Store, backendURL str
 	if err != nil {
 		return nil, err
 	}
+	// Declared before the Director so the closure can capture it: the
+	// transparent-inbound rewrite is gated on s.transparentInbound, which
+	// NewTransparentServer sets after this constructor returns.
+	s := &Server{}
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	// The default Director rewrites the outbound scheme/host/path but
 	// deliberately leaves req.Host as the inbound caller's Host (e.g.
@@ -103,9 +133,29 @@ func NewServer(inbound *pipeline.Holder, sessions *session.Store, backendURL str
 	proxy.Director = func(req *http.Request) {
 		orig(req)
 		req.Host = target.Host
+		// Transparent inbound: the client addressed the app's real port, and
+		// iptables REDIRECTed it here. Forward to that port on loopback instead
+		// of to the single configured backend.
+		//
+		// Loopback specifically, and not the recovered IP: the enforce-redirect
+		// egress guard RETURNs loopback (-o lo, -d 127.0.0.0/8) so this hop
+		// cannot be re-captured by our own outbound rules. It also keeps the
+		// second hop out of Istio ambient's OUTPUT-chain handling entirely.
+		//
+		// The client's real IP is preserved by REDIRECT and reaches the app via
+		// X-Forwarded-For, which ReverseProxy appends from req.RemoteAddr.
+		if s.transparentInbound {
+			if dst, ok := transparentproxy.OrigDstFromContext(req.Context()); ok {
+				if _, port, err := net.SplitHostPort(dst); err == nil {
+					req.URL.Scheme = "http"
+					req.URL.Host = net.JoinHostPort("127.0.0.1", port)
+					req.Host = req.URL.Host
+				}
+			}
+		}
 		// Strip the client's Accept-Encoding, but only when a plugin will
 		// actually inspect the response body: a StreamingResponder (SSE
-		// re-framing) or any ReadsBody/WritesBody plugin (buffered read into
+		// re-framing) or any ReadsBody/WritesRequestBody plugin (buffered read into
 		// pctx.ResponseBody). Those paths must see plaintext — with no explicit
 		// Accept-Encoding, Go's transport negotiates gzip itself and
 		// transparently decompresses the response (dropping Content-Encoding /
@@ -132,12 +182,10 @@ func NewServer(inbound *pipeline.Holder, sessions *session.Store, backendURL str
 	// uniform across content types we install via
 	// installStreamingResponseBody.
 	proxy.FlushInterval = -1
-	s := &Server{
-		InboundPipeline: inbound,
-		Sessions:        sessions,
-		proxy:           proxy,
-		backend:         backendURL,
-	}
+	s.InboundPipeline = inbound
+	s.Sessions = sessions
+	s.proxy = proxy
+	s.backend = backendURL
 	if mtls != nil {
 		if mtls.Source == nil {
 			return nil, fmt.Errorf("reverseproxy: MTLSOptions.Source is required when mtls is non-nil")
@@ -158,6 +206,42 @@ func NewServer(inbound *pipeline.Holder, sessions *session.Store, backendURL str
 	return s, nil
 }
 
+// NewTransparentServer creates a reverse proxy whose forwarding target is
+// resolved per connection from the original destination recovered by
+// transparentproxy.InboundListener, rather than from a fixed backend URL. A
+// request arriving without a recovered destination is rejected with 502.
+//
+// There is deliberately no fallback-backend parameter. An earlier draft took one
+// and disarmed the 502 whenever it was non-empty, which made "unattributable
+// inbound request is rejected" flip to "forwarded to the fallback" as a side
+// effect of an argument that reads like it only adds a backend — a security
+// posture change hidden behind unrelated-looking config, on the one listener
+// whose entire purpose is to be a hard inbound boundary.
+//
+// Nothing needed it: the only caller passed "", and the case it would serve is
+// close to unreachable anyway, since InboundListener rejects unrecoverable and
+// self-referential destinations at Accept time. If a fallback is ever genuinely
+// wanted, it should return as an options struct with a separate, explicit
+// fail-closed field, so a caller has to weaken the boundary on purpose.
+func NewTransparentServer(inbound *pipeline.Holder, sessions *session.Store, mtls *MTLSOptions) (*Server, error) {
+	// url.Parse("") yields a URL with an empty Host, which would make the default
+	// Director emit a request with no target. Park the fixed target on a sentinel
+	// that can never be dialed by accident; the Director overrides it whenever a
+	// destination was recovered, and handleRequest fails closed when one wasn't.
+	s, err := NewServer(inbound, sessions, "http://"+unresolvableBackend, mtls)
+	if err != nil {
+		return nil, err
+	}
+	s.transparentInbound = true
+	return s, nil
+}
+
+// unresolvableBackend is the parked fixed target for a transparent server.
+// 127.0.0.1:0 is not dialable (port 0 is "pick one" for bind, not connect), so a
+// bug that let a request through without a recovered destination fails loudly
+// instead of reaching a real service.
+const unresolvableBackend = "127.0.0.1:0"
+
 // Listen returns a net.Listener bound to addr. When mTLS is configured
 // the listener is a tlssniff.Listener that dispatches TLS handshakes
 // through the local SVID and pass-throughs plain HTTP per the
@@ -170,8 +254,17 @@ func (s *Server) Listen(addr string) (net.Listener, error) {
 	if err != nil {
 		return nil, err
 	}
+	return s.WrapListener(inner), nil
+}
+
+// WrapListener applies this server's inbound mTLS posture to an already-bound
+// listener, returning it unchanged when mTLS is disabled. Split out of Listen so
+// the transparent inbound path — which must bind a *net.TCPListener itself, to
+// recover SO_ORIGINAL_DST before any bytes are read — gets the identical
+// permissive/strict behavior instead of a second implementation of it.
+func (s *Server) WrapListener(inner net.Listener) net.Listener {
 	if s.mtlsCfg == nil {
-		return inner, nil
+		return inner
 	}
 	sniff := tlssniff.New(inner, s.mtlsCfg, s.mtlsMode)
 	if s.mtlsMetrics != nil {
@@ -179,7 +272,7 @@ func (s *Server) Listen(addr string) (net.Listener, error) {
 			s.mtlsMetrics.InboundPlainRejected.Add(1)
 		})
 	}
-	return sniff, nil
+	return sniff
 }
 
 // MTLSEnabled reports whether the listener is wrapping connections
@@ -204,6 +297,21 @@ func (s *Server) Handler() http.Handler {
 }
 
 func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
+	// Fail closed on an unattributable request. In per-connection-backend mode
+	// the forwarding target comes from SO_ORIGINAL_DST; if the listener could
+	// not recover one there is no correct target, and the parked fixed backend
+	// is deliberately undialable. Reject here rather than let it reach the
+	// pipeline — a request we can't attribute to a captured destination is one
+	// this listener has no business forwarding.
+	if s.transparentInbound {
+		if _, ok := transparentproxy.OrigDstFromContext(r.Context()); !ok {
+			slog.Warn("reverse-proxy: rejecting request with no recovered destination",
+				"remote", r.RemoteAddr, "host", r.Host, "path", r.URL.Path)
+			http.Error(w, "no original destination recovered", http.StatusBadGateway)
+			return
+		}
+	}
+
 	pctx := &pipeline.Context{
 		Direction: pipeline.Inbound,
 		Method:    r.Method,
@@ -241,8 +349,9 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
-			slog.Warn("reverse-proxy: request body too large or unreadable", "host", r.Host, "error", err)
-			http.Error(w, `{"error":"request body too large"}`, http.StatusRequestEntityTooLarge)
+			bodyread.LogError("reverse-proxy", r, len(body), maxBodySize, err)
+			status, msg := bodyread.Rejection(err)
+			http.Error(w, msg, status)
 			return
 		}
 		r.Body = io.NopCloser(bytes.NewReader(body))
@@ -257,7 +366,7 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// If a WritesBody plugin rewrote pctx.Body, send the new bytes to
+	// If a WritesRequestBody plugin rewrote pctx.Body, send the new bytes to
 	// the backend and clear Content-Encoding (same rationale as the
 	// response path — plugin may have decompressed).
 	if pctx.BodyMutated() {
@@ -273,7 +382,9 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 	// Authorization used to be forwarded, silently dropping any other injected header
 	// (e.g. static-inject's x-api-key). Content-Length / Content-Encoding are managed
 	// by the body-rewrite block above and the transport, so leave them untouched.
-	skip := func(k string) bool { return k == "Content-Length" || k == "Content-Encoding" }
+	skip := func(k string) bool {
+		return strings.EqualFold(k, "Content-Length") || strings.EqualFold(k, "Content-Encoding")
+	}
 	for k := range r.Header {
 		if skip(k) {
 			continue
@@ -284,6 +395,10 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	for k, vv := range pctx.Headers {
 		if skip(k) {
+			continue
+		}
+		if len(vv) == 0 {
+			r.Header.Del(k) // pctx.Headers[k] = nil is a delete, same as Del(k)
 			continue
 		}
 		r.Header[k] = append([]string(nil), vv...) // set / overwrite
@@ -309,6 +424,7 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 			At:          time.Now(),
 			Direction:   pipeline.Inbound,
 			Phase:       pipeline.SessionRequest,
+			RequestID:   pctx.RequestID(),
 			A2A:         pipeline.SnapshotA2A(pctx.Extensions.A2A),
 			Invocations: pipeline.SnapshotInvocations(pctx.Extensions.Invocations, pipeline.InvocationPhaseRequest),
 			Plugins:     plugins,
@@ -339,14 +455,14 @@ func (s *Server) modifyResponse(resp *http.Response) error {
 	// called on this path — streaming-aware plugins finalize via
 	// OnResponseFrame(last=true).
 	//
-	// WritesBody is incompatible with streaming (we can't rewrite a
+	// WritesResponseBody is incompatible with streaming (we can't rewrite a
 	// body we've already started forwarding) — fall back to buffered
 	// with a warning.
 	if isEventStream(resp.Header.Get("Content-Type")) &&
 		s.InboundPipeline.HasStreamingResponders() &&
 		resp.Body != nil {
-		if s.InboundPipeline.WritesBody() {
-			slog.Warn("reverse-proxy: text/event-stream response with WritesBody plugin — falling back to buffered path", "host", pctx.Host)
+		if s.InboundPipeline.WritesResponseBody() {
+			slog.Warn("reverse-proxy: text/event-stream response with WritesResponseBody plugin — falling back to buffered path", "host", pctx.Host)
 		} else {
 			s.installStreamingResponseBody(resp, pctx)
 			// Strip Content-Length — the framing reader doesn't know
@@ -428,6 +544,7 @@ func (s *Server) modifyResponse(resp *http.Response) error {
 			At:          time.Now(),
 			Direction:   pipeline.Inbound,
 			Phase:       pipeline.SessionResponse,
+			RequestID:   pctx.RequestID(),
 			A2A:         pipeline.SnapshotA2A(pctx.Extensions.A2A),
 			Invocations: pipeline.SnapshotInvocations(pctx.Extensions.Invocations, pipeline.InvocationPhaseResponse),
 			Plugins:     plugins,
@@ -482,6 +599,7 @@ func (s *Server) recordInboundReject(pctx *pipeline.Context, action pipeline.Act
 		At:          time.Now(),
 		Direction:   pipeline.Inbound,
 		Phase:       pipeline.SessionDenied,
+		RequestID:   pctx.RequestID(),
 		Invocations: pipeline.SnapshotInvocations(pctx.Extensions.Invocations, pipeline.InvocationPhaseRequest),
 		Host:        pctx.Host,
 		StatusCode:  status,
@@ -570,6 +688,7 @@ func (s *Server) recordInboundResponseEvent(pctx *pipeline.Context, statusCode i
 		At:          time.Now(),
 		Direction:   pipeline.Inbound,
 		Phase:       pipeline.SessionResponse,
+		RequestID:   pctx.RequestID(),
 		A2A:         pipeline.SnapshotA2A(pctx.Extensions.A2A),
 		Invocations: pipeline.SnapshotInvocations(pctx.Extensions.Invocations, pipeline.InvocationPhaseResponse),
 		Plugins:     plugins,

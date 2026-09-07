@@ -289,6 +289,50 @@ func TestInferenceParser_OnResponse_CapturesToolCalls(t *testing.T) {
 	}
 }
 
+// TestInferenceParser_VlessPath covers OpenAI-compatible proxies (e.g. opencode via
+// litellm) that strip the /v1 prefix and post directly to /chat/completions or
+// /completions. Without these path variants the parser falls to the default arm
+// and records no inference telemetry.
+func TestInferenceParser_VlessPath_ChatCompletions(t *testing.T) {
+	p := NewInferenceParser()
+	pctx := &pipeline.Context{
+		Path: "/chat/completions",
+		Body: []byte(`{"model":"gpt-4","messages":[{"role":"user","content":"hi"}],"stream":false}`),
+	}
+	action := p.OnRequest(context.Background(), pctx)
+	if action.Type != pipeline.Continue {
+		t.Fatalf("expected Continue, got %v", action.Type)
+	}
+	ext := pctx.Extensions.Inference
+	if ext == nil {
+		t.Fatal("Extensions.Inference is nil for /chat/completions")
+	}
+	if ext.Model != "gpt-4" {
+		t.Errorf("Model = %q, want gpt-4", ext.Model)
+	}
+	if !ext.IsAction {
+		t.Error("IsAction should be true")
+	}
+}
+
+func TestInferenceParser_VlessPath_Completions(t *testing.T) {
+	p := NewInferenceParser()
+	pctx := &pipeline.Context{
+		Path: "/completions",
+		Body: []byte(`{"model":"codellama","messages":[{"role":"user","content":"hi"}]}`),
+	}
+	action := p.OnRequest(context.Background(), pctx)
+	if action.Type != pipeline.Continue {
+		t.Fatalf("expected Continue, got %v", action.Type)
+	}
+	if pctx.Extensions.Inference == nil {
+		t.Fatal("Extensions.Inference is nil for /completions")
+	}
+	if pctx.Extensions.Inference.Model != "codellama" {
+		t.Errorf("Model = %q, want codellama", pctx.Extensions.Inference.Model)
+	}
+}
+
 func TestInferenceParser_NonMatchingPath(t *testing.T) {
 	p := NewInferenceParser()
 	pctx := &pipeline.Context{
@@ -528,6 +572,44 @@ func TestInferenceParser_MultipartContent(t *testing.T) {
 	// Non-text parts dropped, multiple text parts joined with newline.
 	if msgs[2].Content != "hello\nthere" {
 		t.Errorf("msg[2].Content = %q, want %q", msgs[2].Content, "hello\nthere")
+	}
+}
+
+// TestInferenceParser_ContentBytes covers the OpenAI dialect's own
+// ContentBytes accounting — a separate UnmarshalJSON from the Anthropic path.
+// A tool-result message whose content is an array flattens to text only for
+// the text parts; the dropped parts (images, tool payloads) still cost prompt
+// tokens, and ContentBytes is what they contribute.
+func TestInferenceParser_ContentBytes(t *testing.T) {
+	p := NewInferenceParser()
+	body := `{
+		"model": "gpt-4",
+		"messages": [
+			{"role": "user", "content": "hi"},
+			{"role": "tool", "content": [{"type":"image_url","image_url":{"url":"http://x/very/long/path"}}]},
+			{"role": "assistant", "content": null, "tool_calls": []}
+		]
+	}`
+	pctx := &pipeline.Context{Path: "/v1/chat/completions", Body: []byte(body)}
+	p.OnRequest(context.Background(), pctx)
+
+	msgs := pctx.Extensions.Inference.Messages
+	if len(msgs) != 3 {
+		t.Fatalf("expected 3 messages, got %d", len(msgs))
+	}
+	// `"hi"` on the wire — the quotes are part of the JSON value.
+	if msgs[0].ContentBytes != 4 {
+		t.Errorf("msgs[0].ContentBytes = %d, want 4", msgs[0].ContentBytes)
+	}
+	// No text parts, so Content is empty — but the message is far from free.
+	if msgs[1].Content != "" || msgs[1].ContentBytes <= msgs[0].ContentBytes {
+		t.Errorf("msgs[1] = %q / %d bytes, want empty text and > %d bytes",
+			msgs[1].Content, msgs[1].ContentBytes, msgs[0].ContentBytes)
+	}
+	// content: null has no content to size — reporting the 4 bytes of the
+	// literal would make an empty assistant turn look like a small payload.
+	if msgs[2].ContentBytes != 0 {
+		t.Errorf("msgs[2].ContentBytes = %d, want 0 for null content", msgs[2].ContentBytes)
 	}
 }
 

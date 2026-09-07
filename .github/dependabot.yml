@@ -5,6 +5,10 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    groups:
+      codeql-action:
+        patterns:
+          - "github/codeql-action/*"
 
   # Go - authlib (the shared library — pulled in by every cmd/* binary
   # via replace directives, so updates here flow into everything).
@@ -12,19 +16,76 @@ updates:
     directory: /authbridge/authlib
     schedule:
       interval: weekly
+    ignore:
+      # gobwas/glob v1 is a breaking API change, not just the engine rewrite
+      # its release notes describe: Compile went from returning the Glob
+      # interface to a concrete *Pattern, and Glob was removed. authlib
+      # declares glob.Glob in listener/skiphost, routing and
+      # plugins/tokenbroker — and OPA declares it too (v1/topdown/glob.go,
+      # v1/bundle/bundle.go, still true at 1.20.1), so v1 cannot be adopted
+      # here until OPA migrates. Blocked outside this repo; see #829.
+      #
+      # Matching semantics are NOT the blocker: a v0.2.3-vs-v1.0.0 diff over
+      # the repo's real pattern corpus (36 patterns x 29 hosts) differed only
+      # on the empty host, which skiphost never passes to glob. Drop this
+      # ignore once OPA is on the glob v1 API.
+      - dependency-name: "github.com/gobwas/glob"
+        update-types: ["version-update:semver-major"]
+      # bifrost/core v1.8.0 raised its own go directive to 1.27.0, which Go
+      # propagates into every module in the workspace. Adopting it is a Go
+      # 1.27 migration, not a dependency bump: it needs authbridge/go.work
+      # bumped and the four digest-pinned golang:1.26-alpine builders in
+      # cmd/*/Dockerfile moved to 1.27 (they set GOWORK=off but not
+      # GOTOOLCHAIN, so they would silently download the 1.27 toolchain
+      # mid-build rather than fail). authlib uses three symbols from
+      # core/schemas, so v1.8 buys nothing today.
+      #
+      # Range rather than update-types, so v1.7.x patches keep flowing —
+      # v1.7.15 is the newest release still on go 1.26.5 (see #840). There is
+      # no API break waiting: v1.8.4 was built and tested against authlib
+      # with go.work at 1.27.0 and the suite passed. Drop this range when the
+      # Go 1.27 move is made deliberately.
+      - dependency-name: "github.com/maximhq/bifrost/core"
+        versions: [">=1.8.0"]
 
   # Go - mode-specific binaries
   - package-ecosystem: gomod
     directory: /authbridge/cmd/authbridge-proxy
     schedule:
       interval: weekly
+    ignore:
+      # See the authlib entry above for why glob v1 is blocked.
+      - dependency-name: "github.com/gobwas/glob"
+        update-types: ["version-update:semver-major"]
+      # Indirect via authlib. See the authlib entry above for why bifrost
+      # v1.8+ is gated on the Go 1.27 move.
+      - dependency-name: "github.com/maximhq/bifrost/core"
+        versions: [">=1.8.0"]
   - package-ecosystem: gomod
     directory: /authbridge/cmd/authbridge-envoy
     schedule:
       interval: weekly
+    ignore:
+      # See the authlib entry above for why glob v1 is blocked.
+      - dependency-name: "github.com/gobwas/glob"
+        update-types: ["version-update:semver-major"]
+      # Indirect via authlib. See the authlib entry above for why bifrost
+      # v1.8+ is gated on the Go 1.27 move.
+      - dependency-name: "github.com/maximhq/bifrost/core"
+        versions: [">=1.8.0"]
   # Go - abctl TUI
   - package-ecosystem: gomod
     directory: /authbridge/cmd/abctl
+    schedule:
+      interval: weekly
+    ignore:
+      # See the authlib entry above for why glob v1 is blocked.
+      - dependency-name: "github.com/gobwas/glob"
+        update-types: ["version-update:semver-major"]
+
+  # Go - storage backends (direct deps: go-redis, miniredis)
+  - package-ecosystem: gomod
+    directory: /authbridge/storage/redis
     schedule:
       interval: weekly
 

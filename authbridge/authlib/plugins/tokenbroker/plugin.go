@@ -14,6 +14,7 @@ import (
 
 	"github.com/gobwas/glob"
 	"github.com/rossoctl/cortex/authbridge/authlib/auth"
+	"github.com/rossoctl/cortex/authbridge/authlib/internal/hostglob"
 	"github.com/rossoctl/cortex/authbridge/authlib/pipeline"
 	"github.com/rossoctl/cortex/authbridge/authlib/plugins"
 	"github.com/rossoctl/cortex/authbridge/authlib/plugins/tokenbroker/client"
@@ -93,15 +94,30 @@ type compiledBrokerRoute struct {
 
 // newBrokerRouter creates a router from the given routes.
 // defaultAction is "broker" or "passthrough" (applied when no route matches).
-// Returns an error if any host pattern is invalid.
+//
+// Rejects configuration that cannot mean what it appears to say, matching
+// authlib/routing:
+//
+//   - an empty or whitespace-only host pattern, which matches only an empty
+//     Host header and so never matches real traffic.
+//   - a route made unreachable by an earlier one. Resolution is
+//     first-match-wins, so a broad early pattern swallows every route beneath
+//     it; if that early route is a passthrough, brokering is silently off for
+//     hosts the operator explicitly listed.
+//
+// A match-all as the final route is accepted — nothing follows it to shadow,
+// so it is a legitimate explicit catch-all.
 func newBrokerRouter(defaultAction string, rules []tokenBrokerRoute) (*brokerRouter, error) {
 	if defaultAction == "" {
 		defaultAction = "passthrough"
 	}
 	compiled := make([]compiledBrokerRoute, 0, len(rules))
-	for _, r := range rules {
-		// Use '.' as separator so *.example.com doesn't match foo.bar.example.com
-		g, err := glob.Compile(r.Host, '.')
+	for i, r := range rules {
+		if strings.TrimSpace(r.Host) == "" {
+			return nil, fmt.Errorf("route %d has an empty host pattern; "+
+				"it would match only an empty Host header, never real traffic", i)
+		}
+		g, err := hostglob.Compile(r.Host)
 		if err != nil {
 			return nil, fmt.Errorf("invalid route pattern %q: %w", r.Host, err)
 		}
@@ -117,6 +133,16 @@ func newBrokerRouter(defaultAction string, rules []tokenBrokerRoute) (*brokerRou
 			tokenEndpoint:         r.TokenEndpoint,
 		})
 	}
+	for j := range compiled {
+		for i := 0; i < j; i++ {
+			if hostglob.Shadows(compiled[i].glob, compiled[j].pattern) {
+				return nil, fmt.Errorf("route %d (%q) is unreachable: earlier route %d (%q) "+
+					"already matches every host it would match, and resolution is "+
+					"first-match-wins; reorder them or narrow the earlier pattern",
+					j, compiled[j].pattern, i, compiled[i].pattern)
+			}
+		}
+	}
 	return &brokerRouter{routes: compiled, defaultAction: defaultAction}, nil
 }
 
@@ -124,10 +150,18 @@ func newBrokerRouter(defaultAction string, rules []tokenBrokerRoute) (*brokerRou
 // Port is stripped from the host before matching.
 // Returns (shouldBroker, authorizationEndpoint, tokenEndpoint) where shouldBroker is true if a route matches with action "broker"
 // or if no route matches and default is "broker".
+// An empty host takes the no-route path rather than being offered to the
+// patterns: a bare "*" matches the empty string under gobwas/glob, so an
+// unset Host header would otherwise select a "*" route and broker a token for
+// a destination we cannot identify. Mirrors the empty-host defence in
+// listener/skiphost and authlib/routing.
 func (r *brokerRouter) resolve(host string) (bool, string, string) {
 	// Strip port if present
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		host = h
+	}
+	if host == "" {
+		return r.defaultAction == "broker", "", ""
 	}
 
 	// Check for matching route

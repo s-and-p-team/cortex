@@ -53,13 +53,136 @@ func TestResolve_PortStripping(t *testing.T) {
 }
 
 func TestResolve_FirstMatchWins(t *testing.T) {
-	r, _ := NewRouter("passthrough", []Route{
+	// Two patterns that genuinely overlap without either being dead:
+	// "svc-*" covers svc-prod and svc-dev, "*-prod" covers svc-prod and
+	// api-prod, and only svc-prod hits both. Neither is unreachable, so
+	// NewRouter accepts the pair.
+	//
+	// This used to configure the host "service" twice, which is dead config
+	// — the second route can never fire — and NewRouter now rejects it. The
+	// property under test is unchanged; only the fixture is honest about
+	// being reachable.
+	r, err := NewRouter("passthrough", []Route{
+		{Host: "svc-*", Audience: "first"},
+		{Host: "*-prod", Audience: "second"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved := r.Resolve("svc-prod")
+	if resolved == nil || resolved.Audience != "first" {
+		t.Error("expected first-match-wins for a host both patterns match")
+	}
+	if resolved := r.Resolve("api-prod"); resolved == nil || resolved.Audience != "second" {
+		t.Error("second route must stay reachable for hosts the first does not match")
+	}
+}
+
+func TestNewRouter_RejectsDuplicateHost(t *testing.T) {
+	_, err := NewRouter("passthrough", []Route{
 		{Host: "service", Audience: "first"},
 		{Host: "service", Audience: "second"},
 	})
-	resolved := r.Resolve("service")
-	if resolved == nil || resolved.Audience != "first" {
-		t.Error("expected first-match-wins")
+	if err == nil {
+		t.Error("expected error: the second route repeats a host and can never fire")
+	}
+}
+
+// TestNewRouter_RejectsShadowedRoute covers the hazard the unreachable-route
+// check exists for: resolution is first-match-wins, so a broad early pattern
+// silently swallows everything configured beneath it. A "***" typo or a bare
+// "*" at the top of authproxy-routes disables every route below — and if the
+// shadowing route is a passthrough, token exchange is off for hosts the
+// operator explicitly listed.
+func TestNewRouter_RejectsShadowedRoute(t *testing.T) {
+	for _, tc := range []struct {
+		shadowing string
+		shadowed  string
+	}{
+		// Total match-all: nothing after it is reachable, FQDN or not.
+		{"**", "api.example.com"},
+		{"***", "api.example.com"},
+		{"{**}", "api.example.com"},
+		{"{*,**}", "api.example.com"},
+		// A bare "*" is confined to one label, so it shadows a short
+		// in-cluster service name but NOT an FQDN — see
+		// TestNewRouter_AcceptsSingleStarBeforeFQDN.
+		{"*", "github-tool-mcp"},
+		// An earlier pattern that simply covers the later literal.
+		{"api.example.com", "api.example.com"},
+		{"*.example.com", "api.example.com"},
+	} {
+		_, err := NewRouter("passthrough", []Route{
+			{Host: tc.shadowing, Action: "passthrough"},
+			{Host: tc.shadowed, Audience: "shadowed"},
+		})
+		if err == nil {
+			t.Errorf("expected error: leading route %q makes the %q route unreachable",
+				tc.shadowing, tc.shadowed)
+		}
+	}
+}
+
+// TestNewRouter_AcceptsSingleStarBeforeFQDN pins the precision of the check.
+// With '.' as the separator a bare "*" matches one label only, so an FQDN
+// route after it is genuinely still reachable and must not be rejected —
+// over-rejection here would fail the pod at boot.
+func TestNewRouter_AcceptsSingleStarBeforeFQDN(t *testing.T) {
+	r, err := NewRouter("passthrough", []Route{
+		{Host: "*", Audience: "single-label"},
+		{Host: "api.example.com", Audience: "fqdn"},
+	})
+	if err != nil {
+		t.Fatalf("single-star before an FQDN route must be accepted, got err = %v", err)
+	}
+	if resolved := r.Resolve("api.example.com"); resolved == nil || resolved.Audience != "fqdn" {
+		t.Error("FQDN route must stay reachable behind a single-label wildcard")
+	}
+}
+
+// TestNewRouter_AcceptsTrailingCatchAll is the deliberate difference from
+// skip_hosts, which rejects match-all outright. Here a match-all as the last
+// route is a legitimate explicit catch-all — equivalent to defaultAction —
+// because nothing follows it to shadow.
+func TestNewRouter_AcceptsTrailingCatchAll(t *testing.T) {
+	r, err := NewRouter("passthrough", []Route{
+		{Host: "api.example.com", Audience: "specific"},
+		{Host: "**", Audience: "catch-all"},
+	})
+	if err != nil {
+		t.Fatalf("trailing catch-all must be accepted, got err = %v", err)
+	}
+	if resolved := r.Resolve("api.example.com"); resolved == nil || resolved.Audience != "specific" {
+		t.Error("specific route must win over the trailing catch-all")
+	}
+	if resolved := r.Resolve("anything-else"); resolved == nil || resolved.Audience != "catch-all" {
+		t.Error("trailing catch-all must match everything the specific route does not")
+	}
+}
+
+func TestNewRouter_RejectsEmptyHost(t *testing.T) {
+	_, err := NewRouter("passthrough", []Route{
+		{Host: "", Audience: "nowhere"},
+	})
+	if err == nil {
+		t.Error("expected error: an empty host pattern matches only an empty Host header, never real traffic")
+	}
+}
+
+// TestResolve_EmptyHost pins the empty-host defence. A bare "*" matches the
+// empty string under gobwas/glob, so without the guard an unset Host header
+// would select this route and mint a token for a destination we cannot
+// identify.
+func TestResolve_EmptyHost(t *testing.T) {
+	r, err := NewRouter("passthrough", []Route{
+		{Host: "*-anything", Audience: "should-not-be-used"},
+		{Host: "*", Audience: "should-not-be-used-either"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved := r.Resolve(""); resolved != nil {
+		t.Errorf("empty host must take the no-route path, got %+v", resolved)
 	}
 }
 

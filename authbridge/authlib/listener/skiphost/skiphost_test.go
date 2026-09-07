@@ -134,3 +134,52 @@ func TestMatch_NoMatch(t *testing.T) {
 		t.Error("Match returned true for an unrelated host")
 	}
 }
+
+// TestNew_RejectsMatchAllSpellings covers the spellings that the previous
+// guard let through. It compared patterns against the literal strings "*"
+// and "**", so every other way of writing match-all was accepted and
+// silently bypassed the plugin pipeline AND session recording for every
+// host — the exact outcome the guard exists to prevent.
+//
+// Each of these matches every hostname the listener sees under
+// `.`-delimited gobwas/glob.
+func TestNew_RejectsMatchAllSpellings(t *testing.T) {
+	for _, p := range []string{
+		"***",    // runs of three or more stars behave as "**"
+		"****",   //
+		"{**}",   // super-star wrapped in braces
+		"{*,**}", // alternation containing a super-star
+		"?*",     // one character then anything = any non-empty label
+	} {
+		if _, err := New([]string{p}); err == nil {
+			t.Errorf("New([%q]) returned nil error; pattern is match-all and must be rejected at boot", p)
+		}
+	}
+}
+
+// TestNew_AcceptsNonMatchAllWildcards is the over-rejection guard for the
+// behavioural probe. Everything here is a wildcard pattern an operator
+// would plausibly write, and each requires either a separator or a fixed
+// prefix/suffix, so none is match-all. If the probe ever starts rejecting
+// these, it has become a footgun of its own — a bad pattern fails the pod
+// at boot.
+func TestNew_AcceptsNonMatchAllWildcards(t *testing.T) {
+	for _, p := range []string{
+		"*.*",
+		"*.svc.cluster.local",
+		"service-*",
+		"*-anything",
+		"*.something",
+		"otel-*",
+		"otel-collector*",
+		"otel-collector.*.svc.cluster.local",
+		"*.rossoctl-system.svc.cluster.local",
+		"**.svc.cluster.local",
+		"?",
+		"**.**",
+	} {
+		if _, err := New([]string{p}); err != nil {
+			t.Errorf("New([%q]) returned err = %v; pattern is not match-all and must be accepted", p, err)
+		}
+	}
+}
