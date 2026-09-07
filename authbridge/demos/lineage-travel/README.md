@@ -79,24 +79,34 @@ are HTTP and stay captured. All 12 pods come back `2/2`.
 ## 3. One turn, one trace
 
 ```sh
-APP=travel_advisor bash run-demo.sh      # in the app clone
-./show-last-trace.sh                     # finds the turn's trace id, prints its shape
+./ask.sh                                 # prints the trace id, runs the scripted turn
+../lineage/show-trace.py <trace-id>      # the shape
 ```
 
-The demo client sends no `traceparent`; its sidecar finds nothing on the wire
-and **mints the root** (`lineage.parent.source: none` — contract v1.6), so
-the whole conversation still lands in one trace: the A2A entry, the
-agent-to-agent consultations, every MCP handshake and tool call, the MinIO
-read, the PSP charge — outbound at the caller and inbound at the callee, all
-`tracestate` after the entry. `show-last-trace.sh` is one grep away from the
-weather demo's reader: it locates the newest demo-client-rooted trace and
-runs [`../lineage/show-trace.py`](../lineage/show-trace.py) on it. Pass:
-`shape: OK — one root, unstamped only at the entry`.
+`ask.sh` sends the app's own scripted turn (demo.py's `USER_TURN`, verbatim)
+from the demo-client pod as one non-streaming `message/send`, with a trace id
+of our choosing. Two lineage-mechanical reasons not to use the app's
+`run-demo.sh` here (neither is the app's fault, both are explained in
+`ask.sh`'s header): the app's script execs into the pod without naming a
+container (post-attach, envoy-proxy is first), and its client STREAMS the
+reply, which the sidecar's body pipeline buffers — the turn completes inside
+the app but the streamed reply reaches the client empty.
+
+The one trace holds the whole conversation: the A2A entry (`wire` — ask.sh
+minted the trace), the agent-to-agent consultations, every MCP handshake and
+tool call, the LLM calls, the MinIO read, the PSP charge — outbound at the
+caller and inbound at the callee, `tracestate` everywhere after the entry.
+Pass: `shape: OK — one root, unstamped only at the entry`.
+
+(`run-turn.sh` and `show-last-trace.sh`/`last-trace-id.sh` remain for the
+minted-root variant: a turn driven by the app's own demo.py — fine before
+the attach, and its sidecar mints the root after it — with the id recovered
+from the collector log.)
 
 ## 4. The risk probe
 
 ```sh
-./risk-probe.sh          # or ./risk-probe.sh <trace-id> to pick a turn
+./risk-probe.sh <trace-id>     # the id ask.sh printed (defaults to the newest turn)
 ```
 
 Two more calls from the demo-client pod, both carrying the turn's trace id in
@@ -136,10 +146,11 @@ ConfigMap delete); run them, or tear the app down entirely in the clone:
 
 | file | what |
 |---|---|
-| `attach-fleet.sh` | the kit, applied to the whole app: one bake + 12 attaches, with the per-store port exclusions |
-| `last-trace-id.sh` | the trace id of the last demo turn, from the collector log |
-| `show-last-trace.sh` | that id + `show-trace.py` on it |
+| `attach-fleet.sh` | the kit, applied to the whole app: one bake + 12 attaches (leaves first), with the per-store port exclusions |
+| `ask.sh` | the app's scripted turn as one non-streaming `message/send`, trace id chosen and printed |
 | `risk-probe.sh` | the two PII calls riding the app trace, one per destination class |
+| `run-turn.sh` | the app's own demo.py, exec'd into the right container |
+| `last-trace-id.sh` / `show-last-trace.sh` | trace id of the last demo.py turn (minted root), and its shape |
 
 The app is not here — it stays in its own repo, unmodified; this directory
 holds only the attach loop and the two readers/probes.

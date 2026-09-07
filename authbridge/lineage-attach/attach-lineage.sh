@@ -209,15 +209,20 @@ build_app_patch() {
 
 # ---- the sidecar fragments (the single source of every sidecar YAML byte) ----
 
-sidecar_container() {  # the envoy-proxy container (8-space list-item indent)
+sidecar_container() {  # the envoy-proxy NATIVE SIDECAR (8-space list-item indent)
   cat <<EOF
         # Envoy + authbridge-envoy (ext_proc + the lineage plugin). MUST run as
         # UID 1337: proxy-init exempts that uid from the outbound redirect.
+        # A NATIVE sidecar (init container + restartPolicy: Always): the app
+        # container is not started until the startupProbe passes, so an app
+        # that dials out at process start (peer/agent-card discovery) cannot
+        # race its own proxy — with a plain container it did, and lost.
         # Readiness = the inbound listener accepting (without it a Service endpoint
         # goes Ready before the sidecar can take the redirect); admin binds loopback.
         - name: envoy-proxy
           image: "${SIDECAR_IMAGE}"
           imagePullPolicy: IfNotPresent
+          restartPolicy: Always
           args: ["--config", "/etc/authbridge/config.yaml"]
           securityContext:
             runAsNonRoot: true
@@ -230,9 +235,12 @@ sidecar_container() {  # the envoy-proxy container (8-space list-item indent)
             - { containerPort: 15123, name: envoy-out }
             - { containerPort: 15124, name: envoy-in }
             - { containerPort: 9090,  name: ext-proc }
+          startupProbe:
+            tcpSocket: { port: 15124 }
+            periodSeconds: 1
+            failureThreshold: 60
           readinessProbe:
             tcpSocket: { port: 15124 }
-            initialDelaySeconds: 2
             periodSeconds: 5
           resources:
             requests: { cpu: 50m, memory: 64Mi }
@@ -327,9 +335,9 @@ spec:
     spec:
       initContainers:
 $(proxy_init_container)
-      containers:
-$(sidecar_container)${app_patch}
-      volumes:
+$(sidecar_container)
+${app_patch:+      containers:${app_patch}
+}      volumes:
 $(sidecar_volumes)
 EOF
 }
