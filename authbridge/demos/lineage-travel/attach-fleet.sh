@@ -20,11 +20,20 @@ CAPTURE_IO="${CAPTURE_IO:-true}"
 # The app lives in its own namespace, which the platform chart did not
 # render an `envoy-config` ConfigMap into (it only renders team namespaces).
 # The config is namespace-agnostic — copy it in from a platform namespace.
+# Read the source first and refuse when it is missing: piping a failed `get`
+# into `create` would leave an EMPTY envoy-config behind, which this guard
+# then treats as present and every later run mounts into the sidecar.
 if ! kubectl -n "$NS" get cm envoy-config >/dev/null 2>&1; then
     src="${ENVOY_CONFIG_SOURCE_NS:-team1}"
+    if ! envoy_yaml="$(kubectl -n "$src" get cm envoy-config -o jsonpath='{.data.envoy\.yaml}')" \
+        || [ -z "$envoy_yaml" ]; then
+        echo "error: no envoy-config ConfigMap to copy from ns/$src (the platform chart renders" >&2
+        echo "       one per agent namespace; set ENVOY_CONFIG_SOURCE_NS to a namespace that has it," >&2
+        echo "       see: kubectl get cm -A --field-selector metadata.name=envoy-config)" >&2
+        exit 1
+    fi
     echo ">> copying envoy-config from ns/$src into ns/$NS"
-    kubectl -n "$src" get cm envoy-config -o jsonpath='{.data.envoy\.yaml}' \
-        | kubectl -n "$NS" create cm envoy-config --from-file=envoy.yaml=/dev/stdin
+    kubectl -n "$NS" create cm envoy-config --from-literal=envoy.yaml="$envoy_yaml"$'\n'  # $(…) ate the final newline
 fi
 
 KIND_CLUSTER_NAME="${KIND_CLUSTER_NAME:-rossoctl}" "$KIT/build-otel-shim.sh" "$IMAGE"
