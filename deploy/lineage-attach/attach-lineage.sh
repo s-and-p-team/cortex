@@ -74,6 +74,33 @@
 #                   telemetry export port (e.g. 4317), or a plaintext non-HTTP
 #                   store (Postgres 5432, SMTP 1025: the outbound HTTP codec
 #                   would close them). Never LLM/tool/S3 ports.
+#   AUTH_ISSUER     the user on the spans. Set to the JWT `iss` of your IdP
+#                   (Keycloak: http://<public-host>/realms/<realm>) and the
+#                   inbound chain gains `jwt-validation` ahead of the parsers:
+#                   every inbound request must carry a valid bearer token or is
+#                   DENIED with 401 (the plugin's default bypass paths excepted:
+#                   /.well-known/*, /healthz, /readyz, /livez, /metrics), and
+#                   the lineage request span of a
+#                   validated one carries lineage.principal.sub (the token's
+#                   `sub`) and lineage.principal.client (`azp`). Only the
+#                   workload that users call directly wants this — a tool an
+#                   agent calls receives no user token. Unset (default): no
+#                   gate, no principal facts, the consumer's caller stays
+#                   anonymous (`client:(unknown)` on the data-governance side).
+#   AUTH_AUDIENCE   needs AUTH_ISSUER: the `aud` the token must carry. Default:
+#                   AUTH_ISSUER — the rossoctl realm's `rossoctl-platform-audience`
+#                   scope stamps the issuer URL as an audience on every token,
+#                   so the default accepts any token the realm minted for ANY
+#                   client — the audience check is the confused-deputy guard,
+#                   and the default opens it to the whole realm. Right for a
+#                   demo; past one, set it to the workload's own client id so
+#                   only tokens minted for it pass.
+#   AUTH_JWKS_URL   needs AUTH_ISSUER: where the sidecar fetches the signing
+#                   keys, when the issuer host is not reachable from inside the
+#                   cluster (kind: *.localtest.me resolves to the pod's own
+#                   loopback). Keycloak:
+#                   http://<svc>.<ns>.svc:8080/realms/<realm>/protocol/openid-connect/certs
+#                   Default: derived from AUTH_ISSUER by the plugin.
 #   SIDECAR_IMAGE   default ghcr.io/rossoctl/cortex/authbridge-envoy:v0.8.1,
 #                   a release that carries lineage-telemetry. A pinned
 #                   tag on purpose: the patch pulls IfNotPresent, so a node
@@ -84,7 +111,9 @@
 #                   step 1).
 #   PROXY_INIT_IMAGE  default ghcr.io/rossoctl/cortex/proxy-init:v0.8.1
 #   NO_EMIT=1       omit the plugin entry: the sidecar proxies, emits nothing
-#                   (parsers alone are legal). The A/B baseline.
+#                   (parsers alone are legal). The A/B baseline. Independent
+#                   of AUTH_ISSUER: with both set the sidecar gates and emits
+#                   nothing.
 #   EMIT            patch (default) | cm | undo
 #
 # Structure: parse_inputs validates EVERY knob (all refusals live there);
@@ -188,8 +217,32 @@ parse_inputs() {
     0|1) ;;
     *) echo "error: NO_EMIT must be 0|1 (got '$NO_EMIT')" >&2; exit 2 ;;
   esac
+  # The user gate. Three knobs, one plugin entry; the two dependents without
+  # their issuer are a stale or mistyped line — refuse rather than emit a
+  # sidecar that validates nothing while the caller believes it does.
+  AUTH_ISSUER="${AUTH_ISSUER:-}"
+  AUTH_AUDIENCE="${AUTH_AUDIENCE:-}"
+  AUTH_JWKS_URL="${AUTH_JWKS_URL:-}"
+  if [ -z "$AUTH_ISSUER" ] && { [ -n "$AUTH_AUDIENCE" ] || [ -n "$AUTH_JWKS_URL" ]; }; then
+    echo "error: AUTH_AUDIENCE / AUTH_JWKS_URL need AUTH_ISSUER — the gate is keyed on the issuer" >&2; exit 2
+  fi
+  if [ -n "$AUTH_ISSUER" ]; then
+    case "$AUTH_ISSUER" in
+      http://*|https://*) ;;
+      *) echo "error: AUTH_ISSUER='$AUTH_ISSUER' must be the token's iss URL (http:// or https://)" >&2; exit 2 ;;
+    esac
+    [ -n "$AUTH_AUDIENCE" ] || AUTH_AUDIENCE="$AUTH_ISSUER"
+    if [ -n "$AUTH_JWKS_URL" ]; then
+      case "$AUTH_JWKS_URL" in
+        http://*|https://*) ;;
+        *) echo "error: AUTH_JWKS_URL='$AUTH_JWKS_URL' must be a URL (http:// or https://)" >&2; exit 2 ;;
+      esac
+    fi
+  fi
+
   local v
-  for v in SELF_ID OTEL_ENDPOINT APP_IMAGE RESTORE_IMAGE SIDECAR_IMAGE PROXY_INIT_IMAGE; do
+  for v in SELF_ID OTEL_ENDPOINT APP_IMAGE RESTORE_IMAGE SIDECAR_IMAGE PROXY_INIT_IMAGE \
+           AUTH_ISSUER AUTH_AUDIENCE AUTH_JWKS_URL; do
     yaml_safe "$v" "${!v}"
   done
   # A container name is a DNS label; it is interpolated bare.
@@ -240,6 +293,24 @@ build_plugin_entry() {
     # The plugin's own default applies when unset; an explicit value is emitted.
     [ -z "$MAX_PAYLOAD_BYTES" ] || lineage_plugin="${lineage_plugin}
               max_payload_bytes: ${MAX_PAYLOAD_BYTES}"
+  fi
+}
+
+build_auth_entry() {
+  # The user gate, inbound only: jwt-validation first, ahead of the parsers —
+  # the position the platform's own rendered runtime config gives it (that
+  # ConfigMap is rendered by the rossoctl chart, outside this repo). Independent
+  # of NO_EMIT — a gate is not an emitter. Empty when AUTH_ISSUER is unset.
+  auth_plugin=""
+  if [ -n "$AUTH_ISSUER" ]; then
+    auth_plugin='
+          - name: jwt-validation
+            config:
+              issuer: "'"${AUTH_ISSUER}"'"
+              audience: "'"${AUTH_AUDIENCE}"'"'
+    # Unset → the plugin derives the JWKS URL from the issuer.
+    [ -z "$AUTH_JWKS_URL" ] || auth_plugin="${auth_plugin}
+              jwks_url: \"${AUTH_JWKS_URL}\""
   fi
 }
 
@@ -375,9 +446,14 @@ data:
     # parsers are content-gated and not mutually exclusive (mcp-parser attaches
     # to any JSON-RPC body), and the plugin reads payloads only through the
     # protocol fact it stamped (precedence a2a > mcp > inference).
+    # Inbound only, when AUTH_ISSUER is set: jwt-validation first, so the
+    # lineage plugin behind it reads a validated identity. A request the gate
+    # denies is answered 401 before the chain reaches the plugin and emits NO
+    # lineage span (the wire contract's "Scope of denied"): lineage sees only
+    # the callers the gate let through.
     pipeline:
       inbound:
-        plugins:
+        plugins:${auth_plugin}
           - name: a2a-parser
           - name: mcp-parser
           - name: inference-parser${lineage_plugin}
@@ -453,6 +529,7 @@ main() {
   parse_inputs        # every knob: read, default, validate — all refusals live here
   build_proxy_env     # optional OUTBOUND_PORTS_EXCLUDE env for proxy-init
   build_plugin_entry  # the lineage-telemetry pipeline entry (empty under NO_EMIT=1)
+  build_auth_entry    # the inbound jwt-validation entry (empty without AUTH_ISSUER)
   build_app_patch     # optional propagation switch on the app's own container
   emit                # dispatch: patch | cm | undo
 }

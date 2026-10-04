@@ -49,7 +49,10 @@
 #   MAX_PAYLOAD_BYTES (cap on a captured value; plugin default 4096, -1 = whole),
 #   SIDECAR_IMAGE, PROXY_INIT_IMAGE, NO_EMIT,
 #   OUTBOUND_PORTS_EXCLUDE (an app's OWN telemetry port, or a plaintext non-HTTP store
-#                   port such as Postgres/SMTP — never LLM/tool/S3 ports).
+#                   port such as Postgres/SMTP — never LLM/tool/S3 ports),
+#   AUTH_ISSUER [AUTH_AUDIENCE] [AUTH_JWKS_URL] (the user gate: inbound requests
+#                   must carry a valid bearer token, and the spans then carry
+#                   lineage.principal.sub — for the workload users call directly).
 #
 # Requires in the namespace: the platform's `envoy-config` ConfigMap; the
 # sidecar + proxy-init images resolvable from the cluster (README "Prerequisites and configuration").
@@ -61,7 +64,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 read_inputs() {
-  DEPLOY="${DEPLOY:?usage: DEPLOY=<deployment> [NAMESPACE=team1] [SELF_ID=<id>] [APP_CONTAINER=<name> [APP_IMAGE=<ref>]] [SIDECAR_IMAGE=<ref> PROXY_INIT_IMAGE=<ref>] [OUTBOUND_PORTS_EXCLUDE=ports] sidecar-patch.sh}"
+  DEPLOY="${DEPLOY:?usage: DEPLOY=<deployment> [NAMESPACE=team1] [SELF_ID=<id>] [APP_CONTAINER=<name> [APP_IMAGE=<ref>]] [SIDECAR_IMAGE=<ref> PROXY_INIT_IMAGE=<ref>] [OUTBOUND_PORTS_EXCLUDE=ports] [AUTH_ISSUER=<iss> [AUTH_AUDIENCE=<aud>] [AUTH_JWKS_URL=<url>]] sidecar-patch.sh}"
   NAMESPACE="${NAMESPACE:-team1}"
   SELF_ID="${SELF_ID:-$DEPLOY}"
   APP_CONTAINER="${APP_CONTAINER:-}"
@@ -161,6 +164,15 @@ note_capture_only() {
   echo "      tracestate) from inbound to outbound itself (its own instrumentation, or the" >&2
   echo "      baked shim + APP_CONTAINER=<name>). Verify pairing" >&2
   echo "      under concurrency before relying on it (DESIGN.md, 'The envelope')." >&2
+}
+
+note_auth_gate() {
+  # The gate denies, it does not merely observe — say so where the operator
+  # attaching it can see it, once, before anything is applied.
+  [ -n "${AUTH_ISSUER:-}" ] || return 0
+  echo "NOTE: AUTH_ISSUER is set — every inbound request to $DEPLOY must carry a bearer token" >&2
+  echo "      issued by ${AUTH_ISSUER} for audience ${AUTH_AUDIENCE:-$AUTH_ISSUER}, or is denied" >&2
+  echo "      with 401; the request span of an accepted one carries lineage.principal.sub." >&2
 }
 
 gen() {  # $1 = EMIT mode; the other knobs reach the generator through the environment
@@ -265,6 +277,7 @@ main() {
   read_inputs        # DEPLOY required; the rest defaulted or inherited
   preconditions      # six checks that can only stop the script
   note_capture_only  # no APP_CONTAINER → say what that means, once
+  note_auth_gate     # AUTH_ISSUER → say that inbound is now gated, once
   apply              # generate both, then the only cluster writes: cm → patch → rollout
 }
 main "$@"

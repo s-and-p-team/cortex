@@ -50,7 +50,7 @@ pair is joined by `lineage.exchange.id` (the request span's own id):
 | `lineage.direction` · `lineage.self.id` · `lineage.peer.host` | `inbound` / `outbound`; this workload's stable id; the other end |
 | `lineage.protocol` | `a2a` / `mcp` / `inference` / `http` |
 | `lineage.outcome`, `lineage.denied_by` | how the exchange ended |
-| `lineage.principal.sub`, `lineage.principal.client` | the caller's identity when a validated token carried one (the generated pipeline runs no `jwt-validation`, so not with the generated ConfigMap) |
+| `lineage.principal.sub`, `lineage.principal.client` | the caller's identity when a validated token carried one — with `AUTH_ISSUER` set, which puts `jwt-validation` ahead of the plugin ("The user", below); absent otherwise |
 | `lineage.parent.source` | `tracestate` — parented on the previous sidecar's stamp; `wire` — on a `traceparent` that arrived without a stamp; `none` — nothing valid arrived, so this hop roots a trace and a `traceparent` is minted for the next |
 | `input.value` / `output.value` | with `capture_io: true`: the parsed A2A message, MCP arguments or LLM prompt, cut at `max_payload_bytes` (4096 unless `MAX_PAYLOAD_BYTES` says otherwise) with a visible marker |
 
@@ -287,9 +287,58 @@ a port out of the iptables redirect: an app's own telemetry export port, or a
 **plaintext non-HTTP store** it talks to (Postgres 5432, SMTP 1025, Redis 6379
 — the outbound listener's HTTP codec would close them; DESIGN "What the
 sidecar can and cannot see"). Never exclude LLM, tool, peer or S3 ports.
-`NO_EMIT=1` keeps the sidecar as a pure proxy — a clean A/B baseline.
+`NO_EMIT=1` keeps the sidecar as a pure proxy — a clean A/B baseline (with
+`AUTH_ISSUER` set as well, a gate that emits nothing).
+
+**The user.** Every fact above names workloads; none names the person who
+asked. The plugin emits `lineage.principal.sub` and `lineage.principal.client`
+on an inbound request span **only** when a gate plugin ahead of it in the chain
+validated a JWT — it never infers an identity from an address. `AUTH_ISSUER`
+puts that gate in: the generated inbound chain gains `jwt-validation` ahead of
+the parsers, and the plugin entry is
+
+```yaml
+- name: jwt-validation
+  config:
+    issuer: "http://keycloak.localtest.me:8080/realms/rossoctl"     # AUTH_ISSUER — the token's iss, bit for bit
+    audience: "http://keycloak.localtest.me:8080/realms/rossoctl"   # AUTH_AUDIENCE, default = the issuer (see below)
+    # jwks_url: "http://keycloak-service.keycloak.svc:8080/realms/rossoctl/protocol/openid-connect/certs"  # AUTH_JWKS_URL
+```
+
+Three things follow, and the first is the one to decide on. (1) The gate
+**denies**: an inbound request without a valid bearer token for that issuer and
+audience is answered `401` by the sidecar and never reaches the app — so this
+belongs on the workload users call directly (the entry agent), not on a tool an
+agent calls, which receives no user token. And **the default audience is wide
+open on purpose**: with `AUTH_AUDIENCE` unset the gate accepts any token the
+realm minted for *any* client (the audience check is the confused-deputy
+guard; the demo wants every realm user through). Past a demo, set
+`AUTH_AUDIENCE` to the workload's own client id. (2) A denied request emits **no
+lineage span**: the pipeline stops at the gate before the plugin runs (the wire
+contract's "Scope of denied"), so lineage sees only the callers the gate let
+through. (3) The value is the token's `sub` as the IdP minted it — on Keycloak
+an opaque UUID, and only when the client's scopes include `basic` (Keycloak 25+
+puts `sub` there; a realm imported without that scope mints tokens with no
+`sub`, and the plugin, which guesses nothing, emits no principal). The
+data-governance consumer turns the fact into a `user:<sub>` entity as the
+trace's root caller; without it the caller is `client:(unknown)`.
+
+The default audience is the issuer URL because the rossoctl realm's
+`rossoctl-platform-audience` default client scope (in the platform's realm
+import, `charts/rossoctl-deps/templates/keycloak-realm-init.yaml` in the
+rossoctl repo) stamps it on every token the realm mints — a token minted by a
+client without that scope is refused, and the issuer is matched bit for bit
+(a trailing slash on `AUTH_ISSUER` that the token's `iss` lacks denies every
+token with the generic `token validation failed`; `token.sh` prints a token's
+`iss` and `aud` so the two can be compared). `AUTH_JWKS_URL` is
+for the split horizon: the sidecar fetches signing keys from inside the
+cluster, where the issuer's public host usually does not resolve (on kind,
+`*.localtest.me` is the pod's own loopback). The [lineage demo](../../demos/lineage/README.md)
+step 6 walks through it, step 7 does the same from the platform UI.
+
 Script knobs: `NAME`/`DEPLOY`, `NAMESPACE` (default `team1`), `SELF_ID`, `OTEL_ENDPOINT`,
-`CAPTURE_IO`, `MAX_PAYLOAD_BYTES`, `APP_CONTAINER`, `APP_IMAGE`, `OUTBOUND_PORTS_EXCLUDE`, `SIDECAR_IMAGE`,
+`CAPTURE_IO`, `MAX_PAYLOAD_BYTES`, `APP_CONTAINER`, `APP_IMAGE`, `OUTBOUND_PORTS_EXCLUDE`,
+`AUTH_ISSUER`, `AUTH_AUDIENCE`, `AUTH_JWKS_URL`, `SIDECAR_IMAGE`,
 `PROXY_INIT_IMAGE`, `NO_EMIT`, `EMIT`; each script's header documents its own.
 
 ---
