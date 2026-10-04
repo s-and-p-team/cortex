@@ -20,13 +20,14 @@ app's job; this page is only the walk-through.
   the kit attaches the sidecar as a native sidecar), namespace `team1` with
   its platform-rendered `envoy-config` ConfigMap, and the platform collector
   (`deploy/otel-collector` in `rossoctl-system`, stock `debug` exporter).
-- A sidecar image that carries `lineage-telemetry` (cortex #761): until a release does,
-  [RECIPE step 1](../../deploy/lineage-attach/RECIPE.md#1-a-sidecar-image-that-carries-the-plugin-once-per-cluster-until-a-release-does)
-  builds and loads it (run it from the kit's directory; its `cd ../..` is
-  relative to there). Then, back in this directory, for the whole session:
+- The sidecar images: the kit's defaults are the published release
+  `ghcr.io/rossoctl/cortex/{authbridge-envoy,proxy-init}:v0.8.1`, which the
+  node pulls on first use. (To run a build of this tree instead,
+  [RECIPE step 1](../../deploy/lineage-attach/RECIPE.md#1-build-the-sidecar-from-source-optional)
+  builds and loads it and exports `SIDECAR_IMAGE`/`PROXY_INIT_IMAGE`.) For the
+  whole session, in this directory:
 
   ```sh
-  export SIDECAR_IMAGE=docker.io/library/authbridge-envoy:latest PROXY_INIT_IMAGE=docker.io/library/proxy-init:latest
   export KIT=../../deploy/lineage-attach
   ```
 - An LLM the agent can reach over **plaintext HTTP** (an HTTPS LLM is TLS

@@ -21,18 +21,16 @@ additive, it is reversible with one printed reverse patch, and it is the same
 for every workload in the fleet — an agent, a tool, a relay, a service nobody
 remembers writing.
 
-> **Until a release carries the plugin, build the sidecar yourself.** The
-> published `ghcr.io/rossoctl/cortex/authbridge-envoy` image does not carry
-> `lineage-telemetry`, so the generator **refuses** to emit a patch that pins
-> it (set `SIDECAR_IMAGE`, or `NO_EMIT=1`). What the refusal prevents: the
-> sidecar crashloops on the unknown plugin name (`plugins.Build` fails
-> closed), its startupProbe never passes, the app container never starts, and
-> a rolling update stalls with the **old pods still serving** — contained,
-> but nothing attaches. (Under `strategy: Recreate` the old pods are deleted
-> first, so there the workload would be down.) The plugin is cortex #761;
-> [RECIPE.md](RECIPE.md) step 1 builds and loads `authbridge-envoy` + `proxy-init`
-> from a tree that carries it. To run on a stock image meanwhile, `NO_EMIT=1`
-> gives a graceful parsers-only sidecar (the parsers predate the plugin).
+The sidecar image defaults to the pinned release
+`ghcr.io/rossoctl/cortex/authbridge-envoy:v0.8.1`, a release that carries
+`lineage-telemetry` (with `proxy-init:v0.8.1` beside it). Pinned rather than
+`:latest` on purpose: the patch pulls `IfNotPresent`, so a node that cached a
+floating tag before the plugin shipped keeps serving that binary, and the
+sidecar crashloops on the unknown plugin name (`plugins.Build` fails closed,
+the startupProbe never passes, a rolling update stalls with the old pods still
+serving). To run a build of this tree instead, [RECIPE.md](RECIPE.md) step 1
+builds and loads it and `SIDECAR_IMAGE` points at it; `NO_EMIT=1` gives a
+parsers-only sidecar that emits nothing, the A/B baseline.
 
 **Start here:** [RECIPE.md](RECIPE.md) — six steps, expected output, back
 out. **Why it works and where it stops:** [DESIGN.md](DESIGN.md). **See it
@@ -58,8 +56,6 @@ pair is joined by `lineage.exchange.id` (the request span's own id):
 
 The attributes are the plugin's: [`plugin-catalog.md`](../../docs/plugin-catalog.md#lineage-telemetry)
 lists its knobs, [`lineage-wire-contract.md`](../../docs/lineage-wire-contract.md) the wire format.
-(Both docs arrive with the `lineage-telemetry` plugin in cortex #761; the links
-resolve once it lands.)
 
 A well-propagated trace has exactly one unstamped hop, at the entry: `wire`
 when the caller sent a `traceparent`, `none` when it sent nothing. Every other
@@ -249,9 +245,9 @@ In the cluster:
   the ConfigMap from that same apply does persist, inert on its own (no pod
   references it), so delete it if you back off.
 - Sidecar images resolvable from the cluster: `SIDECAR_IMAGE` /
-  `PROXY_INIT_IMAGE`, defaulting to the published
-  `ghcr.io/rossoctl/cortex/{authbridge-envoy,proxy-init}:latest` — see the
-  caveat at the top.
+  `PROXY_INIT_IMAGE`, defaulting to the pinned release
+  `ghcr.io/rossoctl/cortex/{authbridge-envoy,proxy-init}:v0.8.1`, which
+  carries the plugin (why pinned: the top of this page).
 - An **OTLP/gRPC endpoint**, `OTEL_ENDPOINT`, default
   `otel-collector.rossoctl-system.svc.cluster.local:4317`. Nothing downstream
   is assumed; DESIGN "Where you see the spans" covers the platform collector.
@@ -330,7 +326,7 @@ BAKE — once per app image                 ATTACH — once per Deployment
 | symptom | cause |
 |---|---|
 | No spans at all | Wrong `OTEL_ENDPOINT`, or the sidecar image predates the plugin — read the `envoy-proxy` container's log. |
-| `envoy-proxy` restarts with `unknown plugin "lineage-telemetry"` | The published image, until a release carries the plugin. Build from this repo (RECIPE step 1); the printed back-out line meanwhile. The patch pulls `IfNotPresent`, so a node that cached an older `:latest` keeps it. |
+| `envoy-proxy` restarts with `unknown plugin "lineage-telemetry"` | A sidecar image built before the plugin, or without its build tag. With `SIDECAR_IMAGE` on a floating tag, the usual cause is the node's cache: the patch pulls `IfNotPresent`, so a `:latest` cached before v0.8.1 is what runs — `crictl images` on the node shows it; remove it or use the pinned default. A build from source needs `GO_BUILD_TAGS` (RECIPE step 1). |
 | `envoy-proxy` restarts with `json: unknown field "namespace"` | A ConfigMap from this kit against a sidecar image built before the namespace key. Re-run `sidecar-patch.sh` with a `SIDECAR_IMAGE` that carries it ("Upgrading across the namespace key"). |
 | `envoy-proxy` restarts with `namespace is required` or `is not a DNS label` | A sidecar that carries the key against a ConfigMap that lacks it or hand-carries a value that is not a namespace. Re-run `sidecar-patch.sh` (it renders `NAMESPACE`, already validated as a DNS label). |
 | Spans arrive without `lineage.self.namespace` after an attach that printed "attached" | The Deployment patch was a no-op (same image, same knobs), so no pod rolled and the old sidecar refused the hot-reload. The script prints a NOTE with the log line to check; re-run with a matching `SIDECAR_IMAGE`. |

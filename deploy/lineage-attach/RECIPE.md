@@ -23,23 +23,31 @@ the name of its app container (`kubectl -n $NS get deploy/$DEPLOY -o jsonpath='{
 Enrolled workloads (an `AgentRuntime` CR) already carry a sidecar: this recipe
 refuses them by design; see README "Enrolled workloads".
 
-## 1. A sidecar image that carries the plugin (once per cluster, until a release does)
+## 1. Build the sidecar from source (optional)
 
-The plugin is cortex #761: build from a tree that carries `core/plugins/lineage/`
-(`main` once #761 has merged; the #761 branch until then).
+The published default, `ghcr.io/rossoctl/cortex/authbridge-envoy:v0.8.1` with
+`proxy-init:v0.8.1`, carries `lineage-telemetry`; skip this step unless you want a
+build of this tree. Plugins are opt-in at build time: the Dockerfile **requires**
+`GO_BUILD_TAGS`, the tag set of the `envoy` profile, which `scripts/profile-tags`
+computes. With Go on the host that is `$(go -C scripts/profile-tags run . envoy)`;
+without it (macOS with podman, typically) a Go container computes the same string:
 
 ```sh
-( cd ../.. && podman build -f cmd/cortex-envoy/Dockerfile -t docker.io/library/authbridge-envoy:latest . \
-            && podman build -f deploy/proxy-init/Dockerfile.init -t docker.io/library/proxy-init:latest deploy/proxy-init/ )
-for ref in authbridge-envoy proxy-init; do podman save docker.io/library/$ref:latest -o /tmp/$ref.tar \
+( cd ../.. \
+  && TAGS="$(podman run --rm -e GOWORK=off -e GOFLAGS=-mod=mod -v "$PWD":/src:ro -w /src/scripts/profile-tags docker.io/library/golang:1.26 go run . envoy)" \
+  && podman build -f cmd/cortex-envoy/Dockerfile --build-arg GO_BUILD_TAGS="$TAGS" -t docker.io/library/authbridge-envoy:dev . \
+  && podman build -f deploy/proxy-init/Dockerfile.init -t docker.io/library/proxy-init:dev deploy/proxy-init/ )
+for ref in authbridge-envoy proxy-init; do podman save docker.io/library/$ref:dev -o /tmp/$ref.tar \
   && KIND_EXPERIMENTAL_PROVIDER=podman kind load image-archive /tmp/$ref.tar --name rossoctl; rm -f /tmp/$ref.tar; done
-export SIDECAR_IMAGE=docker.io/library/authbridge-envoy:latest PROXY_INIT_IMAGE=docker.io/library/proxy-init:latest
+export SIDECAR_IMAGE=docker.io/library/authbridge-envoy:dev PROXY_INIT_IMAGE=docker.io/library/proxy-init:dev
 ```
 
-Pass: `podman exec <kind-node> crictl images | grep -E 'library/(authbridge-envoy|proxy-init)'` lists both.
-Docker hosts: `docker build` with the same `-f`/`-t`, then `kind load docker-image <ref> --name rossoctl`.
-Skip this step once the published `ghcr.io/rossoctl/cortex/authbridge-envoy` carries `lineage-telemetry`;
-the symptom of skipping it too early is the sidecar crash-looping with `unknown plugin "lineage-telemetry"`.
+Pass: `podman exec <kind-node> crictl images | grep -E 'library/(authbridge-envoy|proxy-init)'` lists both,
+and the sidecar's first log lines after step 3 include `lineage-telemetry: initialized`.
+Fail `GO_BUILD_TAGS is required` at the build: the `--build-arg` was dropped — an untagged build registers no plugins.
+Docker hosts: `docker build` with the same `-f`/`-t`/`--build-arg`, then `kind load docker-image <ref> --name rossoctl`.
+A tag of your own (`:dev` here) rather than `:latest`: the patch pulls `IfNotPresent`, and a kind node
+that already holds a `:latest` under that name would keep it over your build.
 
 ## 2. Bake the propagation shim onto the app image (once per image)
 
