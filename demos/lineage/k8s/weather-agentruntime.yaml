@@ -1,0 +1,20 @@
+# The platform UI lists a workload only when it carries rossoctl.io/type=agent,
+# and that label can be set by nobody but the operator (an admission policy
+# refuses it from anyone else). This CR asks the operator to adopt the running
+# weather-service Deployment and stamp the label. The operator's webhook would
+# also inject its own sidecar into an adopted pod — k8s/weather.yaml carries
+# `rossoctl.io/inject: disabled` on the pod template so it does not, and the
+# kit's lineage sidecar stays the only one.
+apiVersion: agent.rossoctl.dev/v1alpha1
+kind: AgentRuntime
+metadata:
+  name: weather-service
+  namespace: team1
+  labels:
+    app.kubernetes.io/name: weather-service
+spec:
+  type: agent
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: weather-service

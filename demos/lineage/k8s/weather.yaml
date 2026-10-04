@@ -43,6 +43,11 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: weather-service
+        # Step 7 adopts this Deployment with an AgentRuntime so the platform UI
+        # lists it; the operator's webhook would then inject its own sidecar
+        # beside the kit's. This label is the documented opt-out, inert until
+        # then (nothing injects into an un-adopted Deployment).
+        rossoctl.io/inject: disabled
     spec:
       # The image runs as 1001 (its Dockerfile); match it at pod level.
       securityContext:

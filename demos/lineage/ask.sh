@@ -10,6 +10,10 @@
 #
 # Usage: ./ask.sh ["What is the weather in Paris?"]
 #        NS=team1 SVC=weather-service PORT=8080 override the target.
+#        TOKEN=<access token> sends it as `authorization: Bearer` — the user
+#        the turn is asked by, once the sidecar's user gate is on (README
+#        step 6; `token.sh` mints one). Without it the request is anonymous,
+#        and a gated agent answers 401.
 #        A turn is given --max-time 300 (curl); the trace exists even if the
 #        answer arrives later than that.
 set -euo pipefail
@@ -20,9 +24,13 @@ body="$(python3 -c 'import json, sys, uuid
 print(json.dumps({"jsonrpc": "2.0", "id": "1", "method": "message/send", "params": {"message": {
   "role": "user", "messageId": uuid.uuid4().hex, "parts": [{"kind": "text", "text": sys.argv[1]}]}}}))' "$question")"
 echo "trace id: ${trace_id}"
+# The bearer header only when TOKEN is set; the `${a[@]+...}` form keeps an
+# empty array legal under `set -u` on bash 3.2 (macOS).
+auth=()
+[ -z "${TOKEN:-}" ] || auth=(-H "authorization: Bearer ${TOKEN}")
 kubectl -n "$NS" run "ask-${trace_id:0:12}" --rm -i --quiet --restart=Never --image=curlimages/curl:8.11.1 -- \
   curl -sS --max-time 300 -H 'content-type: application/json' \
-  -H "traceparent: 00-${trace_id}-0000000000000001-01" \
+  -H "traceparent: 00-${trace_id}-0000000000000001-01" ${auth[@]+"${auth[@]}"} \
   -d "$body" "http://${SVC}:${PORT}/" \
   | python3 -c 'import json, sys
 raw = sys.stdin.read()
@@ -32,6 +40,10 @@ except ValueError:
     # curl failed (nothing came back) or the agent answered with non-JSON:
     # show what arrived, not a traceback; kubectl/curl said why above.
     sys.exit("no answer: " + (raw.strip()[:300] or "empty response — see the error above"))
+if "error" in r and "plugin" in r:
+    # The sidecar answered, not the agent: a gate plugin denied the request
+    # (jwt-validation: no or invalid bearer token). No span exists for it.
+    sys.exit("denied by the sidecar (%s): %s — %s" % (r["plugin"], r["error"], r.get("message", "")))
 res = r.get("result", r)
 parts = (res.get("status", {}).get("message", {}).get("parts", [])
          or [p for a in res.get("artifacts", []) for p in a.get("parts", [])]

@@ -116,6 +116,9 @@ def spans_for(log: str, trace_id: str):
                 attrs.get("lineage.parent.source", ""),
                 attrs.get("lineage.peer.host", "")[:30],
                 attrs.get("lineage.outcome", ""),
+                # The validated caller — present only on an inbound request
+                # span behind a jwt-validation gate (README step 6).
+                attrs.get("lineage.principal.sub", ""),
             )
         )
     rows.sort()
@@ -147,9 +150,9 @@ def main() -> int:
     if not rows:
         print(f"no sidecar spans for {args.trace_id} in the last {args.since}", file=sys.stderr)
         return 1
-    print(f"{'time':<13}{'self':<17}{'dir':<10}{'proto':<11}{'role':<10}{'parent':<12}{'peer':<31}outcome")
+    print(f"{'time':<13}{'self':<17}{'dir':<10}{'proto':<11}{'role':<10}{'parent':<12}{'peer':<31}{'outcome':<11}user")
     for r in rows:
-        print(f"{r[0][11:23]:<13}{r[1]:<17}{r[2]:<10}{r[3]:<11}{r[4]:<10}{r[5]:<12}{r[6]:<31}{r[7]}")
+        print(f"{r[0][11:23]:<13}{r[1]:<17}{r[2]:<10}{r[3]:<11}{r[4]:<10}{r[5]:<12}{r[6]:<31}{r[7]:<11}{r[8]}")
     requests = [r for r in rows if r[4] == "request"]
     parents = collections.Counter(r[5] for r in requests)
     by_proto = collections.Counter(f"{r[2]} {r[3]}" for r in requests)
@@ -165,6 +168,13 @@ def main() -> int:
     print(f"{len(rows)} sidecar spans, {len(requests)} exchanges: {mix}")
     wire, stamped, none = parents.get("wire", 0), parents.get("tracestate", 0), parents.get("none", 0)
     print(f"parent.source: {wire} wire, {stamped} tracestate, {none} none")
+    # Who asked: the principal is a fact of the entry's inbound request span
+    # only — the hops behind it carry the agent's identity, not the user's.
+    # A window holding only response spans has no entry to name.
+    entry = requests[0] if requests else None
+    who = entry[8] if entry and entry[2] == "inbound" else ""
+    principal = f"user {who}" if who else "none — anonymous (no validated token on the inbound request)"
+    print(f"principal on the entry: {principal}")
     print(f"traces begun by an unparented outbound hop while this one was in flight: {strays}")
     has_outbound = any(r[2] == "outbound" for r in requests)
     # The one unstamped hop must be the first request AND an inbound: an
