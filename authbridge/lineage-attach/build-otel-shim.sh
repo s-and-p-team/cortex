@@ -128,7 +128,7 @@ detect_user() {  # sets APP_UID and APP_GID (either may be given explicitly)
 }
 
 # The interlock asks exactly "would wrapping DOUBLE-instrument?": is any of the
-# eight instrumentors this shim installs already present? Not the
+# instrumentors this shim installs already present? Not the
 # `opentelemetry.instrumentation` namespace (a transitive dep of anything
 # OTel-adjacent, no library instrumentation in it) and not a dormant SDK
 # (a2a-sdk ships one on every stock agent) — neither is a refusal signal. An
@@ -139,7 +139,8 @@ refuse_already_instrumented() {
   local already
   if already=$("$CONTAINER_TOOL" run --rm --network=none --entrypoint "$VENV_PYTHON" "$base_ref" -c '
 import importlib.util as u
-mods = ["starlette", "asgi", "fastapi", "httpx", "requests", "aiohttp_client", "urllib3", "threading"]
+mods = ["asgi", "wsgi", "starlette", "fastapi", "aiohttp_server", "flask", "django", "falcon", "pyramid", "tornado", "grpc",
+        "httpx", "requests", "aiohttp_client", "urllib3", "urllib", "threading"]
 found = [m for m in mods if u.find_spec("opentelemetry.instrumentation." + m)]
 print(",".join(found))
 raise SystemExit(0 if found else 1)' 2>/dev/null); then
