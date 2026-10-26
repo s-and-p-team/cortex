@@ -375,7 +375,8 @@ func (p *LineageTelemetry) Init(ctx context.Context) error {
 		res = resource.Default()
 	}
 
-	p.tp = newTracerProvider(&exportObserver{SpanExporter: exporter, failures: &p.exportFailures}, res)
+	p.tp = newTracerProvider(&exportObserver{SpanExporter: exporter, failures: &p.exportFailures}, res,
+		time.Duration(p.cfg.ExportDelayMS)*time.Millisecond)
 	p.tracer = p.tp.Tracer("authbridge/" + pluginName)
 
 	if pending != "" {
@@ -466,9 +467,16 @@ func hasIdentity(id string) bool { return strings.Trim(id, "/") != "" }
 // The forwarded traceparent keeps the caller's flags (a valid one is never
 // modified); only what this producer exports ignores them. An explicit
 // sampler also means OTEL_TRACES_SAMPLER no longer overrides it.
-func newTracerProvider(exporter sdktrace.SpanExporter, res *resource.Resource) *sdktrace.TracerProvider {
+//
+// exportDelay is the batch processor's schedule delay (export_delay_ms); zero
+// leaves the SDK default in place, OTEL_BSP_SCHEDULE_DELAY included.
+func newTracerProvider(exporter sdktrace.SpanExporter, res *resource.Resource, exportDelay time.Duration) *sdktrace.TracerProvider {
+	var batch []sdktrace.BatchSpanProcessorOption
+	if exportDelay > 0 {
+		batch = append(batch, sdktrace.WithBatchTimeout(exportDelay))
+	}
 	return sdktrace.NewTracerProvider(
-		sdktrace.WithBatcher(exporter),
+		sdktrace.WithBatcher(exporter, batch...),
 		sdktrace.WithResource(res),
 		sdktrace.WithSampler(sdktrace.AlwaysSample()),
 	)
