@@ -1,4 +1,4 @@
-# Lineage wire contract — two-span sidecar lineage (v1.8.0)
+# Lineage wire contract — two-span sidecar lineage (v1.8.1)
 
 What the AuthBridge `lineage-telemetry` plugin emits, what it writes onto the wire, and what the
 data-governance `sidecar` interactions algorithm (ADR-0030) commits to when consuming it.
@@ -272,6 +272,7 @@ construction.
 | `capture_io` | `false` | attach `input.value` / `output.value` — the parsers' reduction, or the raw bodies of an exchange no parser claimed (§5). The two body-size facts are emitted regardless |
 | `max_payload_bytes` | `4096` | producer-side cap on those two values; `0` or unset takes the default, `-1` attaches whole, any other negative is refused at start |
 | `max_attr_bytes` | `256` | cap on every variable-content string attribute and the span name (§4), except the two identity facts `lineage.self.id` and `lineage.self.namespace`, which are operator configuration and never truncated; same `0` / `-1` / negative semantics as `max_payload_bytes` |
+| `export_delay_ms` | `0` | the longest a recorded span waits in the batch exporter before it is sent, `0` or unset the SDK's own 5000 ms; a negative value is refused at start. Spans and wire unchanged: it sets only when a span leaves |
 | `mint_traceparent` | `true` | §3.3; `false` = a pure observer that never writes a `traceparent` |
 | `bypass_paths` | `/.well-known/*`, `/healthz`, `/readyz`, `/health` | path globs (`path.Match`; `*` does not cross `/`) that produce no spans, matched by the shared bypass package (query stripped, path normalized) — the same key and semantics as `jwt-validation` and `sparc` |
 | `bypass_hosts` | `otel-collector`, `otel-collector.*`, `jaeger`, `jaeger.*`, `zipkin`, `zipkin.*`, `prometheus`, `prometheus.*` | outbound host globs that produce no spans |
@@ -359,6 +360,7 @@ The producer must not emit these, and the consumer reads nothing from them.
 Version ladder, newest first. Each line is what changed on the wire or in the vocabulary; the
 mechanisms named as removed are not to be reintroduced.
 
+- **v1.8.1** — configuration only; spans and wire unchanged. `export_delay_ms` added.
 - **v1.8.0** — plain-HTTP payloads and body sizes. An exchange no parser claimed
   (`lineage.protocol=http`) carries its raw bodies as `input.value` / `output.value` under
   `capture_io`, when text and (for the response) whole; before, the two values were defined as the
