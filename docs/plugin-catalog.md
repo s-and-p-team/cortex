@@ -33,6 +33,7 @@ AuthBridge pipeline YAML, not whether it is compiled into the binary
 | [`litellm-budget-track`](#litellm-budget-track) | Accumulates the cost record `inference-parser` settles (authoritative where LiteLLM's cost header is present) and enforces a daily budget limit. Place on whichever chain carries LLM traffic — inbound when fronting the LLM endpoint, outbound when hosting an agent via `agentop exec`. | Alpha | Both | No |
 | [`mcp-parser`](#mcp-parser) | Parses MCP tool calls/results into `pctx.Extensions.MCP`. | Beta | Outbound | No |
 | [`opa`](#opa) | [OPA](https://www.openpolicyagent.org/docs) policy enforcement for inbound and outbound requests. | Alpha | Both | No |
+| [`sentry-gate`](#sentry-gate) | Holds an outbound request to an unlisted destination until a verdict service has answered for the exchange; refuses it on a deny verdict. | Alpha | Outbound | No |
 | [`sparc`](#sparc) | Pre-tool reflection: blocks ungrounded/hallucinated tool calls. | Alpha | Outbound | No |
 | [`static-inject`](#static-inject) | Swaps a placeholder credential for a real static credential on outbound requests. | Alpha | Outbound | No |
 | [`script`](#script) | Runs the scripts in `~/.cortex/plugins` as pipeline steps, so a small Python or shell script can read, change or block requests and responses. Laptop only. | Alpha | Outbound | No |
@@ -161,6 +162,14 @@ OPA engine and four fixed decision paths. Full details in the plugin's
 [README](../core/plugins/opa/README.md).
 
 Full reference: [`opa-plugin.md`](opa-plugin.md).
+
+## `sentry-gate`
+
+Holds an outbound request to a destination outside its pass list until a
+verdict service answers for that exchange, and refuses it on a deny verdict.
+Place it after `lineage-telemetry`, whose stamp is the key it asks by.
+
+Full reference: [`sentry-gate-plugin.md`](sentry-gate-plugin.md).
 
 ## `sparc`
 

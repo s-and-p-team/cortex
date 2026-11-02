@@ -9,7 +9,7 @@ Built-in plugins and the open plugin registry. Plugin authoring docs live under
 
 ## Built-in plugins
 
-All seventeen, with config and behavior, in
+Every plugin, with config and behavior, in
 [`docs/plugin-catalog.md`](../../docs/plugin-catalog.md); each plugin also
 has a dedicated reference doc there (`docs/<name>-plugin.md`).
 
@@ -28,6 +28,7 @@ has a dedicated reference doc there (`docs/<name>-plugin.md`).
 | `static-inject` | Swap a placeholder credential for a real static one on outbound requests |
 | `token-broker` | Acquire tokens from an external broker service per host-based routes |
 | `lineage-telemetry` | Emit facts-only OTel lineage spans per HTTP exchange |
+| `sentry-gate` | Hold an outbound request to an unlisted destination until a verdict service has answered for the exchange; refuse it on a deny verdict |
 | `sparc` | Pre-tool reflection against a SPARC reflection service |
 | `session-budget` | Per-session token / call / duration budgets via Redis |
 | `context-guru` | Compact the outbound LLM request context |
@@ -64,7 +65,7 @@ named profiles in `scripts/profile-tags`:
 | Profile | Carries |
 |---------|---------|
 | `local` | the three parsers + `tool-prune` |
-| `full` | all fourteen non-optional plugins |
+| `full` | every plugin but `cpex` (the cgo builds only) and the two no profile carries, `context-guru` and `session-budget` |
 | `lite` | jwt-validation, token-exchange, litellm-budget-track, static-inject |
 | `envoy`, `cpex` | the sets those binaries shipped historically |
 

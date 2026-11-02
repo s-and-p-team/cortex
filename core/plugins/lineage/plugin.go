@@ -60,6 +60,7 @@ import (
 	"net"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -653,8 +654,16 @@ func (p *LineageTelemetry) OnRequest(ctx context.Context, pctx *pipeline.Context
 	// stamp (and any minted traceparent under it) is a header rewrite; when
 	// nothing was written — pure-observer config, or a refused Insert — the
 	// exchange was only recorded.
+	// capture_io travels with the record because a body's absence from the span
+	// means something only beside it: a gate later in this chain tells "capture
+	// is off" from "this body could not be captured" by reading it here, from the
+	// config that emitted this exchange's span, which a reload cannot separate.
 	if stamped {
-		pctx.Modify("stamped_tracestate")
+		pctx.Record(pipeline.Invocation{
+			Action:  pipeline.ActionModify,
+			Reason:  "stamped_tracestate",
+			Details: map[string]string{"capture_io": strconv.FormatBool(p.cfg.CaptureIO)},
+		})
 	} else {
 		pctx.Observe("recorded_request")
 	}

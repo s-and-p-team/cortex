@@ -41,7 +41,7 @@ var allProfiles = []ProfileName{
 //
 //	local     desktop cortex — the three parsers, tool-prune and script
 //	full      authbridge image, Kubernetes proxy-sidecar, release tarballs,
-//	          make dev-install — all sixteen
+//	          make dev-install — all seventeen
 //	lite      authbridge-lite image — sidecar minimum
 //	envoy     authbridge-envoy image
 //	cpex      authbridge-cpex image
@@ -63,6 +63,11 @@ var membership = map[PluginName][]ProfileName{
 	"tokenbroker": {ProfileFull, ProfileFullCpex, ProfileEnvoy, ProfileCpex},
 	"lineage":     {ProfileFull, ProfileFullCpex, ProfileEnvoy},
 	"opa":         {ProfileFull, ProfileFullCpex, ProfileEnvoy},
+
+	// Full (and fullcpex, which stays full plus cpex): the authbridge image, the
+	// sidecar a gated namespace runs. Not envoy, where it is untested. Inert until
+	// a config lists it, after lineage-telemetry, which its Requires enforces.
+	"sentrygate": {ProfileFull, ProfileFullCpex},
 
 	// Full (and fullcpex) only. Its redirect needs the forward proxy, so cortex-envoy would refuse
 	// it at build time. Full is what the release
