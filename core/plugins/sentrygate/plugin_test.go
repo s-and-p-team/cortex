@@ -1117,3 +1117,105 @@ func TestRefusalWithNoKeyNamesNoExchange(t *testing.T) {
 		t.Errorf("details = %v", act.Violation.Details)
 	}
 }
+
+func hello(params string) string {
+	return `{"method":"initialize","params":{` + params + `},"jsonrpc":"2.0","id":0}`
+}
+
+// What a real client sends passes with nothing asked; any other form of it does not. The bodies of the first group are captured from the MCP and A2A clients.
+func TestCarriesNoData(t *testing.T) {
+	for _, tc := range []struct {
+		name, method, path, body, kind string
+	}{
+		{"card", http.MethodGet, "/.well-known/agent-card.json", "", "agent_card"},
+		{"previous card path", http.MethodGet, "/.well-known/agent.json", "", "agent_card"},
+		{"initialized", http.MethodPost, "/mcp", `{"method":"notifications/initialized","jsonrpc":"2.0"}`, "notifications/initialized"},
+		{"ping", http.MethodPost, "/mcp", `{"method":"ping","jsonrpc":"2.0","id":1}`, "ping"},
+		{"tools list", http.MethodPost, "/mcp", `{"method":"tools/list","jsonrpc":"2.0","id":2}`, "tools/list"},
+		{"empty params", http.MethodPost, "/mcp", `{"method":"tools/list","params":{},"jsonrpc":"2.0","id":2}`, "tools/list"},
+		{"null params", http.MethodPost, "/mcp", `{"method":"ping","params":null,"jsonrpc":"2.0","id":2}`, "ping"},
+		{"other spacing", http.MethodPost, "/mcp", `{"method": "ping", "jsonrpc": "2.0", "id": 1}`, "ping"},
+
+		{"card with a body", http.MethodGet, "/.well-known/agent-card.json", "x", ""},
+		{"card by POST", http.MethodPost, "/.well-known/agent-card.json", "", ""},
+		{"another well-known path", http.MethodGet, "/.well-known/other", "", ""},
+		{"a path under the card", http.MethodGet, "/.well-known/agent-card.json/x", "", ""},
+		{"empty POST", http.MethodPost, "/mcp", "", ""},
+		{"initialize as sent", http.MethodPost, "/mcp", hello(`"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"mcp","version":"0.1.0"}`), "initialize"},
+		{"initialize with no params", http.MethodPost, "/mcp", `{"method":"initialize","jsonrpc":"2.0","id":0}`, ""},
+		{"initialize, a value in the version", http.MethodPost, "/mcp", hello(`"protocolVersion":"123-45-6789","capabilities":{},"clientInfo":{"name":"mcp","version":"0.1.0"}`), ""},
+		{"initialize, a name with spaces", http.MethodPost, "/mcp", hello(`"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"Priya Raman","version":"0.1.0"}`), ""},
+		{"initialize, a long name", http.MethodPost, "/mcp", hello(`"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"` + strings.Repeat("a", 33) + `","version":"0.1.0"}`), ""},
+		{"initialize, capabilities", http.MethodPost, "/mcp", hello(`"protocolVersion":"2025-11-25","capabilities":{"x":"y"},"clientInfo":{"name":"mcp","version":"0.1.0"}`), ""},
+		{"initialize, an extra param", http.MethodPost, "/mcp", hello(`"note":"x","protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"mcp","version":"0.1.0"}`), ""},
+		{"initialize, an extra client field", http.MethodPost, "/mcp", hello(`"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"mcp","version":"0.1.0","title":"x"}`), ""},
+		{"initialize, no client", http.MethodPost, "/mcp", hello(`"protocolVersion":"2025-11-25","capabilities":{}`), ""},
+		{"initialize, a param given twice", http.MethodPost, "/mcp", hello(`"protocolVersion":"123-45-6789","protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"mcp","version":"0.1.0"}`), ""},
+		{"initialize, a client field given twice", http.MethodPost, "/mcp", hello(`"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"secret","name":"mcp","version":"0.1.0"}`), ""},
+		{"tool call", http.MethodPost, "/mcp", `{"method":"tools/call","jsonrpc":"2.0","id":3}`, ""},
+		{"params with a value", http.MethodPost, "/mcp", `{"method":"tools/list","params":{"cursor":"123-45-6789"},"jsonrpc":"2.0","id":2}`, ""},
+		{"params as a list", http.MethodPost, "/mcp", `{"method":"ping","params":["123-45-6789"],"jsonrpc":"2.0","id":2}`, ""},
+		{"an extra field", http.MethodPost, "/mcp", `{"method":"ping","note":"123-45-6789","jsonrpc":"2.0","id":2}`, ""},
+		{"a field given twice", http.MethodPost, "/mcp", `{"method":"ping","params":{"a":"123-45-6789"},"params":{},"id":2}`, ""},
+		{"a string id", http.MethodPost, "/mcp", `{"method":"ping","jsonrpc":"2.0","id":"123-45-6789"}`, ""},
+		{"a long id", http.MethodPost, "/mcp", `{"method":"ping","jsonrpc":"2.0","id":123456789}`, ""},
+		{"a fractional id", http.MethodPost, "/mcp", `{"method":"ping","jsonrpc":"2.0","id":1.5}`, ""},
+		{"an escaped method", http.MethodPost, "/mcp", `{"method":"pin\u0067","jsonrpc":"2.0","id":1}`, ""},
+		{"another version", http.MethodPost, "/mcp", `{"method":"ping","jsonrpc":"1.0","id":1}`, ""},
+		{"no method", http.MethodPost, "/mcp", `{"jsonrpc":"2.0","id":1}`, ""},
+		{"not an object", http.MethodPost, "/mcp", `["ping"]`, ""},
+		{"not JSON", http.MethodPost, "/mcp", `ping`, ""},
+		{"padded past the bound", http.MethodPost, "/mcp", `{"method":"ping","jsonrpc":"2.0","id":1` + strings.Repeat(" ", noDataBodyMax) + `}`, ""},
+		{"a PUT", http.MethodPut, "/mcp", `{"method":"ping","jsonrpc":"2.0","id":1}`, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			kind, ok := carriesNoData(tc.method, tc.path, []byte(tc.body))
+			if ok != (tc.kind != "") || kind != tc.kind {
+				t.Errorf("carriesNoData = %q, %v; want %q", kind, ok, tc.kind)
+			}
+		})
+	}
+}
+
+// The gate reads the body and declares no body capability: declaring it would forbid the
+// gate after inference-router, where its doc puts it. Lineage, which the gate requires,
+// requires a parser, and a parser asks the listener to buffer the body.
+func TestTheGateFitsAfterABodyRewriter(t *testing.T) {
+	if New().Capabilities().ReadsBody {
+		t.Error("ReadsBody forbids the gate after a plugin that rewrites the body")
+	}
+}
+
+// Such a message asks nothing, needs no stamp, and is recorded; the same message with
+// anything more is asked about.
+func TestNoDataContinuesWithNothingAsked(t *testing.T) {
+	srv, calls, _ := verdictServer(t, 0, `{"state":"decided","verdict":"block"}`)
+	g := gate(t, `{"verdict_url":"`+srv.URL+`"}`)
+
+	unstamped := &pipeline.Context{Direction: pipeline.Outbound, Host: "outside.example", Method: http.MethodGet,
+		Path: "/.well-known/agent-card.json", Headers: http.Header{}}
+	if act := g.OnRequest(context.Background(), unstamped); act.Type != pipeline.Continue {
+		t.Fatalf("card: action = %v, want Continue", act.Type)
+	}
+	if inv := lastInvocation(t, unstamped); inv.Action != pipeline.ActionAllow || inv.Reason != "no_data" || inv.Details["kind"] != "agent_card" {
+		t.Errorf("card: invocation = %+v", inv)
+	}
+
+	listed := outbound("outside.example", stamped())
+	listed.Method, listed.Path, listed.Body = http.MethodPost, "/mcp", []byte(`{"method":"tools/list","jsonrpc":"2.0","id":2}`)
+	if act := g.OnRequest(context.Background(), listed); act.Type != pipeline.Continue {
+		t.Fatalf("tools/list: action = %v, want Continue", act.Type)
+	}
+	if calls.Load() != 0 {
+		t.Errorf("verdict calls = %d, want 0", calls.Load())
+	}
+
+	smuggled := outbound("outside.example", stamped())
+	smuggled.Method, smuggled.Path, smuggled.Body = http.MethodPost, "/mcp", []byte(`{"method":"tools/list","params":{"x":"y"},"jsonrpc":"2.0","id":2}`)
+	if act := g.OnRequest(context.Background(), smuggled); act.Type != pipeline.Reject {
+		t.Fatalf("with a value: action = %v, want Reject", act.Type)
+	}
+	if calls.Load() != 1 {
+		t.Errorf("verdict calls = %d, want 1", calls.Load())
+	}
+}

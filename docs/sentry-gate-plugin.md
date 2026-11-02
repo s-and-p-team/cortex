@@ -31,6 +31,15 @@ Per request, in order:
   (`kind: tunnel`). A tunnel `tls-bridge` decrypts runs the pipeline again for
   each request inside it, and each of those is judged, a `CONNECT` sent inside it
   included.
+- A message that can carry no data: continues at once, nothing asked, recorded
+  `allow/no_data` (`kind` names it). That is a `GET` of `/.well-known/agent-card.json`
+  or `/.well-known/agent.json` with no body, and a `POST` of MCP
+  `notifications/initialized`, `ping` or `tools/list` whose body holds only `jsonrpc`,
+  a numeric `id` of at most six digits and `method`, with `params` absent, empty or
+  null, and of `initialize` whose `params` are a date-shaped `protocolVersion`, empty
+  `capabilities`, and a `clientInfo` of a short `name` and `version`, in at most 256
+  bytes. So an agent can start against an outside peer and connect to an outside MCP
+  tool; a tool that needs OAuth discovery needs its host on `pass_hosts`. Any other form of these messages is asked about like any other request.
 - Otherwise the gate asks
   `GET {verdict_url}/verdicts/{trace_id}/{exchange_id}?wait_ms=N` and waits up to
   `wait_ms`. A verdict listed in `deny_on` is refused with a 403; any other
@@ -123,8 +132,9 @@ decline it.
 A `rules`, `labels` or `redacted_payload` of the wrong shape is dropped, and the refusal stands. The gate reads at most 64 KiB of an
 answer. The service's cap on `redacted_payload` keeps an answer under that.
 
-The invocation record carries `verdict`, `version`, `exchange_id`, `waited_ms`, `rules` and `labels` (comma-joined), and `unread` on an
-`unjudged` answer. It does not carry `redacted_payload`. The service's `status` and `error` on a failed call are in the record only:
+The invocation record carries `verdict`, `version`, `exchange_id`, `waited_ms`, `rules` and `labels` (comma-joined, when not empty),
+`unread` on an `unjudged` answer that was not denied, and `rules_error`, `labels_error` or `redacted_payload_error` for a value of the
+wrong shape. It does not carry `redacted_payload`. The service's `status` and `error` on a failed call are in the record only:
 that text can carry the internal URL, so a refusal never does.
 
 ## Config

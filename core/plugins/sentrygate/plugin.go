@@ -47,6 +47,11 @@
 // connection tls-bridge does not decrypt is recorded unjudged (kind=tunnel),
 // and its bytes, readable or not, leave without a verdict.
 //
+// A message that carries no data continues at once, with nothing asked: an agent
+// card fetch, and the MCP handshake messages with nothing in them beyond what the
+// handshake needs (carriesNoData). Without this an agent could not start against, or
+// connect to, a peer or a tool outside its pass list.
+//
 // A body lineage does not capture is never read, so the service answers
 // "unjudged". With capture_io off the operator gave up judging bodies, and such
 // a request continues, recorded as unread_capture_off; lineage's record of this
@@ -85,6 +90,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -132,6 +138,21 @@ const refusedOpening = "Sentry gate (data governance) refused this request to %s
 // when it reads as a next step; it says the new request is judged, because nothing
 // promises it passes.
 const sendWithoutMarked = "To deliver the rest, make the same call again now with the marked parts removed, then answer. It will be judged again."
+
+// noDataBodyMax bounds a body carriesNoData reads. The longest real one, initialize, is
+// about 150 bytes.
+const noDataBodyMax = 256
+
+// noDataIDDigits bounds a JSON-RPC id in a message that carries no data: the id is
+// the client's counter, and a longer number is room for a value.
+const noDataIDDigits = 6
+
+// The values initialize may hold and still carry no data, raw JSON with their quotes.
+var (
+	protocolVersion = regexp.MustCompile(`^"[0-9]{4}-[0-9]{2}-[0-9]{2}"$`)
+	clientName      = regexp.MustCompile(`^"[A-Za-z0-9._-]{1,32}"$`)
+	clientVersion   = regexp.MustCompile(`^"[A-Za-z0-9._-]{1,16}"$`)
+)
 
 func init() {
 	plugins.RegisterPlugin(pluginName, func() pipeline.Plugin { return New() })
@@ -240,7 +261,10 @@ func (g *Gate) Capabilities() pipeline.PluginCapabilities {
 	return pipeline.PluginCapabilities{
 		// The key the gate asks by is the stamp lineage-telemetry writes into
 		// the forwarded tracestate; earlier in the chain or no key at all.
-		Requires:    []string{"lineage-telemetry"},
+		Requires: []string{"lineage-telemetry"},
+		// No body capability, on purpose, as lineage: carriesNoData reads the raw body,
+		// lineage requires a parser, and a parser has the listener buffer the body.
+		// Declaring it would forbid the gate after inference-router.
 		Description: "Holds unlisted egress until a verdict service answers; rejects a deny verdict.",
 	}
 }
@@ -328,6 +352,10 @@ func (g *Gate) OnRequest(ctx context.Context, pctx *pipeline.Context) pipeline.A
 		pctx.Record(pipeline.Invocation{Action: pipeline.ActionAllow, Reason: "unjudged", Details: map[string]string{"kind": "tunnel"}})
 		return pipeline.Action{Type: pipeline.Continue}
 	}
+	if kind, ok := carriesNoData(pctx.Method, pctx.Path, pctx.Body); ok {
+		pctx.Record(pipeline.Invocation{Action: pipeline.ActionAllow, Reason: "no_data", Details: map[string]string{"kind": kind}})
+		return pipeline.Action{Type: pipeline.Continue}
+	}
 	// The stamp names THIS exchange only when lineage-telemetry wrote it in
 	// this same pass. When lineage skipped the exchange (not ready yet, a
 	// bypass_paths or bypass_hosts match) the header still carries what the
@@ -396,6 +424,101 @@ func (g *Gate) OnRequest(ctx context.Context, pctx *pipeline.Context) pipeline.A
 
 func (g *Gate) OnResponse(context.Context, *pipeline.Context) pipeline.Action {
 	return pipeline.Action{Type: pipeline.Continue}
+}
+
+// carriesNoData reports whether a request can carry no data, and names it: a GET of
+// an agent card with no body, or a POST of an MCP handshake message whose raw body
+// holds its own name, a small id and, for initialize, the client's short name and
+// version, and nothing else. It reads the raw body rather
+// than mcp-parser's result, because a parser's result does not show what it left out.
+func carriesNoData(method, path string, body []byte) (string, bool) {
+	switch method {
+	case http.MethodGet:
+		if len(body) == 0 && (path == "/.well-known/agent-card.json" || path == "/.well-known/agent.json") {
+			return "agent_card", true
+		}
+	case http.MethodPost:
+		return noDataRPC(body)
+	}
+	return "", false
+}
+
+func noDataRPC(body []byte) (string, bool) {
+	if len(body) == 0 || len(body) > noDataBodyMax {
+		return "", false
+	}
+	fields, ok := exactFields(body)
+	if !ok {
+		return "", false
+	}
+	method := string(fields["method"])
+	switch method {
+	case `"notifications/initialized"`, `"ping"`, `"tools/list"`:
+		if p, has := fields["params"]; has && string(p) != `{}` && string(p) != `null` {
+			return "", false
+		}
+	case `"initialize"`:
+		if !isClientHello(fields["params"]) {
+			return "", false
+		}
+	default:
+		return "", false
+	}
+	if string(fields["jsonrpc"]) != `"2.0"` {
+		return "", false
+	}
+	if id, has := fields["id"]; has && !isSmallCount(id) {
+		return "", false
+	}
+	for name := range fields {
+		switch name {
+		case "jsonrpc", "id", "method", "params":
+		default:
+			return "", false
+		}
+	}
+	return strings.Trim(method, `"`), true
+}
+
+// isClientHello reports whether raw params are initialize's and nothing more: a
+// date-shaped protocolVersion, no capabilities, and a short client name and version.
+func isClientHello(raw []byte) bool {
+	params, ok := exactFields(raw)
+	if !ok || len(params) != 3 || !protocolVersion.Match(params["protocolVersion"]) || string(params["capabilities"]) != `{}` {
+		return false
+	}
+	client, ok := exactFields(params["clientInfo"])
+	return ok && len(client) == 2 && clientName.Match(client["name"]) && clientVersion.Match(client["version"])
+}
+
+// exactFields decodes a JSON object whose values stay raw and compact. It refuses a
+// field given twice, which decodes as its last value and may be read as its first
+// elsewhere: the object must hold exactly the fields decoded.
+func exactFields(raw []byte) (map[string]json.RawMessage, bool) {
+	var compact bytes.Buffer
+	if json.Compact(&compact, raw) != nil {
+		return nil, false
+	}
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(compact.Bytes(), &fields) != nil || fields == nil {
+		return nil, false
+	}
+	decoded, err := json.Marshal(fields)
+	return fields, err == nil && compact.Len() == len(decoded)
+}
+
+// isSmallCount reports whether a raw JSON value is a plain number of at most
+// noDataIDDigits digits.
+func isSmallCount(raw []byte) bool {
+	if len(raw) == 0 || len(raw) > noDataIDDigits {
+		return false
+	}
+	for _, c := range raw {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // unknown refuses a request the gate could not get a verdict for. A 503 rather
