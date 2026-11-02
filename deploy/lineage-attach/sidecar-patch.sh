@@ -47,6 +47,7 @@
 # Env — inherited by attach-lineage.sh and validated there (see its header):
 #   APP_IMAGE, OTEL_ENDPOINT, CAPTURE_IO (content capture, off unless true),
 #   MAX_PAYLOAD_BYTES (cap on a captured value; plugin default 4096, -1 = whole),
+#   EXPORT_DELAY_MS (longest a span waits before it is sent; plugin default 5000),
 #   SIDECAR_IMAGE, PROXY_INIT_IMAGE, NO_EMIT,
 #   OUTBOUND_PORTS_EXCLUDE (an app's OWN telemetry port, or a plaintext non-HTTP store
 #                   port such as Postgres/SMTP — never LLM/tool/S3 ports).
