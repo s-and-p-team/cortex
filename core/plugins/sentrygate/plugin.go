@@ -55,6 +55,18 @@
 // max_payload_bytes. capture_io defaults to off, and the gate cannot see that
 // until a request shows it, so it warns on the first such body it lets through.
 //
+// A refusal has two readers. A model reads one message, the processed text: what
+// happened, which parts were flagged, and on a block with marked text that the rest
+// can be sent again. A program reads the raw facts beside it, what the service
+// answered and how long the gate waited. It reaches the app in the reply that app's
+// stock client hands to its caller rather than raises on: a tools/call gets an MCP
+// result with isError, an A2A send gets an agent message at 200, and anything else
+// gets the framework's rejection envelope. Whether to send again is the caller's: a
+// new request is judged like any other. A rules, labels or redacted_payload value of
+// the wrong shape is dropped and noted in the record; the refusal stands. The text of
+// a service or transport error stays in the record, because it can carry the internal
+// URL.
+//
 // The verdict call carries verdict_secret (or the contents of
 // verdict_secret_file) as an Authorization bearer token. The plugin never logs
 // it or puts it in an invocation record, and the config echoes (/v1/pipeline,
@@ -111,6 +123,15 @@ const maxIdlePerHost = 64
 // bodyNotCaptured is the verdict service's reason for a record that saw none of
 // the request body.
 const bodyNotCaptured = "body_not_captured"
+
+// refusedOpening opens every refusal's message, so whoever reads one, a model
+// included, knows who refused and that nothing left.
+const refusedOpening = "Sentry gate (data governance) refused this request to %s. Nothing was delivered."
+
+// sendWithoutMarked closes a message that shows marked text. A model acts on it only
+// when it reads as a next step; it says the new request is judged, because nothing
+// promises it passes.
+const sendWithoutMarked = "To deliver the rest, make the same call again now with the marked parts removed, then answer. It will be judged again."
 
 func init() {
 	plugins.RegisterPlugin(pluginName, func() pipeline.Plugin { return New() })
@@ -276,13 +297,17 @@ func newTransport() *http.Transport {
 // verdict is the verdict service's answer. State is "decided" once a record
 // for the exchange exists, "pending" when wait_ms passed without one, and
 // "unjudged" when a record exists but the request body was not read whole, so
-// Reason says why and Verdict covers only what was read.
+// Reason says why and Verdict covers only what was read. Rules, Labels and
+// RedactedPayload stay raw: their shape is read apart, so a bad one cannot turn a
+// judged block into an error.
 type verdict struct {
-	State         string `json:"state"`
-	Verdict       string `json:"verdict"`
-	Reason        string `json:"reason"`
-	InteractionID string `json:"interaction_id"`
-	Version       int    `json:"version"`
+	State           string          `json:"state"`
+	Verdict         string          `json:"verdict"`
+	Reason          string          `json:"reason"`
+	Version         int             `json:"version"`
+	Rules           json.RawMessage `json:"rules"`
+	Labels          json.RawMessage `json:"labels"`
+	RedactedPayload json.RawMessage `json:"redacted_payload"`
 }
 
 func (g *Gate) OnRequest(ctx context.Context, pctx *pipeline.Context) pipeline.Action {
@@ -311,11 +336,11 @@ func (g *Gate) OnRequest(ctx context.Context, pctx *pipeline.Context) pipeline.A
 	// Lineage's own record of the pass is the one fact that says it wrote.
 	rec, stamped := lineageStampThisPass(pctx)
 	if !stamped {
-		return g.unknown(pctx, "no_lineage_stamp", 0, nil)
+		return g.unknown(pctx, "no_lineage_stamp", "", 0, nil)
 	}
 	traceID, exchangeID, ok := exchangeKey(ctx, pctx.Headers)
 	if !ok {
-		return g.unknown(pctx, "no_exchange_key", 0, nil)
+		return g.unknown(pctx, "no_exchange_key", "", 0, nil)
 	}
 
 	start := time.Now()
@@ -325,22 +350,30 @@ func (g *Gate) OnRequest(ctx context.Context, pctx *pipeline.Context) pipeline.A
 		if reason == "verdict_error" && ctx.Err() != nil {
 			return pipeline.Deny("pipeline.cancelled", "request cancelled while waiting for a verdict")
 		}
-		return g.unknown(pctx, reason, waited, extra)
+		return g.unknown(pctx, reason, exchangeID, waited, extra)
 	}
 
 	// The service's value as it came, compared as deny_on is decoded: trimmed
 	// and case-folded, so " Block " is a block and never an allow.
 	name := strings.ToLower(strings.TrimSpace(v.Verdict))
+	waitedMS := waited.Milliseconds()
 	details := map[string]string{
-		"verdict":        name,
-		"interaction_id": v.InteractionID,
-		"version":        strconv.Itoa(v.Version),
-		"waited_ms":      strconv.FormatInt(waited.Milliseconds(), 10),
+		"verdict":     name,
+		"exchange_id": exchangeID,
+		"version":     strconv.Itoa(v.Version),
+		"waited_ms":   strconv.FormatInt(waitedMS, 10),
+	}
+	refusal := map[string]any{"state": v.State, "verdict": name, "exchange_id": exchangeID, "waited_ms": waitedMS}
+	labels := readCaught(v, details, refusal)
+	note := ""
+	if v.State == "unjudged" {
+		refusal["reason"] = v.Reason
+		note = " Only part of it could be judged."
 	}
 	if g.denyOn[name] {
+		marked := readRedactedPayload(v, details, refusal)
 		pctx.Record(pipeline.Invocation{Action: pipeline.ActionDeny, Reason: "verdict_" + name, Details: details})
-		return pipeline.Deny("policy.content-blocked",
-			fmt.Sprintf("egress to %s refused: the governance verdict on this exchange is %s", hostOnly(pctx.Host), name))
+		return refuse(pctx, "policy.content-blocked", http.StatusForbidden, refusalMessage(pctx.Host, note, labels, marked), refusal)
 	}
 	// A deny on what was read is a deny; anything else says nothing about the
 	// part of the body nobody read, so nothing was judged.
@@ -354,7 +387,8 @@ func (g *Gate) OnRequest(ctx context.Context, pctx *pipeline.Context) pipeline.A
 			pctx.Record(pipeline.Invocation{Action: pipeline.ActionAllow, Reason: "unread_capture_off", Details: details})
 			return pipeline.Action{Type: pipeline.Continue}
 		}
-		return g.unknown(pctx, "verdict_unjudged", waited, details)
+		pctx.Record(pipeline.Invocation{Action: pipeline.ActionDeny, Reason: "verdict_unjudged", Details: details})
+		return refuse(pctx, "policy.verdict-unavailable", http.StatusServiceUnavailable, refusalMessage(pctx.Host, note, labels, ""), refusal)
 	}
 	pctx.Record(pipeline.Invocation{Action: pipeline.ActionAllow, Reason: "verdict_" + name, Details: details})
 	return pipeline.Action{Type: pipeline.Continue}
@@ -366,14 +400,121 @@ func (g *Gate) OnResponse(context.Context, *pipeline.Context) pipeline.Action {
 
 // unknown refuses a request the gate could not get a verdict for. A 503 rather
 // than a 403: nothing was judged.
-func (g *Gate) unknown(pctx *pipeline.Context, reason string, waited time.Duration, extra map[string]string) pipeline.Action {
+func (g *Gate) unknown(pctx *pipeline.Context, reason, exchangeID string, waited time.Duration, extra map[string]string) pipeline.Action {
 	details := map[string]string{"waited_ms": strconv.FormatInt(waited.Milliseconds(), 10)}
 	for k, v := range extra {
 		details[k] = v
 	}
+	refusal := map[string]any{"reason": reason, "waited_ms": waited.Milliseconds()}
+	if exchangeID != "" {
+		details["exchange_id"] = exchangeID
+		refusal["exchange_id"] = exchangeID
+	}
 	pctx.Record(pipeline.Invocation{Action: pipeline.ActionDeny, Reason: reason, Details: details})
-	return pipeline.DenyStatus(http.StatusServiceUnavailable, "policy.verdict-unavailable",
-		fmt.Sprintf("egress to %s held: no governance verdict on this exchange (%s)", hostOnly(pctx.Host), reason))
+	return refuse(pctx, "policy.verdict-unavailable", http.StatusServiceUnavailable,
+		refusalMessage(pctx.Host, " No verdict was given, so nothing was judged and nothing is flagged.", nil, ""), refusal)
+}
+
+// refuse renders a refusal in the reply the caller's client hands on. A stock MCP
+// client raises on a JSON-RPC error, and a stock A2A client raises on a status with the
+// body unread, so in either the refusal would end the turn with nobody having read it.
+func refuse(pctx *pipeline.Context, code string, status int, message string, details map[string]any) pipeline.Action {
+	action := pipeline.DenyWithDetails(code, message, details)
+	action.Violation.Status = status
+	facts := map[string]any{"error": code, "plugin": pluginName, "details": details}
+	if m := pctx.Extensions.MCP; m != nil && m.Method == "tools/call" && m.RPCID != nil {
+		action.Violation.RPCResult = map[string]any{
+			"isError":           true,
+			"content":           []map[string]any{{"type": "text", "text": message}},
+			"structuredContent": facts,
+		}
+		return action
+	}
+	if a := pctx.Extensions.A2A; a != nil && a.RPCID != nil && (a.Method == "message/send" || a.Method == "message/stream") {
+		body, err := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": a.RPCID, "result": map[string]any{
+			"kind":      "message",
+			"messageId": refusalMessageID(pctx, details),
+			"role":      "agent",
+			"parts":     []map[string]any{{"kind": "text", "text": message}},
+			"metadata":  map[string]any{pluginName: facts},
+		}})
+		if err != nil {
+			return action
+		}
+		action.Violation.Status = http.StatusOK
+		action.Violation.Body, action.Violation.BodyType = body, "application/json"
+		if a.Method == "message/stream" {
+			action.Violation.Body, action.Violation.BodyType = []byte("data: "+string(body)+"\n\n"), "text/event-stream"
+		}
+	}
+	return action
+}
+
+// refusalMessageID names one A2A refusal: a client that keys messages by id must
+// see two refusals in one conversation as two messages. The exchange id is the
+// gate's own key for the request; a refusal given before the gate had one (no
+// lineage stamp, no key) takes the proxy's request id, unique per request.
+func refusalMessageID(pctx *pipeline.Context, details map[string]any) string {
+	if ex, _ := details["exchange_id"].(string); ex != "" {
+		return "sentry-gate-refusal-" + ex
+	}
+	return "sentry-gate-refusal-" + pctx.RequestID()
+}
+
+// refusalMessage is the one text a refusal gives its reader. Marked text with nothing
+// flagged says nothing, so it is shown only beside labels.
+func refusalMessage(host, note string, labels []string, marked string) string {
+	lines := []string{fmt.Sprintf(refusedOpening, hostOnly(host)) + note}
+	switch {
+	case len(labels) > 0 && marked != "":
+		lines = append(lines, "Flagged parts are marked [category]:", marked, sendWithoutMarked)
+	case len(labels) > 0:
+		lines = append(lines, "Flagged: "+strings.Join(labels, ", ")+".")
+	}
+	return strings.Join(lines, "\n")
+}
+
+// readCaught puts the answer's rules and labels in the refusal, always as lists, and
+// in the record, and returns the labels. A value that is not a list of strings counts
+// as none and is noted in the record.
+func readCaught(v verdict, details map[string]string, refusal map[string]any) (labels []string) {
+	for _, field := range []struct {
+		name string
+		raw  json.RawMessage
+	}{{"rules", v.Rules}, {"labels", v.Labels}} {
+		var list []string
+		if len(field.raw) > 0 && json.Unmarshal(field.raw, &list) != nil {
+			list = nil
+			details[field.name+"_error"] = "not a list of strings"
+		}
+		if list == nil {
+			list = []string{}
+		}
+		refusal[field.name] = list
+		if len(list) > 0 {
+			details[field.name] = strings.Join(list, ",")
+		}
+		if field.name == "labels" {
+			labels = list
+		}
+	}
+	return labels
+}
+
+// readRedactedPayload puts the answer's redacted payload in the refusal and returns it.
+// The record does not keep it: the service can render it again from what DG holds. A
+// value that is not a string is dropped and noted in the record.
+func readRedactedPayload(v verdict, details map[string]string, refusal map[string]any) string {
+	if len(v.RedactedPayload) == 0 {
+		return ""
+	}
+	var text *string
+	if json.Unmarshal(v.RedactedPayload, &text) != nil || text == nil {
+		details["redacted_payload_error"] = "not a string"
+		return ""
+	}
+	refusal["redacted_payload"] = *text
+	return *text
 }
 
 // ask fetches the verdict for one exchange and reads the answer by the

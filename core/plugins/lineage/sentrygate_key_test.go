@@ -69,7 +69,7 @@ func askedGate(t *testing.T, extra string) (*sentrygate.Gate, *atomic.Value) {
 	last.Store("")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		last.Store(r.URL.Path)
-		fmt.Fprint(w, `{"state":"decided","verdict":"allow","interaction_id":"i"}`)
+		fmt.Fprint(w, `{"state":"decided","verdict":"allow"}`)
 	}))
 	t.Cleanup(srv.Close)
 	g := sentrygate.New()
@@ -232,7 +232,7 @@ func TestSentryGate_ReadinessWaitsForLineage(t *testing.T) {
 // pass that emitted the span: an unread body continues only with capture_io off.
 func TestSentryGate_CaptureOffComesFromLineage(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `{"state":"unjudged","verdict":"allow","reason":"body_not_captured","interaction_id":"i"}`)
+		fmt.Fprint(w, `{"state":"unjudged","verdict":"allow","reason":"body_not_captured"}`)
 	}))
 	t.Cleanup(srv.Close)
 	for _, tc := range []struct {

@@ -67,6 +67,66 @@ turn as well; the frames of any other WebSocket are not judged.
 It is carried by the `full` and `fullcpex` profiles only, so to gate egress run
 the proxy-sidecar `authbridge` image.
 
+## Refusal bodies
+
+A refusal has two readers. A model reads one `message`, the processed text. A program reads the raw facts beside it: `details`, what
+the service answered and how long the gate waited. The refusal reaches the app in the reply its stock client hands to its caller:
+
+| request | status | reply | the message | the raw facts |
+|---|---|---|---|---|
+| MCP `tools/call` with an id | 200 | a JSON-RPC result with `isError: true` | `content[0].text` | `structuredContent` |
+| A2A `message/send` with an id | 200 | a JSON-RPC result, an agent message | `parts[0].text` | `metadata["sentry-gate"]` |
+| A2A `message/stream` with an id | 200 | the same, as one server-sent event | `parts[0].text` | `metadata["sentry-gate"]` |
+| another MCP call with an id | 200 | a JSON-RPC error | `error.message` | `error.data` |
+| anything else | 403 or 503 | the envelope `{"error", "message", "plugin", "details"}` | `message` | `error`, `plugin`, `details` |
+
+An MCP result and an A2A message look like answers at the HTTP level. Code that reads such a reply itself must check `isError`, or read
+the part's text; a client that counts any 200 as delivered is wrong about a refused call. The refusal is still a denial in the
+session record and in lineage.
+
+The raw facts are `error` (the code), `plugin` and `details`:
+
+| refusal | code | `details` |
+|---|---|---|
+| a verdict in `deny_on` | `policy.content-blocked` (403 where the status shows) | `state`, `verdict`, `reason` if unjudged, `rules`, `labels`, `redacted_payload` if the service sent it, `exchange_id`, `waited_ms` |
+| an `unjudged` answer, not denied | `policy.verdict-unavailable` (503) | `state`, `verdict`, `reason`, `rules`, `labels`, `exchange_id`, `waited_ms` |
+| no verdict | `policy.verdict-unavailable` (503) | `reason` (the recorded one), `waited_ms`, `exchange_id` once the key is known |
+
+Every message starts `Sentry gate (data governance) refused this request to <host>. Nothing was delivered.` The rest depends on the
+refusal:
+
+| refusal | the rest of the message |
+|---|---|
+| labels and the service's redacted payload | the marked text, then how to send the rest |
+| labels and no redacted payload | `Flagged:` and the labels |
+| nothing flagged | nothing more |
+| `unjudged` | `Only part of it could be judged.` before any of the above |
+| no verdict | `No verdict was given, so nothing was judged and nothing is flagged.` |
+
+A block's reply to a `tools/call`, for example:
+
+```json
+{"jsonrpc": "2.0", "id": 7, "result": {"isError": true,
+ "content": [{"type": "text", "text": "Sentry gate (data governance) refused this request to peer.example. Nothing was delivered.\nFlagged parts are marked [category]:\n{\"drug\": \"Lisinopril\", \"ssn\": \"[person.govID]\"}\nTo deliver the rest, make the same call again now with the marked parts removed, then answer. It will be judged again."}],
+ "structuredContent": {"error": "policy.content-blocked", "plugin": "sentry-gate",
+  "details": {"state": "decided", "verdict": "block", "rules": ["DG-001"], "labels": ["person.govID"],
+              "redacted_payload": "{\"drug\": \"Lisinopril\", \"ssn\": \"[person.govID]\"}",
+              "exchange_id": "00f067aa0ba902b7", "waited_ms": 410}}}}
+```
+
+The marked text is the service's, passed as it came: the text the classifier judged, each finding replaced by its category. It
+replaces findings and nothing else. It is text, not always JSON: a flagged bare number leaves `"quantity": [medical.codes]`.
+
+The last sentences promise nothing: a new request is judged like any other. A caller that does not want a partial delivery can
+decline it.
+
+A `rules`, `labels` or `redacted_payload` of the wrong shape is dropped, and the refusal stands. The gate reads at most 64 KiB of an
+answer. The service's cap on `redacted_payload` keeps an answer under that.
+
+The invocation record carries `verdict`, `version`, `exchange_id`, `waited_ms`, `rules` and `labels` (comma-joined), and `unread` on an
+`unjudged` answer. It does not carry `redacted_payload`. The service's `status` and `error` on a failed call are in the record only:
+that text can carry the internal URL, so a refusal never does.
+
 ## Config
 
 | Field | Type | Default | Notes |

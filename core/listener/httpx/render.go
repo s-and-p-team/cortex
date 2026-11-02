@@ -99,6 +99,11 @@ var mcpRejectionFallback = []byte(`{"jsonrpc":"2.0","id":null,"error":{"code":-3
 // constant precomputed frame.
 func MarshalMCPRejectionBody(action pipeline.Action, id any) []byte {
 	v := action.Violation
+	if v != nil && v.RPCResult != nil {
+		if body, err := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": id, "result": v.RPCResult}); err == nil {
+			return body
+		}
+	}
 	message := "request rejected"
 	code := jsonRPCServerError
 	var data map[string]any

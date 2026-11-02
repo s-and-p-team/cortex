@@ -58,6 +58,12 @@ type Violation struct {
 	// a code a client acts on, such as a retry signal.
 	RPCCode int
 
+	// RPCResult, when set, is rendered as the JSON-RPC result instead of an
+	// error on a request an MCP parser classified. For a refusal a client
+	// should show its caller as a failed tool call: MCP's own channel for that
+	// is a result with isError, and a stock client raises on an error frame.
+	RPCResult any
+
 	// PluginName is populated by the pipeline framework from Plugin.Name()
 	// when the Reject is returned. Plugins should leave this empty.
 	PluginName string

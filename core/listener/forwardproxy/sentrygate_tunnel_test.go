@@ -99,7 +99,7 @@ func gatedChain(t *testing.T) (*pipeline.Pipeline, *lineageStamper, *gateRecordP
 	verdicts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
 		asked.Store(r.URL.Path)
-		fmt.Fprint(w, `{"state":"decided","verdict":"block","interaction_id":"i-1","version":1}`)
+		fmt.Fprint(w, `{"state":"decided","verdict":"block","version":1}`)
 	}))
 	t.Cleanup(verdicts.Close)
 	gate := sentrygate.New()

@@ -11,12 +11,14 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/rossoctl/cortex/core/listener/httpx"
 	"github.com/rossoctl/cortex/core/pipeline"
 	"github.com/rossoctl/cortex/core/redact"
 )
@@ -85,7 +87,7 @@ func lastInvocation(t *testing.T, pctx *pipeline.Context) pipeline.Invocation {
 
 func TestBlockVerdictRejects(t *testing.T) {
 	srv, calls, last := verdictServer(t, 0,
-		`{"state":"decided","verdict":"block","interaction_id":"i-1","version":2}`)
+		`{"state":"decided","verdict":"block","exchange_id":"00f067aa0ba902b7","version":2}`)
 	g := gate(t, `{"verdict_url":"`+srv.URL+`/enforce/v1/","wait_ms":1500}`)
 	pctx := outbound("outside.example:8000", stamped())
 
@@ -110,13 +112,13 @@ func TestBlockVerdictRejects(t *testing.T) {
 	if inv.Action != pipeline.ActionDeny || inv.Reason != "verdict_block" {
 		t.Errorf("invocation = %s/%s, want deny/verdict_block", inv.Action, inv.Reason)
 	}
-	if inv.Details["interaction_id"] != "i-1" {
+	if inv.Details["exchange_id"] != exchangeID {
 		t.Errorf("details = %v", inv.Details)
 	}
 }
 
 func TestAllowVerdictContinues(t *testing.T) {
-	srv, _, _ := verdictServer(t, 0, `{"state":"decided","verdict":"allow","interaction_id":"i-2","version":1}`)
+	srv, _, _ := verdictServer(t, 0, `{"state":"decided","verdict":"allow","version":1}`)
 	g := gate(t, `{"verdict_url":"`+srv.URL+`"}`)
 	pctx := outbound("peer.example.com", stamped())
 
@@ -678,7 +680,7 @@ func TestAnswerMapping(t *testing.T) {
 		{"503 other", http.StatusServiceUnavailable, `{"error":"db down"}`, "verdict_error"},
 		{"400", http.StatusBadRequest, `{"error":"wait_ms_too_large","max":3000}`, "verdict_error"},
 		{"302", http.StatusFound, ``, "verdict_error"},
-		{"decided empty", http.StatusOK, `{"state":"decided","verdict":"","interaction_id":"i-3"}`, "verdict_empty"},
+		{"decided empty", http.StatusOK, `{"state":"decided","verdict":""}`, "verdict_empty"},
 		{"decided blank", http.StatusOK, `{"state":"decided","verdict":"  "}`, "verdict_empty"},
 		{"unknown state", http.StatusOK, `{"state":"thinking"}`, "verdict_error"},
 		{"no state", http.StatusOK, `{}`, "verdict_error"},
@@ -794,5 +796,324 @@ func TestStampNotWrittenThisPassIsUnknown(t *testing.T) {
 	}
 	if calls.Load() != 0 {
 		t.Errorf("verdict calls = %d, want 0", calls.Load())
+	}
+}
+
+// A refusal is one message for a model and the raw facts for a program, in both shapes the
+// framework renders. The record keeps the facts and not the text.
+func TestRefusalIsOneMessage(t *testing.T) {
+	const text = `{\"drug\": \"x\", \"ssn\": \"[person.govID]\"}`
+	const opening = "Sentry gate (data governance) refused this request to outside.example. Nothing was delivered."
+	const offer = "\nTo deliver the rest, make the same call again now with the marked parts removed, then answer. It will be judged again."
+	for _, tc := range []struct {
+		name       string
+		answer     string
+		wantStatus int
+		wantCode   string
+		wantMsg    string
+		want       map[string]any
+		wantRecord map[string]string
+	}{
+		{
+			name:       "decided block",
+			answer:     `{"state":"decided","verdict":"block","version":3,"exchange_id":"e","rules":["DG-001","DG-004"],"labels":["person.govID"],"redacted_payload":"` + text + `"}`,
+			wantStatus: http.StatusForbidden, wantCode: "policy.content-blocked",
+			wantMsg:    opening + "\nFlagged parts are marked [category]:\n" + `{"drug": "x", "ssn": "[person.govID]"}` + offer,
+			want:       map[string]any{"state": "decided", "verdict": "block", "exchange_id": exchangeID, "rules": []any{"DG-001", "DG-004"}, "labels": []any{"person.govID"}, "redacted_payload": `{"drug": "x", "ssn": "[person.govID]"}`},
+			wantRecord: map[string]string{"rules": "DG-001,DG-004", "labels": "person.govID", "verdict": "block", "version": "3", "exchange_id": exchangeID},
+		},
+		{
+			name:       "a block with labels and no text lists them, and offers nothing",
+			answer:     `{"state":"decided","verdict":"block","rules":["DG-001"],"labels":["a","b"]}`,
+			wantStatus: http.StatusForbidden, wantCode: "policy.content-blocked",
+			wantMsg: opening + "\nFlagged: a, b.",
+			want:    map[string]any{"state": "decided", "verdict": "block", "exchange_id": exchangeID, "rules": []any{"DG-001"}, "labels": []any{"a", "b"}},
+		},
+		{
+			name:       "a block with text and nothing flagged shows no text",
+			answer:     `{"state":"decided","verdict":"block","rules":["DG-001"],"labels":[],"redacted_payload":"plain"}`,
+			wantStatus: http.StatusForbidden, wantCode: "policy.content-blocked",
+			wantMsg: opening,
+			want:    map[string]any{"state": "decided", "verdict": "block", "exchange_id": exchangeID, "rules": []any{"DG-001"}, "labels": []any{}, "redacted_payload": "plain"},
+		},
+		{
+			name:       "unjudged block",
+			answer:     `{"state":"unjudged","verdict":"block","reason":"body_truncated","rules":["DG-001"],"labels":["a"],"redacted_payload":"cut"}`,
+			wantStatus: http.StatusForbidden, wantCode: "policy.content-blocked",
+			wantMsg: opening + " Only part of it could be judged.\nFlagged parts are marked [category]:\ncut" + offer,
+			want:    map[string]any{"state": "unjudged", "verdict": "block", "reason": "body_truncated", "exchange_id": exchangeID, "rules": []any{"DG-001"}, "labels": []any{"a"}, "redacted_payload": "cut"},
+		},
+		{
+			name:       "unjudged, nothing denied",
+			answer:     `{"state":"unjudged","verdict":"allow","reason":"body_truncated","rules":[],"labels":["a"],"redacted_payload":"not for an allow"}`,
+			wantStatus: http.StatusServiceUnavailable, wantCode: "policy.verdict-unavailable",
+			wantMsg:    opening + " Only part of it could be judged.\nFlagged: a.",
+			want:       map[string]any{"state": "unjudged", "verdict": "allow", "reason": "body_truncated", "exchange_id": exchangeID, "rules": []any{}, "labels": []any{"a"}},
+			wantRecord: map[string]string{"unread": "body_truncated", "labels": "a"},
+		},
+		{
+			name:       "pending",
+			answer:     `{"state":"pending","exchange_id":"e","waited_ms":2000}`,
+			wantStatus: http.StatusServiceUnavailable, wantCode: "policy.verdict-unavailable",
+			wantMsg: opening + " No verdict was given, so nothing was judged and nothing is flagged.",
+			want:    map[string]any{"reason": "verdict_pending", "exchange_id": exchangeID},
+		},
+		{
+			name:       "malformed rules, labels and text: the block stands",
+			answer:     `{"state":"decided","verdict":"block","rules":"DG-001","labels":[{"category":"a"}],"redacted_payload":{"x":1}}`,
+			wantStatus: http.StatusForbidden, wantCode: "policy.content-blocked",
+			wantMsg:    opening,
+			want:       map[string]any{"state": "decided", "verdict": "block", "exchange_id": exchangeID, "rules": []any{}, "labels": []any{}},
+			wantRecord: map[string]string{"rules_error": "not a list of strings", "labels_error": "not a list of strings", "redacted_payload_error": "not a string"},
+		},
+		{
+			name:       "null rules, labels and text: the block stands",
+			answer:     `{"state":"decided","verdict":"block","rules":null,"labels":null,"redacted_payload":null}`,
+			wantStatus: http.StatusForbidden, wantCode: "policy.content-blocked",
+			wantMsg: opening,
+			want:    map[string]any{"state": "decided", "verdict": "block", "exchange_id": exchangeID, "rules": []any{}, "labels": []any{}},
+		},
+		{
+			name:       "a fact missing from an older service",
+			answer:     `{"state":"decided","verdict":"block"}`,
+			wantStatus: http.StatusForbidden, wantCode: "policy.content-blocked",
+			wantMsg: opening,
+			want:    map[string]any{"state": "decided", "verdict": "block", "exchange_id": exchangeID, "rules": []any{}, "labels": []any{}},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, _, _ := verdictServer(t, 0, tc.answer)
+			pctx := outbound("outside.example:8000", stamped())
+			act := gate(t, `{"verdict_url":"`+srv.URL+`"}`).OnRequest(context.Background(), pctx)
+			if act.Type != pipeline.Reject {
+				t.Fatalf("action = %v, want Reject", act.Type)
+			}
+			act.Violation.PluginName = pluginName // the framework stamps it
+
+			status, _, raw := act.Violation.Render()
+			if status != tc.wantStatus {
+				t.Errorf("status = %d, want %d", status, tc.wantStatus)
+			}
+			var envelope struct {
+				Error, Message, Plugin string
+				Details                map[string]any
+			}
+			if err := json.Unmarshal(raw, &envelope); err != nil {
+				t.Fatalf("envelope %s: %v", raw, err)
+			}
+
+			var frame struct {
+				JSONRPC string `json:"jsonrpc"`
+				ID      any    `json:"id"`
+				Error   struct {
+					Code    int    `json:"code"`
+					Message string `json:"message"`
+					Data    struct {
+						Error, Plugin string
+						Details       map[string]any
+					} `json:"data"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal(httpx.MarshalMCPRejectionBody(act, 7), &frame); err != nil {
+				t.Fatalf("frame: %v", err)
+			}
+			if frame.JSONRPC != "2.0" || frame.ID != float64(7) || frame.Error.Code != -32000 {
+				t.Errorf("frame = %+v", frame)
+			}
+
+			for shape, got := range map[string]struct {
+				code, message, plugin string
+				details               map[string]any
+			}{
+				"envelope": {envelope.Error, envelope.Message, envelope.Plugin, envelope.Details},
+				"frame":    {frame.Error.Data.Error, frame.Error.Message, frame.Error.Data.Plugin, frame.Error.Data.Details},
+			} {
+				if got.code != tc.wantCode || got.message != tc.wantMsg || got.plugin != pluginName {
+					t.Errorf("%s: code %q, message %q, plugin %q", shape, got.code, got.message, got.plugin)
+				}
+				// Exactly these raw facts, and how long the gate waited.
+				if _, ok := got.details["waited_ms"].(float64); !ok {
+					t.Errorf("%s: waited_ms = %#v", shape, got.details["waited_ms"])
+				}
+				delete(got.details, "waited_ms")
+				if !reflect.DeepEqual(got.details, tc.want) {
+					t.Errorf("%s: details = %#v, want %#v", shape, got.details, tc.want)
+				}
+			}
+
+			inv := lastInvocation(t, pctx)
+			for k, want := range tc.wantRecord {
+				if inv.Details[k] != want {
+					t.Errorf("record[%s] = %q, want %q", k, inv.Details[k], want)
+				}
+			}
+			if _, ok := inv.Details["redacted_payload"]; ok {
+				t.Error("the record keeps the redacted payload")
+			}
+		})
+	}
+}
+
+// Each protocol gets the reply its stock client hands on, with the message as the text a
+// model reads and the raw facts beside it.
+func TestRefusalIsTheReplyTheClientHandsOn(t *testing.T) {
+	const answer = `{"state":"decided","verdict":"block","rules":["DG-001"],"labels":["a"],"redacted_payload":"[a]"}`
+	const message = "Sentry gate (data governance) refused this request to outside.example. Nothing was delivered.\nFlagged parts are marked [category]:\n[a]\n" + sendWithoutMarked
+	block := func(t *testing.T, set func(*pipeline.Context)) pipeline.Action {
+		t.Helper()
+		srv, _, _ := verdictServer(t, 0, answer)
+		pctx := outbound("outside.example:8000", stamped())
+		set(pctx)
+		act := gate(t, `{"verdict_url":"`+srv.URL+`"}`).OnRequest(context.Background(), pctx)
+		if act.Type != pipeline.Reject {
+			t.Fatalf("action = %v, want Reject", act.Type)
+		}
+		return act
+	}
+	checkFacts := func(t *testing.T, facts map[string]any) {
+		t.Helper()
+		details, _ := facts["details"].(map[string]any)
+		if facts["error"] != "policy.content-blocked" || facts["plugin"] != pluginName || details["redacted_payload"] != "[a]" {
+			t.Errorf("facts = %v", facts)
+		}
+	}
+
+	t.Run("a tools/call gets a result with isError", func(t *testing.T) {
+		act := block(t, func(p *pipeline.Context) {
+			p.Extensions.MCP = &pipeline.MCPExtension{Method: "tools/call", RPCID: float64(7)}
+		})
+		var frame struct {
+			ID     any             `json:"id"`
+			Error  json.RawMessage `json:"error"`
+			Result struct {
+				IsError           bool             `json:"isError"`
+				Content           []map[string]any `json:"content"`
+				StructuredContent map[string]any   `json:"structuredContent"`
+			} `json:"result"`
+		}
+		if err := json.Unmarshal(httpx.MarshalMCPRejectionBody(act, float64(7)), &frame); err != nil {
+			t.Fatal(err)
+		}
+		if frame.ID != float64(7) || frame.Error != nil || !frame.Result.IsError {
+			t.Errorf("frame = %+v", frame)
+		}
+		if len(frame.Result.Content) != 1 || frame.Result.Content[0]["type"] != "text" || frame.Result.Content[0]["text"] != message {
+			t.Errorf("content = %v", frame.Result.Content)
+		}
+		checkFacts(t, frame.Result.StructuredContent)
+	})
+
+	t.Run("another MCP method keeps the error frame", func(t *testing.T) {
+		act := block(t, func(p *pipeline.Context) {
+			p.Extensions.MCP = &pipeline.MCPExtension{Method: "resources/read", RPCID: float64(7)}
+		})
+		if act.Violation.RPCResult != nil {
+			t.Errorf("RPCResult = %v", act.Violation.RPCResult)
+		}
+	})
+
+	for _, tc := range []struct {
+		method, wantType, prefix, suffix string
+	}{
+		{"message/send", "application/json", "", ""},
+		{"message/stream", "text/event-stream", "data: ", "\n\n"},
+	} {
+		t.Run("an A2A "+tc.method+" gets an agent message at 200", func(t *testing.T) {
+			act := block(t, func(p *pipeline.Context) { p.Extensions.A2A = &pipeline.A2AExtension{Method: tc.method, RPCID: "r1"} })
+			status, headers, raw := act.Violation.Render()
+			if status != http.StatusOK || headers.Get("Content-Type") != tc.wantType {
+				t.Errorf("status %d, type %q", status, headers.Get("Content-Type"))
+			}
+			text := string(raw)
+			if !strings.HasPrefix(text, tc.prefix) || !strings.HasSuffix(text, tc.suffix) {
+				t.Fatalf("body = %q", text)
+			}
+			var frame struct {
+				ID     any `json:"id"`
+				Result struct {
+					Kind, MessageID, Role string
+					Parts                 []map[string]any
+					Metadata              map[string]map[string]any
+				} `json:"result"`
+			}
+			if err := json.Unmarshal([]byte(strings.TrimSuffix(strings.TrimPrefix(text, tc.prefix), tc.suffix)), &frame); err != nil {
+				t.Fatal(err)
+			}
+			if frame.ID != "r1" || frame.Result.Kind != "message" || frame.Result.Role != "agent" || frame.Result.MessageID != "sentry-gate-refusal-"+exchangeID {
+				t.Errorf("frame = %+v", frame)
+			}
+			if len(frame.Result.Parts) != 1 || frame.Result.Parts[0]["kind"] != "text" || frame.Result.Parts[0]["text"] != message {
+				t.Errorf("parts = %v", frame.Result.Parts)
+			}
+			checkFacts(t, frame.Result.Metadata[pluginName])
+		})
+	}
+
+	t.Run("anything else keeps the envelope and its status", func(t *testing.T) {
+		act := block(t, func(*pipeline.Context) {})
+		if status, _, _ := act.Violation.Render(); status != http.StatusForbidden || act.Violation.RPCResult != nil {
+			t.Errorf("status %d, RPCResult %v", status, act.Violation.RPCResult)
+		}
+	})
+}
+
+// Two refusals given before the gate had an exchange id are still two messages.
+func TestA2ARefusalsWithoutAKeyGetTheirOwnIDs(t *testing.T) {
+	ids := map[string]bool{}
+	for range 2 {
+		pctx := &pipeline.Context{Direction: pipeline.Outbound, Host: "outside.example", Headers: http.Header{}}
+		pctx.Extensions.A2A = &pipeline.A2AExtension{Method: "message/send", RPCID: "r1"}
+		act := gate(t, `{"verdict_url":"http://127.0.0.1:1"}`).OnRequest(context.Background(), pctx)
+		if act.Type != pipeline.Reject || lastInvocation(t, pctx).Reason != "no_lineage_stamp" {
+			t.Fatalf("action = %v, record %v", act.Type, lastInvocation(t, pctx))
+		}
+		var frame struct {
+			Result struct{ MessageID string }
+		}
+		if err := json.Unmarshal(act.Violation.Body, &frame); err != nil {
+			t.Fatal(err)
+		}
+		if frame.Result.MessageID == "" || ids[frame.Result.MessageID] {
+			t.Errorf("message id %q seen before: %v", frame.Result.MessageID, ids)
+		}
+		ids[frame.Result.MessageID] = true
+	}
+}
+
+// A refusal's text never says what a failed call said: it can carry the internal
+// URL and the key.
+func TestRefusalLeavesServiceErrorsInTheRecord(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
+	url := srv.URL
+	srv.Close() // nothing answers: the transport error names the URL
+
+	pctx := outbound("outside.example", stamped())
+	act := gate(t, `{"verdict_url":"`+url+`"}`).OnRequest(context.Background(), pctx)
+	_, _, raw := act.Violation.Render()
+	if strings.Contains(string(raw), strings.TrimPrefix(url, "http://")) || strings.Contains(string(raw), traceID) {
+		t.Errorf("the refusal leaks the call: %s", raw)
+	}
+	inv := lastInvocation(t, pctx)
+	if inv.Reason != "verdict_error" || !strings.Contains(inv.Details["error"], strings.TrimPrefix(url, "http://")) {
+		t.Errorf("the record lost the error: %v", inv)
+	}
+	var body struct{ Details map[string]any }
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Details["reason"] != "verdict_error" || body.Details["exchange_id"] != exchangeID {
+		t.Errorf("details = %v", body.Details)
+	}
+}
+
+// Refused before any key was read, a refusal names no exchange.
+func TestRefusalWithNoKeyNamesNoExchange(t *testing.T) {
+	pctx := &pipeline.Context{Direction: pipeline.Outbound, Host: "outside.example", Headers: stamped()}
+	act := gate(t, `{"verdict_url":"http://verdict.invalid"}`).OnRequest(context.Background(), pctx)
+	if act.Type != pipeline.Reject {
+		t.Fatalf("action = %v, want Reject", act.Type)
+	}
+	if _, ok := act.Violation.Details["exchange_id"]; ok || act.Violation.Details["reason"] != "no_lineage_stamp" {
+		t.Errorf("details = %v", act.Violation.Details)
 	}
 }
