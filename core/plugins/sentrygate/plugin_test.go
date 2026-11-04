@@ -461,6 +461,144 @@ func TestFallbackConfig(t *testing.T) {
 	}
 }
 
+// pendingTo runs one request to host through g and returns the action and the record.
+func pendingTo(t *testing.T, g *Gate, host string) (pipeline.Action, pipeline.Invocation) {
+	t.Helper()
+	pctx := outbound(host, stamped())
+	act := g.OnRequest(context.Background(), pctx)
+	return act, lastInvocation(t, pctx)
+}
+
+// A fail_mode row overrides the default fallback for its host only, and the
+// record of the fallback names the row's destination.
+func TestFailModeRowOverridesTheDefaultForItsHost(t *testing.T) {
+	srv, _, _ := verdictServer(t, 0, `{"state":"pending"}`)
+	g := gate(t, `{"verdict_url":"`+srv.URL+`","fallback":"deny","fail_mode":[{"destination":"peer.example","fallback":"allow"}]}`)
+
+	act, inv := pendingTo(t, g, "peer.example")
+	if act.Type != pipeline.Continue || inv.Reason != "fallback_allow" || inv.Details["fail_mode_destination"] != "peer.example" {
+		t.Errorf("peer.example: action %v, record %s %v, want Continue, fallback_allow, fail_mode_destination peer.example", act.Type, inv.Reason, inv.Details)
+	}
+	act, inv = pendingTo(t, g, "other.example")
+	if act.Type != pipeline.Reject || inv.Reason != "fallback_deny" {
+		t.Fatalf("other.example: action %v, record %s, want Reject, fallback_deny", act.Type, inv.Reason)
+	}
+	if _, ok := inv.Details["fail_mode_destination"]; ok {
+		t.Errorf("other.example: record %v names a row, but none applied", inv.Details)
+	}
+	if _, ok := act.Violation.Details["fail_mode_destination"]; ok {
+		t.Errorf("other.example: refusal details %v name a row, but none applied", act.Violation.Details)
+	}
+
+	// A refusal on a row names it too.
+	g = gate(t, `{"verdict_url":"`+srv.URL+`","fallback":"allow","fail_mode":[{"destination":"peer.example","fallback":"deny"}]}`)
+	act, inv = pendingTo(t, g, "peer.example")
+	if act.Type != pipeline.Reject || inv.Reason != "fallback_deny" || inv.Details["fail_mode_destination"] != "peer.example" ||
+		act.Violation.Details["fail_mode_destination"] != "peer.example" {
+		t.Errorf("deny row: action %v, record %s %v, refusal %v, want Reject, fallback_deny naming peer.example", act.Type, inv.Reason, inv.Details, act.Violation.Details)
+	}
+	if act, _ := pendingTo(t, g, "other.example"); act.Type != pipeline.Continue {
+		t.Errorf("other.example under the allow default: action %v, want Continue", act.Type)
+	}
+}
+
+// The row's wait_ms is the hold: the wait the service is asked for, and the
+// longest the call may take (wait_ms + 500 ms).
+func TestFailModeRowWaitIsTheHold(t *testing.T) {
+	cfg := func(url string) string {
+		return `{"verdict_url":"` + url + `","wait_ms":2000,"fail_mode":[{"destination":"peer.example","wait_ms":100}]}`
+	}
+	t.Run("asked", func(t *testing.T) {
+		srv, _, last := verdictServer(t, 300*time.Millisecond, `{"state":"pending"}`)
+		g := gate(t, cfg(srv.URL))
+		_, inv := pendingTo(t, g, "peer.example")
+		if got := last.Load().(string); !strings.HasSuffix(got, "?wait_ms=100") {
+			t.Errorf("asked %q, want wait_ms=100", got)
+		}
+		if ms, err := strconv.Atoi(inv.Details["waited_ms"]); err != nil || ms >= 1000 {
+			t.Errorf("waited_ms = %q, want under 1000", inv.Details["waited_ms"])
+		}
+		if inv.Reason != "fallback_deny" || inv.Details["fail_mode_destination"] != "peer.example" {
+			t.Errorf("record = %s %v, want fallback_deny naming peer.example", inv.Reason, inv.Details)
+		}
+		pendingTo(t, g, "other.example")
+		if got := last.Load().(string); !strings.HasSuffix(got, "?wait_ms=2000") {
+			t.Errorf("other.example asked %q, want the default wait_ms=2000", got)
+		}
+	})
+	t.Run("a service holding past it is cut", func(t *testing.T) {
+		srv, _, _ := verdictServer(t, 1500*time.Millisecond, `{"state":"pending"}`)
+		_, inv := pendingTo(t, gate(t, cfg(srv.URL)), "peer.example")
+		if inv.Reason != "fallback_deny" || inv.Details["error_kind"] != "transport" {
+			t.Errorf("record = %s %v, want fallback_deny, error_kind transport", inv.Reason, inv.Details)
+		}
+		if ms, err := strconv.Atoi(inv.Details["waited_ms"]); err != nil || ms >= 1000 {
+			t.Errorf("waited_ms = %q, want under 1000 (100 + 500 ms)", inv.Details["waited_ms"])
+		}
+	})
+}
+
+// A row matches the request host exactly, port stripped and case folded on both
+// sides, a trailing dot dropped; a subdomain or a longer name does not.
+func TestFailModeRowMatchesTheHostExactly(t *testing.T) {
+	srv, _, _ := verdictServer(t, 0, `{"state":"pending"}`)
+	for _, dest := range []string{"peer.example", "Peer.EXAMPLE", "peer.example."} {
+		g := gate(t, `{"verdict_url":"`+srv.URL+`","fail_mode":[{"destination":"`+dest+`","fallback":"allow"}]}`)
+		for host, match := range map[string]bool{
+			"peer.example":      true,
+			"PEER.example:443":  true,
+			"peer.example.":     true,
+			"peer.example.:443": true,
+			"sub.peer.example":  false,
+			"peer.example.net":  false,
+		} {
+			_, inv := pendingTo(t, g, host)
+			if got := inv.Reason == "fallback_allow" && inv.Details["fail_mode_destination"] == "peer.example"; got != match {
+				t.Errorf("row %s, host %s: record %s %v, matched %v, want %v", dest, host, inv.Reason, inv.Details, got, match)
+			}
+		}
+	}
+}
+
+// A row outside the shape refuses the config at load; no rows, or no key, is
+// the gate without rows.
+func TestFailModeConfig(t *testing.T) {
+	for name, rows := range map[string]string{
+		"duplicate":           `[{"destination":"peer.example","fallback":"allow"},{"destination":"peer.example","wait_ms":100}]`,
+		"duplicate, folded":   `[{"destination":"peer.example","fallback":"allow"},{"destination":"PEER.example","wait_ms":100}]`,
+		"port":                `[{"destination":"peer.example:8443","fallback":"allow"}]`,
+		"duplicate, dotted":   `[{"destination":"peer.example","fallback":"allow"},{"destination":"peer.example.","wait_ms":100}]`,
+		"wildcard":            `[{"destination":"*.peer.example","fallback":"deny"}]`,
+		"glob":                `[{"destination":"peer?.example","fallback":"deny"}]`,
+		"scheme":              `[{"destination":"https://peer.example","fallback":"allow"}]`,
+		"empty destination":   `[{"destination":"","fallback":"allow"}]`,
+		"no destination":      `[{"fallback":"allow"}]`,
+		"wait_ms 0":           `[{"destination":"peer.example","wait_ms":0}]`,
+		"wait_ms 3001":        `[{"destination":"peer.example","wait_ms":3001}]`,
+		"fallback open":       `[{"destination":"peer.example","fallback":"open"}]`,
+		"neither key":         `[{"destination":"peer.example"}]`,
+		"neither key, nulled": `[{"destination":"peer.example","wait_ms":null,"fallback":null}]`,
+	} {
+		if err := New().Configure(json.RawMessage(`{"verdict_url":"http://x","fail_mode":` + rows + `}`)); err == nil {
+			t.Errorf("%s: accepted %s", name, rows)
+		}
+	}
+	srv, _, last := verdictServer(t, 0, `{"state":"pending"}`)
+	for name, raw := range map[string]string{
+		"empty":  `{"verdict_url":"` + srv.URL + `","wait_ms":700,"fail_mode":[]}`,
+		"no key": `{"verdict_url":"` + srv.URL + `","wait_ms":700}`,
+	} {
+		g := gate(t, raw)
+		act, inv := pendingTo(t, g, "peer.example")
+		if act.Type != pipeline.Reject || inv.Reason != "fallback_deny" || inv.Details["fail_mode_destination"] != "" {
+			t.Errorf("%s: action %v, record %s %v, want the default fallback_deny", name, act.Type, inv.Reason, inv.Details)
+		}
+		if got := last.Load().(string); !strings.HasSuffix(got, "?wait_ms=700") {
+			t.Errorf("%s: asked %q, want wait_ms=700", name, got)
+		}
+	}
+}
+
 // A record that did not see the whole body has no answer about the rest of it,
 // unless what it did see is already refused.
 func TestUnjudgedRefusesAndADenyStillDenies(t *testing.T) {

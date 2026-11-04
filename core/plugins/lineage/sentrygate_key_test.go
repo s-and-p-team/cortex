@@ -282,6 +282,12 @@ const markCap = 64
 // against a verdict service that gives one answer.
 func markedChain(t *testing.T, capture bool, fallback string, status int, answer string, pctx *pipeline.Context) pipeline.Action {
 	t.Helper()
+	return markedChainWith(t, capture, `"fallback":"`+fallback+`"`, status, answer, pctx)
+}
+
+// markedChainWith is markedChain with the gate's config after verdict_url as given.
+func markedChainWith(t *testing.T, capture bool, gateCfg string, status int, answer string, pctx *pipeline.Context) pipeline.Action {
+	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(status)
 		fmt.Fprint(w, answer)
@@ -292,7 +298,7 @@ func markedChain(t *testing.T, capture bool, fallback string, status int, answer
 	p.cfg.CaptureIO = capture
 	p.cfg.MaxPayloadBytes = markCap
 	g := sentrygate.New()
-	if err := g.Configure(json.RawMessage(`{"verdict_url":"` + srv.URL + `","fallback":"` + fallback + `"}`)); err != nil {
+	if err := g.Configure(json.RawMessage(`{"verdict_url":"` + srv.URL + `",` + gateCfg + `}`)); err != nil {
 		t.Fatalf("Configure: %v", err)
 	}
 	pl, err := pipeline.New([]pipeline.Plugin{p, g})
@@ -514,5 +520,25 @@ func TestSentryGate_BodyAtTheCapIsTheFallbacks(t *testing.T) {
 		pctx := withBody(strings.Repeat("x", markCap+1))
 		act := markedChain(t, true, "allow", http.StatusOK, answerPending, pctx)
 		wantMarkedRefusal(t, act, pctx, "verdict_pending", "body_cut")
+	})
+}
+
+// A fail_mode row's allow is the fallback's, so a marked body is refused under
+// it too, never fallback_allow. The same row delivers a body at the cap, so it applied.
+func TestSentryGate_CutBodyIsRefusedWhateverTheRow(t *testing.T) {
+	row := `"fallback":"deny","fail_mode":[{"destination":"outside.example","fallback":"allow"}]`
+	t.Run("cut", func(t *testing.T) {
+		pctx := withBody(strings.Repeat("x", markCap+1))
+		act := markedChainWith(t, true, row, http.StatusOK, answerPending, pctx)
+		wantMarkedRefusal(t, act, pctx, "verdict_pending", "body_cut")
+	})
+	t.Run("at the cap", func(t *testing.T) {
+		pctx := withBody(strings.Repeat("x", markCap))
+		if act := markedChainWith(t, true, row, http.StatusOK, answerPending, pctx); act.Type != pipeline.Continue {
+			t.Fatalf("action = %v, want Continue", act.Type)
+		}
+		if inv := gateInvocation(t, pctx); inv.Reason != "fallback_allow" || inv.Details["fail_mode_destination"] != "outside.example" {
+			t.Errorf("record = %s %v, want fallback_allow naming outside.example", inv.Reason, inv.Details)
+		}
 	})
 }

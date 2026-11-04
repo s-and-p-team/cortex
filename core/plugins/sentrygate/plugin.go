@@ -31,7 +31,8 @@
 // When no verdict arrives from a slow or dead service (slowOrDead), the fallback
 // setting decides: deny, the default, refuses with a 503 (fail closed), so the
 // verdict service is a dependency of every gated egress; allow delivers unjudged.
-// Either is recorded as the setting's outcome. Any other missing verdict is a fault
+// Either is recorded as the setting's outcome. A fail_mode row for the request's host
+// replaces wait_ms, fallback or both for that host. Any other missing verdict is a fault
 // and is refused whatever the setting, and so is a body lineage marked as cut at
 // max_payload_bytes or not captured: its verdict would have said unjudged.
 //
@@ -169,13 +170,16 @@ type Config struct {
 	VerdictURL      string   `json:"verdict_url" required:"true" description:"Base URL of the verdict service; the plugin GETs {verdict_url}/verdicts/{trace_id}/{exchange_id}?wait_ms=N."`
 	PassHosts       []string `json:"pass_hosts" description:"Outbound host globs (path.Match, port stripped, case folded) that never wait for a verdict."`
 	PassSingleLabel bool     `json:"pass_single_label" description:"A cluster short name (one DNS label, not a number) never waits." default:"true"`
-	WaitMS          int      `json:"wait_ms" description:"Longest an outbound request is held for its verdict, 1..3000." default:"2000"`
+	WaitMS          int      `json:"wait_ms" description:"Longest an outbound request is held for its verdict, 1..3000; a fail_mode row can set its own." default:"2000"`
 	DenyOn          []string `json:"deny_on" description:"Verdicts that reject the request." default:"block"`
 	Fallback        string   `json:"fallback" description:"What a request gets when no verdict arrives from a slow or dead service: deny, or allow (deliver unjudged)." default:"deny"`
 	// The secret's key ends in "secret" so redact.JSON masks it wherever the
 	// raw config is echoed; renaming it would put the value on /v1/pipeline.
 	VerdictSecret     string `json:"verdict_secret" description:"Shared secret sent as an Authorization bearer token on every verdict call; empty sends no header."`
 	VerdictSecretFile string `json:"verdict_secret_file" description:"File holding the shared secret (a mounted Secret), read when the plugin is configured; exclusive with verdict_secret."`
+	// fail_mode, and its rows by destination once decoded.
+	FailMode []FailModeRow `json:"fail_mode" description:"Rows {destination, wait_ms?, fallback?} replacing wait_ms and fallback for one host name, whatever the request's port or case."`
+	rows     map[string]failRow
 }
 
 func defaultConfig() Config {
@@ -209,6 +213,9 @@ func decodeConfig(raw json.RawMessage) (Config, error) {
 	}
 	if cfg.Fallback != "deny" && cfg.Fallback != "allow" {
 		return Config{}, fmt.Errorf("sentry-gate config: fallback %q must be deny or allow", cfg.Fallback)
+	}
+	if cfg.rows, err = decodeFailMode(cfg.FailMode, cfg.WaitMS, cfg.Fallback); err != nil {
+		return Config{}, err
 	}
 	if len(cfg.DenyOn) == 0 {
 		return Config{}, errors.New("sentry-gate config: deny_on is empty, so no verdict could ever reject; remove the plugin instead")
@@ -293,7 +300,6 @@ func (g *Gate) Configure(raw json.RawMessage) error {
 	g.closeIdle()
 	g.transport = newTransport()
 	g.client = &http.Client{
-		Timeout:   time.Duration(cfg.WaitMS)*time.Millisecond + verdictGrace,
 		Transport: g.transport,
 		// A redirect is an answer that is not a verdict (verdict_error), and
 		// following one would carry the secret to wherever it points.
@@ -382,8 +388,9 @@ func (g *Gate) OnRequest(ctx context.Context, pctx *pipeline.Context) pipeline.A
 		return g.fault(pctx, "no_exchange_key", "", 0, nil)
 	}
 
+	row := g.failRowFor(pctx.Host)
 	start := time.Now()
-	v, reason, extra := g.ask(ctx, traceID, exchangeID)
+	v, reason, extra := g.ask(ctx, traceID, exchangeID, row.waitMS)
 	waited := time.Since(start)
 	if reason != "" {
 		if reason == "verdict_error" && ctx.Err() != nil {
@@ -395,7 +402,7 @@ func (g *Gate) OnRequest(ctx context.Context, pctx *pipeline.Context) pipeline.A
 					return g.markedBody(pctx, mark, reason, exchangeID, waited, extra)
 				}
 			}
-			return g.fallback(pctx, reason, exchangeID, waited, extra)
+			return g.fallback(pctx, row, reason, exchangeID, waited, extra)
 		}
 		return g.fault(pctx, reason, exchangeID, waited, extra)
 	}
@@ -574,12 +581,15 @@ func (g *Gate) fault(pctx *pipeline.Context, reason, exchangeID string, waited t
 }
 
 // fallback applies the fallback setting to a request a slow or dead service gave no
-// verdict for, recorded as the setting's outcome with the cause: allow delivers it
-// unjudged, deny refuses it with a 503.
-func (g *Gate) fallback(pctx *pipeline.Context, cause, exchangeID string, waited time.Duration, extra map[string]string) pipeline.Action {
+// verdict for, the row's or the default, recorded as the setting's outcome with the
+// cause: allow delivers it unjudged, deny refuses it with a 503.
+func (g *Gate) fallback(pctx *pipeline.Context, row failRow, cause, exchangeID string, waited time.Duration, extra map[string]string) pipeline.Action {
 	details, refusal := noVerdict(cause, exchangeID, waited, extra)
 	details["no_verdict"] = cause
-	if g.cfg.Fallback == "allow" {
+	if row.destination != "" {
+		details["fail_mode_destination"], refusal["fail_mode_destination"] = row.destination, row.destination
+	}
+	if row.fallback == "allow" {
 		pctx.Record(pipeline.Invocation{Action: pipeline.ActionAllow, Reason: "fallback_allow", Details: details})
 		return pipeline.Action{Type: pipeline.Continue}
 	}
@@ -723,9 +733,11 @@ func readRedactedPayload(v verdict, details map[string]string, refusal map[strin
 // only, so no detail can carry it.
 //
 // A read with no body — the key is the path — so a plain GET, safe and
-// idempotent, which the gate may repeat.
-func (g *Gate) ask(ctx context.Context, traceID, exchangeID string) (v verdict, reason string, extra map[string]string) {
-	u := fmt.Sprintf("%s/verdicts/%s/%s?wait_ms=%d", g.cfg.VerdictURL, traceID, exchangeID, g.cfg.WaitMS)
+// idempotent, which the gate may repeat. The call may take waitMS + verdictGrace.
+func (g *Gate) ask(ctx context.Context, traceID, exchangeID string, waitMS int) (v verdict, reason string, extra map[string]string) {
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(waitMS)*time.Millisecond+verdictGrace)
+	defer cancel()
+	u := fmt.Sprintf("%s/verdicts/%s/%s?wait_ms=%d", g.cfg.VerdictURL, traceID, exchangeID, waitMS)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return verdict{}, "verdict_error", map[string]string{"error": err.Error()}
