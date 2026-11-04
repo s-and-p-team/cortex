@@ -599,6 +599,139 @@ func TestFailModeConfig(t *testing.T) {
 	}
 }
 
+// pendingFrom is pendingTo for a request whose lineage record names source as its
+// self_id, with the wait the service was asked for.
+func pendingFrom(t *testing.T, g *Gate, last *atomic.Value, source, host string) (pipeline.Action, pipeline.Invocation, string) {
+	t.Helper()
+	pctx := &pipeline.Context{Direction: pipeline.Outbound, Host: host, Headers: stamped()}
+	pctx.Record(pipeline.Invocation{Plugin: "lineage-telemetry", Phase: pipeline.InvocationPhaseRequest,
+		Action: pipeline.ActionModify, Reason: "stamped_tracestate", Details: map[string]string{"self_id": source}})
+	act := g.OnRequest(context.Background(), pctx)
+	asked := last.Load().(string)
+	return act, lastInvocation(t, pctx), asked[strings.LastIndex(asked, "?")+1:]
+}
+
+// noSource fails when the record or the refusal names a slice.
+func noSource(t *testing.T, what string, act pipeline.Action, inv pipeline.Invocation) {
+	t.Helper()
+	if _, ok := inv.Details["fail_mode_source"]; ok {
+		t.Errorf("%s: record %v names a slice, but none applied", what, inv.Details)
+	}
+	if act.Violation != nil {
+		if _, ok := act.Violation.Details["fail_mode_source"]; ok {
+			t.Errorf("%s: refusal details %v name a slice, but none applied", what, act.Violation.Details)
+		}
+	}
+}
+
+// A slice under sources applies to the requests of the source lineage's record
+// names, its missing defaults the top level's; another source gets the top level.
+func TestSourceSliceAppliesToItsSource(t *testing.T) {
+	srv, _, last := verdictServer(t, 0, `{"state":"pending"}`)
+	g := gate(t, `{"verdict_url":"`+srv.URL+`","wait_ms":700,"fallback":"deny","sources":{"desk":{"fallback":"allow"}}}`)
+
+	act, inv, asked := pendingFrom(t, g, last, "desk", "peer.example")
+	if act.Type != pipeline.Continue || inv.Reason != "fallback_allow" || inv.Details["fail_mode_source"] != "desk" {
+		t.Errorf("desk: action %v, record %s %v, want Continue, fallback_allow, fail_mode_source desk", act.Type, inv.Reason, inv.Details)
+	}
+	if asked != "wait_ms=700" {
+		t.Errorf("desk: asked %s, want the top-level wait_ms=700", asked)
+	}
+	if _, ok := inv.Details["fail_mode_destination"]; ok {
+		t.Errorf("desk: record %v names a row, but the slice has none", inv.Details)
+	}
+	act, inv, _ = pendingFrom(t, g, last, "other", "peer.example")
+	if act.Type != pipeline.Reject || inv.Reason != "fallback_deny" {
+		t.Errorf("other: action %v, record %s, want Reject, fallback_deny", act.Type, inv.Reason)
+	}
+	noSource(t, "other", act, inv)
+
+	// A refusal under a slice names it too.
+	g = gate(t, `{"verdict_url":"`+srv.URL+`","fallback":"allow","sources":{"desk":{"fallback":"deny"}}}`)
+	act, inv, _ = pendingFrom(t, g, last, "desk", "peer.example")
+	if act.Type != pipeline.Reject || inv.Details["fail_mode_source"] != "desk" || act.Violation.Details["fail_mode_source"] != "desk" {
+		t.Errorf("deny slice: action %v, record %s %v, want Reject naming desk in the record and the refusal", act.Type, inv.Reason, inv.Details)
+	}
+	if act, _, _ := pendingFrom(t, g, last, "other", "peer.example"); act.Type != pipeline.Continue {
+		t.Errorf("other under the allow default: action %v, want Continue", act.Type)
+	}
+}
+
+// Inside a slice a row's missing key is the slice's default, never the top-level
+// row for the same host, nor a top-level row for a host the slice has none for;
+// another source gets the top-level rows.
+func TestSourceSliceFillsItsRowsFromItsDefaults(t *testing.T) {
+	srv, _, last := verdictServer(t, 0, `{"state":"pending"}`)
+	g := gate(t, `{"verdict_url":"`+srv.URL+`","fail_mode":[{"destination":"peer.example","wait_ms":50},{"destination":"other.example","wait_ms":60,"fallback":"allow"}],`+
+		`"sources":{"desk":{"wait_ms":100,"fail_mode":[{"destination":"peer.example","fallback":"allow"}]}}}`)
+	for _, tc := range []struct {
+		source, host, asked, reason, src, dest string
+	}{
+		{"desk", "peer.example", "wait_ms=100", "fallback_allow", "desk", "peer.example"},
+		{"desk", "other.example", "wait_ms=100", "fallback_deny", "desk", ""},
+		{"other", "peer.example", "wait_ms=50", "fallback_deny", "", "peer.example"},
+		{"other", "other.example", "wait_ms=60", "fallback_allow", "", "other.example"},
+	} {
+		_, inv, asked := pendingFrom(t, g, last, tc.source, tc.host)
+		if asked != tc.asked || inv.Reason != tc.reason || inv.Details["fail_mode_source"] != tc.src || inv.Details["fail_mode_destination"] != tc.dest {
+			t.Errorf("%s to %s: asked %s, record %s %v, want %s, %s, source %q, destination %q",
+				tc.source, tc.host, asked, inv.Reason, inv.Details, tc.asked, tc.reason, tc.src, tc.dest)
+		}
+	}
+}
+
+// A lineage record with no self_id, as an older lineage writes it, gets the
+// unnamed slice.
+func TestRecordWithoutSelfIDGetsTheUnnamedSlice(t *testing.T) {
+	srv, _, last := verdictServer(t, 0, `{"state":"pending"}`)
+	g := gate(t, `{"verdict_url":"`+srv.URL+`","wait_ms":700,"sources":{"desk":{"wait_ms":100,"fallback":"allow"}}}`)
+	act, inv := pendingTo(t, g, "peer.example")
+	if act.Type != pipeline.Reject || inv.Reason != "fallback_deny" || !strings.HasSuffix(last.Load().(string), "?wait_ms=700") {
+		t.Errorf("action %v, record %s %v, asked %s, want the top level's fallback_deny at wait_ms=700", act.Type, inv.Reason, inv.Details, last.Load())
+	}
+	noSource(t, "no self_id", act, inv)
+}
+
+// A slice outside the shape refuses the config at load; no slices, or no key, is
+// the gate without slices.
+func TestSourcesConfig(t *testing.T) {
+	for name, sources := range map[string]string{
+		"unknown key":           `{"desk":{"fallback":"allow","source":"desk"}}`,
+		"unknown key in a row":  `{"desk":{"fail_mode":[{"destination":"peer.example","fallback":"allow","source":"desk"}]}}`,
+		"empty source":          `{"":{"fallback":"allow"}}`,
+		"a SPIFFE ID":           `{"spiffe://td/ns/a/sa/desk":{"fallback":"allow"}}`,
+		"a namespaced name":     `{"team1/desk":{"fallback":"allow"}}`,
+		"duplicate destination": `{"desk":{"fail_mode":[{"destination":"peer.example","fallback":"allow"},{"destination":"PEER.example","wait_ms":100}]}}`,
+		"row with neither key":  `{"desk":{"fail_mode":[{"destination":"peer.example"}]}}`,
+		"row with a port":       `{"desk":{"fail_mode":[{"destination":"peer.example:443","fallback":"allow"}]}}`,
+		"default wait_ms 0":     `{"desk":{"wait_ms":0}}`,
+		"default wait_ms 3001":  `{"desk":{"wait_ms":3001}}`,
+		"default fallback open": `{"desk":{"fallback":"open"}}`,
+		"row fallback open":     `{"desk":{"fail_mode":[{"destination":"peer.example","fallback":"open"}]}}`,
+		"not an object":         `["desk"]`,
+		"a slice not an object": `{"desk":"allow"}`,
+		"second slice bad":      `{"desk":{"fallback":"allow"},"till":{"wait_ms":-1}}`,
+	} {
+		if err := New().Configure(json.RawMessage(`{"verdict_url":"http://x","sources":` + sources + `}`)); err == nil {
+			t.Errorf("%s: accepted %s", name, sources)
+		}
+	}
+	srv, _, last := verdictServer(t, 0, `{"state":"pending"}`)
+	for name, raw := range map[string]string{
+		"empty":  `{"verdict_url":"` + srv.URL + `","wait_ms":700,"fail_mode":[{"destination":"peer.example","fallback":"allow"}],"sources":{}}`,
+		"no key": `{"verdict_url":"` + srv.URL + `","wait_ms":700,"fail_mode":[{"destination":"peer.example","fallback":"allow"}]}`,
+	} {
+		g := gate(t, raw)
+		for host, want := range map[string]string{"peer.example": "fallback_allow", "other.example": "fallback_deny"} {
+			act, inv, asked := pendingFrom(t, g, last, "desk", host)
+			if inv.Reason != want || asked != "wait_ms=700" {
+				t.Errorf("%s, %s: record %s %v, asked %s, want the top level's %s at wait_ms=700", name, host, inv.Reason, inv.Details, asked, want)
+			}
+			noSource(t, name+", "+host, act, inv)
+		}
+	}
+}
+
 // A record that did not see the whole body has no answer about the rest of it,
 // unless what it did see is already refused.
 func TestUnjudgedRefusesAndADenyStillDenies(t *testing.T) {

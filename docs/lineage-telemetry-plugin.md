@@ -29,7 +29,8 @@ denial by a plugin ordered before it emits no spans.
 
 The plugin's invocation record of a request pass whose `lineage-parent` stamp it wrote is
 `modify/stamped_tracestate`, read by `sentry-gate` later in the chain. Its details are
-`capture_io` (`"true"` or `"false"`, the setting that emitted this exchange's span) and,
+`self_id` (the workload's identity as `lineage.self.id` carries it, the last segment of a
+SPIFFE ID), `capture_io` (`"true"` or `"false"`, the setting that emitted this exchange's span) and,
 with `capture_io` on, one mark when the request body did not reach `input.value` whole:
 `body_cut: "true"` when it was cut at `max_payload_bytes`, `body_not_captured: "true"`
 when the body has bytes and `input.value` got none of them. With `capture_io` off there

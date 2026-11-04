@@ -32,9 +32,11 @@
 // setting decides: deny, the default, refuses with a 503 (fail closed), so the
 // verdict service is a dependency of every gated egress; allow delivers unjudged.
 // Either is recorded as the setting's outcome. A fail_mode row for the request's host
-// replaces wait_ms, fallback or both for that host. Any other missing verdict is a fault
-// and is refused whatever the setting, and so is a body lineage marked as cut at
-// max_payload_bytes or not captured: its verdict would have said unjudged.
+// replaces wait_ms, fallback or both for that host, and a slice under sources does so
+// for the requests of one source workload, which lineage's record names (self_id).
+// Any other missing verdict is a fault and is refused whatever the setting, and so is
+// a body lineage marked as cut at max_payload_bytes or not captured: its verdict would
+// have said unjudged.
 //
 // A tunnel is never judged. The forward proxy runs the pipeline on the
 // CONNECT before it decides whether tls-bridge will decrypt the tunnel, and a
@@ -170,16 +172,18 @@ type Config struct {
 	VerdictURL      string   `json:"verdict_url" required:"true" description:"Base URL of the verdict service; the plugin GETs {verdict_url}/verdicts/{trace_id}/{exchange_id}?wait_ms=N."`
 	PassHosts       []string `json:"pass_hosts" description:"Outbound host globs (path.Match, port stripped, case folded) that never wait for a verdict."`
 	PassSingleLabel bool     `json:"pass_single_label" description:"A cluster short name (one DNS label, not a number) never waits." default:"true"`
-	WaitMS          int      `json:"wait_ms" description:"Longest an outbound request is held for its verdict, 1..3000; a fail_mode row can set its own." default:"2000"`
+	WaitMS          int      `json:"wait_ms" description:"Longest an outbound request is held for its verdict, 1..3000; a fail_mode row or a slice under sources can set its own." default:"2000"`
 	DenyOn          []string `json:"deny_on" description:"Verdicts that reject the request." default:"block"`
 	Fallback        string   `json:"fallback" description:"What a request gets when no verdict arrives from a slow or dead service: deny, or allow (deliver unjudged)." default:"deny"`
 	// The secret's key ends in "secret" so redact.JSON masks it wherever the
 	// raw config is echoed; renaming it would put the value on /v1/pipeline.
 	VerdictSecret     string `json:"verdict_secret" description:"Shared secret sent as an Authorization bearer token on every verdict call; empty sends no header."`
 	VerdictSecretFile string `json:"verdict_secret_file" description:"File holding the shared secret (a mounted Secret), read when the plugin is configured; exclusive with verdict_secret."`
-	// fail_mode, and its rows by destination once decoded.
-	FailMode []FailModeRow `json:"fail_mode" description:"Rows {destination, wait_ms?, fallback?} replacing wait_ms and fallback for one host name, whatever the request's port or case."`
-	rows     map[string]failRow
+	// fail_mode and sources, and once decoded the unnamed slice and the slices by source.
+	FailMode []FailModeRow    `json:"fail_mode" description:"Rows {destination, wait_ms?, fallback?} replacing wait_ms and fallback for one host name, whatever the request's port or case."`
+	Sources  map[string]Slice `json:"sources" description:"Slices by source workload (lineage's self_id), each {wait_ms?, fallback?, fail_mode?} for its requests; a default left out is the top-level key."`
+	unnamed  failSlice
+	sources  map[string]failSlice
 }
 
 func defaultConfig() Config {
@@ -214,7 +218,7 @@ func decodeConfig(raw json.RawMessage) (Config, error) {
 	if cfg.Fallback != "deny" && cfg.Fallback != "allow" {
 		return Config{}, fmt.Errorf("sentry-gate config: fallback %q must be deny or allow", cfg.Fallback)
 	}
-	if cfg.rows, err = decodeFailMode(cfg.FailMode, cfg.WaitMS, cfg.Fallback); err != nil {
+	if err = decodeSlices(&cfg); err != nil {
 		return Config{}, err
 	}
 	if len(cfg.DenyOn) == 0 {
@@ -388,7 +392,7 @@ func (g *Gate) OnRequest(ctx context.Context, pctx *pipeline.Context) pipeline.A
 		return g.fault(pctx, "no_exchange_key", "", 0, nil)
 	}
 
-	row := g.failRowFor(pctx.Host)
+	row := g.failRowFor(rec.Details["self_id"], pctx.Host)
 	start := time.Now()
 	v, reason, extra := g.ask(ctx, traceID, exchangeID, row.waitMS)
 	waited := time.Since(start)
@@ -588,6 +592,9 @@ func (g *Gate) fallback(pctx *pipeline.Context, row failRow, cause, exchangeID s
 	details["no_verdict"] = cause
 	if row.destination != "" {
 		details["fail_mode_destination"], refusal["fail_mode_destination"] = row.destination, row.destination
+	}
+	if row.source != "" {
+		details["fail_mode_source"], refusal["fail_mode_source"] = row.source, row.source
 	}
 	if row.fallback == "allow" {
 		pctx.Record(pipeline.Invocation{Action: pipeline.ActionAllow, Reason: "fallback_allow", Details: details})

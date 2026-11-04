@@ -542,3 +542,43 @@ func TestSentryGate_CutBodyIsRefusedWhateverTheRow(t *testing.T) {
 		}
 	})
 }
+
+// Lineage's record names the source as its span does, the last segment of a
+// SPIFFE ID, and the gate picks that source's slice by it; another source gets the top
+// level.
+func TestSentryGate_SliceIsPickedByLineagesSelfID(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, answerPending)
+	}))
+	t.Cleanup(srv.Close)
+	for _, tc := range []struct {
+		selfID, source, want string
+	}{
+		{"spiffe://cluster.local/ns/team1/sa/desk", "desk", "fallback_allow"},
+		{"spiffe://cluster.local/ns/team1/sa/other", "", "fallback_deny"},
+	} {
+		seg := tc.selfID[strings.LastIndex(tc.selfID, "/")+1:]
+		t.Run(seg, func(t *testing.T) {
+			p, _ := newTestPlugin(t)
+			p.bypassPaths, _ = bypass.NewMatcher(nil)
+			p.selfID = tc.selfID
+			g := sentrygate.New()
+			if err := g.Configure(json.RawMessage(`{"verdict_url":"` + srv.URL + `","fallback":"deny","sources":{"desk":{"fallback":"allow"}}}`)); err != nil {
+				t.Fatalf("Configure: %v", err)
+			}
+			pl, err := pipeline.New([]pipeline.Plugin{p, g})
+			if err != nil {
+				t.Fatalf("pipeline.New: %v", err)
+			}
+			pctx := withBody("hello")
+			pl.Run(context.Background(), pctx)
+			rec, _ := lineageRecord(t, pctx)
+			if rec.Details["self_id"] != seg {
+				t.Errorf("lineage record = %v, want self_id %s", rec.Details, seg)
+			}
+			if inv := gateInvocation(t, pctx); inv.Reason != tc.want || inv.Details["fail_mode_source"] != tc.source {
+				t.Errorf("gate record = %s %v, want %s, fail_mode_source %q", inv.Reason, inv.Details, tc.want, tc.source)
+			}
+		})
+	}
+}

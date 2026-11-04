@@ -660,8 +660,9 @@ func (p *LineageTelemetry) OnRequest(ctx context.Context, pctx *pipeline.Context
 	// config that emitted this exchange's span, which a reload cannot separate.
 	// A body mark (requestBodyMark) is known here, before any verdict, so a gate
 	// with no verdict in time still knows the body could not be judged whole.
+	// self_id, as the span carries it, lets the gate pick its settings by source.
 	if stamped {
-		details := map[string]string{"capture_io": strconv.FormatBool(p.cfg.CaptureIO)}
+		details := map[string]string{"capture_io": strconv.FormatBool(p.cfg.CaptureIO), "self_id": self}
 		if mark := p.requestBodyMark(pctx, protocol); mark != "" {
 			details[mark] = "true"
 		}

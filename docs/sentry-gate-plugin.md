@@ -42,7 +42,8 @@ Per request, in order:
   tool; a tool that needs OAuth discovery needs its host on `pass_hosts`. Any other form of these messages is asked about like any other request.
 - Otherwise the gate asks
   `GET {verdict_url}/verdicts/{trace_id}/{exchange_id}?wait_ms=N` and waits up to
-  `wait_ms`, a [`fail_mode`](#rows-by-destination) row's where one matches the host. A verdict listed in `deny_on` is refused with a 403; any other
+  `wait_ms`, a [`fail_mode`](#rows-by-destination) row's where one matches the host, within the request's
+  [slice](#slices-by-source). A verdict listed in `deny_on` is refused with a 403; any other
   decided verdict continues.
 - An `unjudged` answer, a record that did not see the whole request body, is
   refused with a 503 unless its verdict is in `deny_on`, recorded
@@ -97,7 +98,8 @@ https URL (`error_kind: tls`), an `unjudged` answer, and a request with no linea
 faults, or a verdict about the request, and `allow` does not deliver them. The record of a fallback carries
 `no_verdict` (the cause: `verdict_pending`, `verdict_busy`, `verdict_empty` or
 `verdict_error`), `exchange_id`, `waited_ms`, the cause's `status`, `error` and
-`error_kind` where it has them, and `fail_mode_destination` when a row decided. `allow` trades fail-closed for availability: while the
+`error_kind` where it has them, `fail_mode_destination` when a row decided and `fail_mode_source` when a
+[slice](#slices-by-source) did. `allow` trades fail-closed for availability: while the
 service is slow, down or at its waiter cap, unlisted egress leaves unjudged, and only the record says so.
 
 A body that could not be judged whole is never the fallback's. With `capture_io` on,
@@ -124,6 +126,23 @@ for a row with an empty destination, a port, a scheme, a space, a wildcard (`*`,
 `[`), a destination given twice (folded), a `wait_ms` outside `1..3000`, a `fallback`
 other than `deny` or `allow`, or neither key; an IPv6 literal cannot be a destination.
 
+## Slices by source
+
+`sources` maps a source workload to its own slice, `{"<source>": {"wait_ms": 1..3000,
+"fallback": "deny" | "allow", "fail_mode": [rows]}}`, every key optional. The source is
+`self_id` in `lineage-telemetry`'s record of the pass, the workload's name as its spans
+carry it (`lineage.self.id`, the last segment of a SPIFFE ID). A request whose source
+has a slice is looked up in that slice, any other in the top-level keys, which are the
+unnamed slice: so a source with no slice, and a record with no `self_id` (an older
+`lineage-telemetry`), get exactly what they got without `sources`. In the slice, for
+each key the most specific value applies: the slice's row for the host, else the slice's
+`wait_ms` and `fallback`, else the top-level ones. A top-level row is the unnamed slice's
+and never reaches a named one. The record of a fallback a slice decided names it in
+`fail_mode_source`, and so do the refusal details. `self_id` carries no namespace, so where one config reaches
+workloads in several namespaces, a slice applies to every workload of that name. The
+config is refused at load for an empty source name or one holding a `/`, an unknown key in a slice, a slice `wait_ms` or `fallback` outside
+the values above, and anything a top-level row is refused for.
+
 ## Refusal bodies
 
 A refusal has two readers. A model reads one `message`, the processed text. A program reads the raw facts beside it: `details`, what
@@ -147,7 +166,7 @@ The raw facts are `error` (the code), `plugin` and `details`:
 |---|---|---|
 | a verdict in `deny_on` | `policy.content-blocked` (403 where the status shows) | `state`, `verdict`, `reason` if unjudged, `rules`, `labels`, `redacted_payload` if the service sent it, `exchange_id`, `waited_ms` |
 | an `unjudged` answer, not denied | `policy.verdict-unavailable` (503) | `state`, `verdict`, `reason`, `rules`, `labels`, `exchange_id`, `waited_ms` |
-| no verdict, `fallback: deny` | `policy.verdict-unavailable` (503) | `reason` (the cause, as `no_verdict` in the record), `fallback: "deny"`, `waited_ms`, `exchange_id`, `fail_mode_destination` when a row decided |
+| no verdict, `fallback: deny` | `policy.verdict-unavailable` (503) | `reason` (the cause, as `no_verdict` in the record), `fallback: "deny"`, `waited_ms`, `exchange_id`, `fail_mode_destination` when a row decided, `fail_mode_source` when a slice did |
 | no verdict, a fault | `policy.verdict-unavailable` (503) | `reason` (the recorded one), `waited_ms`, `exchange_id` once the key is known |
 | no verdict, a marked body | `policy.verdict-unavailable` (503) | `reason` (the recorded cause), `body_cut: true` or `body_not_captured: true`, `waited_ms`, `exchange_id` |
 
@@ -196,9 +215,10 @@ that text can carry the internal URL, so a refusal never does.
 | `verdict_url` | string | required | Base URL of the verdict service; the plugin appends `/verdicts/{trace_id}/{exchange_id}`. For the lab-data-governance service it ends in `/enforce/v1`. The call never goes through a proxy. |
 | `pass_hosts` | `[]string` | `[]` | Outbound host globs that never wait: `path.Match` on the host, port stripped, case folded. |
 | `pass_single_label` | bool | `true` | A cluster short name never waits: one label of lowercase letters, digits and hyphens, not a number. |
-| `wait_ms` | int | `2000` | Longest hold for a verdict, `1..3000`; a `fail_mode` row can set its own. The HTTP call may take `wait_ms` + 500 ms. |
+| `wait_ms` | int | `2000` | Longest hold for a verdict, `1..3000`; a `fail_mode` row or a slice can set its own. The HTTP call may take `wait_ms` + 500 ms. |
 | `deny_on` | `[]string` | `["block"]` | Verdicts that refuse the request, compared trimmed and case-folded. Empty is refused: remove the plugin instead. |
 | `fallback` | string | `deny` | What a request gets when no verdict arrives from a slow or dead service ([the fallback](#the-fallback)): `deny` refuses it with a 503, `allow` delivers it unjudged. Any other value is refused. |
 | `fail_mode` | list | `[]` | Rows `{destination, wait_ms?, fallback?}` that set `wait_ms` and `fallback` for one host ([rows by destination](#rows-by-destination)). |
+| `sources` | map | `{}` | Slices `{wait_ms?, fallback?, fail_mode?}` by source workload, `lineage-telemetry`'s `self_id`, for that source's requests ([slices by source](#slices-by-source)). |
 | `verdict_secret` | string | `""` | Sent as `Authorization: Bearer <secret>` on every verdict call. Masked in config echoes by its key name, never logged or recorded. |
 | `verdict_secret_file` | string | `""` | File holding the secret (a mounted Secret), read at configure, so a rotated secret is refused `verdict_unauthorized` until the config reloads. Exclusive with `verdict_secret`. |
