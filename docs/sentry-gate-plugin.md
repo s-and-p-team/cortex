@@ -27,7 +27,7 @@ Per request, in order:
 
 - Inbound: skipped (`skip/inbound`).
 - A host on the pass list: continues at once, nothing asked (`skip/pass_host`).
-- A tunnel, a `CONNECT` that opens one: never judged, continues, recorded `allow/unjudged`
+- A tunnel, a `CONNECT` that opens one: never judged, continues, recorded `allow/not_inspected`
   (`kind: tunnel`). A tunnel `tls-bridge` decrypts runs the pipeline again for
   each request inside it, and each of those is judged, a `CONNECT` sent inside it
   included.

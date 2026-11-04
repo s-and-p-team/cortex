@@ -958,9 +958,9 @@ func TestMissingKeyIsUnknown(t *testing.T) {
 // A CONNECT is never judged and never refused: whether the tunnel will be
 // decrypted is decided after the pipeline runs on it, and a bridged tunnel's
 // requests are judged one by one when they come through again. The CONNECT
-// is recorded unjudged (kind=tunnel), without a call — even when lineage did not stamp it; a listed host is a pass as for any
+// is recorded not_inspected (kind=tunnel), without a call — even when lineage did not stamp it; a listed host is a pass as for any
 // request.
-func TestConnectIsUnjudgedAndContinues(t *testing.T) {
+func TestConnectIsNotInspectedAndContinues(t *testing.T) {
 	srv, calls, _ := verdictServer(t, 0, `{"state":"decided","verdict":"block"}`)
 	tunnel := func(host string, stampedByLineage bool) *pipeline.Context {
 		pctx := &pipeline.Context{Direction: pipeline.Outbound, Method: http.MethodConnect, Scheme: "tcp", Host: host, Headers: stamped()}
@@ -981,8 +981,8 @@ func TestConnectIsUnjudgedAndContinues(t *testing.T) {
 			t.Errorf("%s: action = %v, want Continue", name, act.Type)
 		}
 		inv := lastInvocation(t, pctx)
-		if inv.Action != pipeline.ActionAllow || inv.Reason != "unjudged" || inv.Details["kind"] != "tunnel" {
-			t.Errorf("%s: invocation = %s/%s %v, want allow/unjudged kind=tunnel", name, inv.Action, inv.Reason, inv.Details)
+		if inv.Action != pipeline.ActionAllow || inv.Reason != "not_inspected" || inv.Details["kind"] != "tunnel" {
+			t.Errorf("%s: invocation = %s/%s %v, want allow/not_inspected kind=tunnel", name, inv.Action, inv.Reason, inv.Details)
 		}
 	}
 	pctx := tunnel("api.trusted.example:443", true)

@@ -43,7 +43,7 @@
 // bridged tunnel's decrypted requests run the pipeline again, where each is
 // judged like any other request. What an opaque tunnel may carry is the
 // listener's tls_bridge policy, not a verdict's: there is no payload to ask
-// about. So the CONNECT continues and is recorded as unjudged (kind=tunnel). A
+// about. So the CONNECT continues and is recorded as not_inspected (kind=tunnel). A
 // CONNECT sent inside a decrypted tunnel opens nothing: the bridge re-originates
 // it with its body, and it is judged like any other request.
 //
@@ -52,7 +52,7 @@
 // synthetic CONNECT, plaintext HTTP on port 80 included. So what the gate
 // judges is a request sent through the forward proxy (HTTP_PROXY) and a
 // request inside a tunnel tls-bridge decrypts; a transparently captured
-// connection tls-bridge does not decrypt is recorded unjudged (kind=tunnel),
+// connection tls-bridge does not decrypt is recorded not_inspected (kind=tunnel),
 // and its bytes, readable or not, leave without a verdict.
 //
 // A message that carries no data continues at once, with nothing asked: an agent
@@ -370,7 +370,7 @@ func (g *Gate) OnRequest(ctx context.Context, pctx *pipeline.Context) pipeline.A
 	// listener re-originates is redirectable, so a CONNECT that is redirectable
 	// was sent inside a decrypted tunnel, and it carries a body like any other.
 	if pctx.Method == http.MethodConnect && !pctx.Redirectable() {
-		pctx.Record(pipeline.Invocation{Action: pipeline.ActionAllow, Reason: "unjudged", Details: map[string]string{"kind": "tunnel"}})
+		pctx.Record(pipeline.Invocation{Action: pipeline.ActionAllow, Reason: "not_inspected", Details: map[string]string{"kind": "tunnel"}})
 		return pipeline.Action{Type: pipeline.Continue}
 	}
 	if kind, ok := carriesNoData(pctx.Method, pctx.Path, pctx.Body); ok {
