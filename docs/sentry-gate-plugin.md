@@ -55,7 +55,8 @@ Per request, in order:
   change needs no pod restart, and it logs one warning per loaded config at the
   first body it lets through this way. Turning capture on puts raw bodies on the
   spans, credentials included, and refuses a clean body over `max_payload_bytes`.
-- No verdict from a slow or dead service: the `fallback` setting decides (below).
+- No verdict from a slow or dead service: the `fallback` setting decides, unless
+  lineage marked the body as not captured whole (below).
   `deny`, the default, refuses with a 503, recorded `deny/fallback_deny`; `allow`
   continues unjudged, recorded `allow/fallback_allow`. Either record names the cause
   in `no_verdict`.
@@ -99,6 +100,15 @@ faults, or a verdict about the request, and `allow` does not deliver them. The r
 `error_kind` where it has them. `allow` trades fail-closed for availability: while the
 service is slow, down or at its waiter cap, unlisted egress leaves unjudged, and only the record says so.
 
+A body that could not be judged whole is never the fallback's. With `capture_io` on,
+`lineage-telemetry` marks its record of the pass `body_cut` when it cut the request
+body at `max_payload_bytes`, or `body_not_captured` when the body has bytes and capture
+took none of them (a binary body, a parser's nothing). The gate reads the mark only when
+the fallback would decide: a marked body is refused with a 503 whatever `fallback` says,
+recorded `deny` under its cause (`verdict_pending`, ...) with the mark in the details,
+never `fallback_*`, because the verdict would have said `unjudged`. A verdict that
+arrived and a fault are untouched by the mark, and with `capture_io` off there is none.
+
 ## Refusal bodies
 
 A refusal has two readers. A model reads one `message`, the processed text. A program reads the raw facts beside it: `details`, what
@@ -124,6 +134,7 @@ The raw facts are `error` (the code), `plugin` and `details`:
 | an `unjudged` answer, not denied | `policy.verdict-unavailable` (503) | `state`, `verdict`, `reason`, `rules`, `labels`, `exchange_id`, `waited_ms` |
 | no verdict, `fallback: deny` | `policy.verdict-unavailable` (503) | `reason` (the cause, as `no_verdict` in the record), `fallback: "deny"`, `waited_ms`, `exchange_id` |
 | no verdict, a fault | `policy.verdict-unavailable` (503) | `reason` (the recorded one), `waited_ms`, `exchange_id` once the key is known |
+| no verdict, a marked body | `policy.verdict-unavailable` (503) | `reason` (the recorded cause), `body_cut: true` or `body_not_captured: true`, `waited_ms`, `exchange_id` |
 
 Every message starts `Sentry gate (data governance) refused this request to <host>. Nothing was delivered.` The rest depends on the
 refusal:
@@ -136,6 +147,7 @@ refusal:
 | `unjudged` | `Only part of it could be judged.` before any of the above |
 | no verdict, `fallback: deny` | `No verdict arrived, so nothing was judged and nothing is flagged.` |
 | no verdict, a fault | `No verdict was given, so nothing was judged and nothing is flagged.` |
+| no verdict, a marked body | `No verdict arrived, and the request body could not be judged in full, so nothing is flagged.` |
 
 A block's reply to a `tools/call`, for example:
 

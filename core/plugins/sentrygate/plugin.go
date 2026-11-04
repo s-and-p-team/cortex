@@ -32,7 +32,8 @@
 // setting decides: deny, the default, refuses with a 503 (fail closed), so the
 // verdict service is a dependency of every gated egress; allow delivers unjudged.
 // Either is recorded as the setting's outcome. Any other missing verdict is a fault
-// and is refused whatever the setting.
+// and is refused whatever the setting, and so is a body lineage marked as cut at
+// max_payload_bytes or not captured: its verdict would have said unjudged.
 //
 // A tunnel is never judged. The forward proxy runs the pipeline on the
 // CONNECT before it decides whether tls-bridge will decrypt the tunnel, and a
@@ -389,6 +390,11 @@ func (g *Gate) OnRequest(ctx context.Context, pctx *pipeline.Context) pipeline.A
 			return pipeline.Deny("pipeline.cancelled", "request cancelled while waiting for a verdict")
 		}
 		if slowOrDead(reason, v, extra) {
+			for _, mark := range []string{"body_cut", "body_not_captured"} {
+				if rec.Details[mark] == "true" {
+					return g.markedBody(pctx, mark, reason, exchangeID, waited, extra)
+				}
+			}
 			return g.fallback(pctx, reason, exchangeID, waited, extra)
 		}
 		return g.fault(pctx, reason, exchangeID, waited, extra)
@@ -581,6 +587,17 @@ func (g *Gate) fallback(pctx *pipeline.Context, cause, exchangeID string, waited
 	refusal["fallback"] = "deny"
 	return refuse(pctx, "policy.verdict-unavailable", http.StatusServiceUnavailable,
 		refusalMessage(pctx.Host, " No verdict arrived, so nothing was judged and nothing is flagged.", nil, ""), refusal)
+}
+
+// markedBody refuses, whatever the fallback, a request a slow or dead service gave no
+// verdict for whose body lineage marked as cut (body_cut) or not captured
+// (body_not_captured): the verdict would have said unjudged. Recorded under its cause.
+func (g *Gate) markedBody(pctx *pipeline.Context, mark, cause, exchangeID string, waited time.Duration, extra map[string]string) pipeline.Action {
+	details, refusal := noVerdict(cause, exchangeID, waited, extra)
+	details[mark], refusal[mark] = "true", true
+	pctx.Record(pipeline.Invocation{Action: pipeline.ActionDeny, Reason: cause, Details: details})
+	return refuse(pctx, "policy.verdict-unavailable", http.StatusServiceUnavailable,
+		refusalMessage(pctx.Host, " No verdict arrived, and the request body could not be judged in full, so nothing is flagged.", nil, ""), refusal)
 }
 
 // noVerdict is the record's details and the refusal's for a request with no verdict.

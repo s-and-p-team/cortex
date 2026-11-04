@@ -2807,3 +2807,54 @@ func TestCaptureIO_PlainHTTPTruncatesOversizeBody(t *testing.T) {
 	checkInt(t, req, "http.request.body.size", 500)
 	checkInt(t, resp, "http.response.body.size", 500)
 }
+
+// The request-pass record carries body_cut or body_not_captured when, with capture
+// on, input.value is cut at max_payload_bytes or empty for a body that has bytes; no
+// mark otherwise, and none ever with capture off.
+func TestRequestRecord_MarksABodyCaptureDidNotTakeWhole(t *testing.T) {
+	over := strings.Repeat("x", 9)
+	for _, tc := range []struct {
+		name     string
+		capture  bool
+		max      int
+		body     string
+		mcp      bool
+		wantMark string
+	}{
+		{"capture off, over the cap", false, 8, over, false, ""},
+		{"no body", true, 8, "", false, ""},
+		{"at the cap", true, 8, over[:8], false, ""},
+		{"over the cap", true, 8, over, false, "body_cut"},
+		{"no cap", true, -1, over, false, ""},
+		{"not text", true, 8, "\xff\xfe", false, "body_not_captured"},
+		{"mcp with no params", true, 8, `{"method":"tools/call"}`, true, "body_not_captured"},
+		{"capture off, mcp with no params", false, 8, `{"method":"tools/call"}`, true, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, _ := newTestPlugin(t)
+			p.cfg.CaptureIO, p.cfg.MaxPayloadBytes = tc.capture, tc.max
+			pctx := fakeContext(pipeline.Outbound, http.Header{})
+			pctx.Body = []byte(tc.body)
+			if tc.mcp {
+				pctx.Extensions.MCP = &pipeline.MCPExtension{Method: "tools/call", RPCID: 1}
+			}
+			run(t, p, pctx, allow(200))
+			rec, _ := lineageRecord(t, pctx)
+			if rec.Reason != "stamped_tracestate" {
+				t.Fatalf("record = %s, want stamped_tracestate", rec.Reason)
+			}
+			got := ""
+			for _, mark := range []string{"body_cut", "body_not_captured"} {
+				if v, ok := rec.Details[mark]; ok {
+					if got != "" || v != "true" {
+						t.Errorf("details = %v, want at most one mark, \"true\"", rec.Details)
+					}
+					got = mark
+				}
+			}
+			if got != tc.wantMark {
+				t.Errorf("mark = %q, want %q (details %v)", got, tc.wantMark, rec.Details)
+			}
+		})
+	}
+}
