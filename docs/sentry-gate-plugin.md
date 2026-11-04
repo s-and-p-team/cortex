@@ -18,7 +18,7 @@ only when lineage recorded, in the same pass, that it stamped this exchange.
 The service can answer only once it has the request span, so run
 `lineage-telemetry` with `export_delay_ms` well under `wait_ms`; use `10`, so
 batching adds at most 10 ms to a hold. At lineage's default, 5000 ms, a request is often
-held for `wait_ms` and refused `verdict_pending`.
+held for `wait_ms` and gets no verdict (`verdict_pending`), so the fallback decides it.
 
 A plugin that moves a request to another host (`inference-router`) belongs before
 the gate: after it, the request goes to a host the gate never saw.
@@ -55,9 +55,16 @@ Per request, in order:
   change needs no pod restart, and it logs one warning per loaded config at the
   first body it lets through this way. Turning capture on puts raw bodies on the
   spans, credentials included, and refuses a clean body over `max_payload_bytes`.
-- No verdict is refused with a 503, recorded under one of `verdict_pending`,
-  `verdict_error`, `verdict_busy`, `verdict_unauthorized`, `verdict_empty`,
-  `no_lineage_stamp` or `no_exchange_key`.
+- No verdict from a slow or dead service: the `fallback` setting decides (below).
+  `deny`, the default, refuses with a 503, recorded `deny/fallback_deny`; `allow`
+  continues unjudged, recorded `allow/fallback_allow`. Either record names the cause
+  in `no_verdict`.
+- Any other missing verdict is a fault and is refused with a 503 whatever the
+  setting, recorded under its cause: `verdict_unauthorized`, `verdict_error` (any other
+  status below 500, an answer that is not a verdict, a certificate the gate does not
+  trust, a service that requires a client certificate, plain HTTP at an https URL),
+  `verdict_empty` (an `unjudged` answer naming no verdict), `no_lineage_stamp`
+  or `no_exchange_key`.
 - A client that hangs up during the hold: nothing recorded by the gate, and the
   listener records a 499 (`pipeline.cancelled`).
 
@@ -75,6 +82,22 @@ turn as well; the frames of any other WebSocket are not judged.
 
 It is carried by the `full` and `fullcpex` profiles only, so to gate egress run
 the proxy-sidecar `authbridge` image.
+
+## The fallback
+
+`fallback` speaks only for a slow or dead service: the service answered `pending`
+(nothing to judge yet within `wait_ms`), answered 503 `verdict_busy` (its waiter cap
+is full), answered any other 5xx, answered `decided` with no verdict, or did not
+answer at all (refused, reset, a name that does not resolve, the call running past
+`wait_ms` + 500 ms; recorded `error_kind: transport`). A status below 500 other than 200 (a wrong path, a
+wrong secret), an answer that is not a verdict (`error_kind: answer`), a certificate the
+gate does not trust, a service that requires a client certificate or plain HTTP at an
+https URL (`error_kind: tls`), an `unjudged` answer, and a request with no lineage stamp or no exchange key are setup or code
+faults, or a verdict about the request, and `allow` does not deliver them. The record of a fallback carries
+`no_verdict` (the cause: `verdict_pending`, `verdict_busy`, `verdict_empty` or
+`verdict_error`), `exchange_id`, `waited_ms`, and the cause's `status`, `error` and
+`error_kind` where it has them. `allow` trades fail-closed for availability: while the
+service is slow, down or at its waiter cap, unlisted egress leaves unjudged, and only the record says so.
 
 ## Refusal bodies
 
@@ -99,7 +122,8 @@ The raw facts are `error` (the code), `plugin` and `details`:
 |---|---|---|
 | a verdict in `deny_on` | `policy.content-blocked` (403 where the status shows) | `state`, `verdict`, `reason` if unjudged, `rules`, `labels`, `redacted_payload` if the service sent it, `exchange_id`, `waited_ms` |
 | an `unjudged` answer, not denied | `policy.verdict-unavailable` (503) | `state`, `verdict`, `reason`, `rules`, `labels`, `exchange_id`, `waited_ms` |
-| no verdict | `policy.verdict-unavailable` (503) | `reason` (the recorded one), `waited_ms`, `exchange_id` once the key is known |
+| no verdict, `fallback: deny` | `policy.verdict-unavailable` (503) | `reason` (the cause, as `no_verdict` in the record), `fallback: "deny"`, `waited_ms`, `exchange_id` |
+| no verdict, a fault | `policy.verdict-unavailable` (503) | `reason` (the recorded one), `waited_ms`, `exchange_id` once the key is known |
 
 Every message starts `Sentry gate (data governance) refused this request to <host>. Nothing was delivered.` The rest depends on the
 refusal:
@@ -110,7 +134,8 @@ refusal:
 | labels and no redacted payload | `Flagged:` and the labels |
 | nothing flagged | nothing more |
 | `unjudged` | `Only part of it could be judged.` before any of the above |
-| no verdict | `No verdict was given, so nothing was judged and nothing is flagged.` |
+| no verdict, `fallback: deny` | `No verdict arrived, so nothing was judged and nothing is flagged.` |
+| no verdict, a fault | `No verdict was given, so nothing was judged and nothing is flagged.` |
 
 A block's reply to a `tools/call`, for example:
 
@@ -146,5 +171,6 @@ that text can carry the internal URL, so a refusal never does.
 | `pass_single_label` | bool | `true` | A cluster short name never waits: one label of lowercase letters, digits and hyphens, not a number. |
 | `wait_ms` | int | `2000` | Longest hold for a verdict, `1..3000`. The HTTP call may take `wait_ms` + 500 ms. |
 | `deny_on` | `[]string` | `["block"]` | Verdicts that refuse the request, compared trimmed and case-folded. Empty is refused: remove the plugin instead. |
+| `fallback` | string | `deny` | What a request gets when no verdict arrives from a slow or dead service ([the fallback](#the-fallback)): `deny` refuses it with a 503, `allow` delivers it unjudged. Any other value is refused. |
 | `verdict_secret` | string | `""` | Sent as `Authorization: Bearer <secret>` on every verdict call. Masked in config echoes by its key name, never logged or recorded. |
 | `verdict_secret_file` | string | `""` | File holding the secret (a mounted Secret), read at configure, so a rotated secret is refused `verdict_unauthorized` until the config reloads. Exclusive with `verdict_secret`. |

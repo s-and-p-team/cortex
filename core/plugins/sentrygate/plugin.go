@@ -26,9 +26,13 @@
 // Waiting is selective. A request to a host on the pass list (pass_hosts, and
 // with pass_single_label a cluster short name) continues at once and asks
 // nothing; every other outbound request waits up to wait_ms (at most 3000,
-// the verdict service's own cap). A request with no verdict in time is refused
-// with a 503 (fail closed), so the verdict service is a dependency of every
-// gated egress.
+// the verdict service's own cap).
+//
+// When no verdict arrives from a slow or dead service (slowOrDead), the fallback
+// setting decides: deny, the default, refuses with a 503 (fail closed), so the
+// verdict service is a dependency of every gated egress; allow delivers unjudged.
+// Either is recorded as the setting's outcome. Any other missing verdict is a fault
+// and is refused whatever the setting.
 //
 // A tunnel is never judged. The forward proxy runs the pipeline on the
 // CONNECT before it decides whether tls-bridge will decrypt the tunnel, and a
@@ -81,6 +85,7 @@ package sentrygate
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -165,6 +170,7 @@ type Config struct {
 	PassSingleLabel bool     `json:"pass_single_label" description:"A cluster short name (one DNS label, not a number) never waits." default:"true"`
 	WaitMS          int      `json:"wait_ms" description:"Longest an outbound request is held for its verdict, 1..3000." default:"2000"`
 	DenyOn          []string `json:"deny_on" description:"Verdicts that reject the request." default:"block"`
+	Fallback        string   `json:"fallback" description:"What a request gets when no verdict arrives from a slow or dead service: deny, or allow (deliver unjudged)." default:"deny"`
 	// The secret's key ends in "secret" so redact.JSON masks it wherever the
 	// raw config is echoed; renaming it would put the value on /v1/pipeline.
 	VerdictSecret     string `json:"verdict_secret" description:"Shared secret sent as an Authorization bearer token on every verdict call; empty sends no header."`
@@ -176,6 +182,7 @@ func defaultConfig() Config {
 		PassSingleLabel: true,
 		WaitMS:          2000,
 		DenyOn:          []string{"block"},
+		Fallback:        "deny",
 	}
 }
 
@@ -198,6 +205,9 @@ func decodeConfig(raw json.RawMessage) (Config, error) {
 	}
 	if cfg.WaitMS > maxWaitMS {
 		return Config{}, fmt.Errorf("sentry-gate config: wait_ms %d must be 1..%d (the verdict service refuses a longer wait)", cfg.WaitMS, maxWaitMS)
+	}
+	if cfg.Fallback != "deny" && cfg.Fallback != "allow" {
+		return Config{}, fmt.Errorf("sentry-gate config: fallback %q must be deny or allow", cfg.Fallback)
 	}
 	if len(cfg.DenyOn) == 0 {
 		return Config{}, errors.New("sentry-gate config: deny_on is empty, so no verdict could ever reject; remove the plugin instead")
@@ -364,11 +374,11 @@ func (g *Gate) OnRequest(ctx context.Context, pctx *pipeline.Context) pipeline.A
 	// Lineage's own record of the pass is the one fact that says it wrote.
 	rec, stamped := lineageStampThisPass(pctx)
 	if !stamped {
-		return g.unknown(pctx, "no_lineage_stamp", "", 0, nil)
+		return g.fault(pctx, "no_lineage_stamp", "", 0, nil)
 	}
 	traceID, exchangeID, ok := exchangeKey(ctx, pctx.Headers)
 	if !ok {
-		return g.unknown(pctx, "no_exchange_key", "", 0, nil)
+		return g.fault(pctx, "no_exchange_key", "", 0, nil)
 	}
 
 	start := time.Now()
@@ -378,7 +388,10 @@ func (g *Gate) OnRequest(ctx context.Context, pctx *pipeline.Context) pipeline.A
 		if reason == "verdict_error" && ctx.Err() != nil {
 			return pipeline.Deny("pipeline.cancelled", "request cancelled while waiting for a verdict")
 		}
-		return g.unknown(pctx, reason, exchangeID, waited, extra)
+		if slowOrDead(reason, v, extra) {
+			return g.fallback(pctx, reason, exchangeID, waited, extra)
+		}
+		return g.fault(pctx, reason, exchangeID, waited, extra)
 	}
 
 	// The service's value as it came, compared as deny_on is decoded: trimmed
@@ -521,9 +534,57 @@ func isSmallCount(raw []byte) bool {
 	return true
 }
 
-// unknown refuses a request the gate could not get a verdict for. A 503 rather
-// than a 403: nothing was judged.
-func (g *Gate) unknown(pctx *pipeline.Context, reason, exchangeID string, waited time.Duration, extra map[string]string) pipeline.Action {
+// tlsSetupFault says the TLS setup failed: a certificate the gate does not trust, a
+// handshake alert from either side (the service wants a client certificate, or no
+// version or cipher is shared), or a plain-HTTP answer on an https URL. A remote
+// alert reaches the gate only as a "remote error" net.OpError.
+func tlsSetupFault(err error) bool {
+	var badCert *tls.CertificateVerificationError
+	var alert tls.AlertError
+	var header tls.RecordHeaderError
+	var op *net.OpError
+	return errors.As(err, &badCert) || errors.As(err, &alert) || errors.As(err, &header) ||
+		errors.Is(err, http.ErrSchemeMismatch) || (errors.As(err, &op) && op.Op == "remote error")
+}
+
+// slowOrDead says the service was slow or dead, so the fallback setting decides: a
+// pending answer, a busy one, a 5xx, a decided answer naming no verdict, or a call
+// that got no answer. Any other status below 500, an answer that is not a verdict, a
+// TLS setup that failed and an unjudged answer are faults.
+func slowOrDead(reason string, v verdict, extra map[string]string) bool {
+	status, _ := strconv.Atoi(extra["status"])
+	return reason == "verdict_pending" || reason == "verdict_busy" ||
+		(reason == "verdict_empty" && v.State == "decided") ||
+		(reason == "verdict_error" && (extra["error_kind"] == "transport" || status >= 500))
+}
+
+// fault refuses a request the gate got no verdict for because something is set up or
+// answering wrong, whatever the fallback. A 503 rather than a 403: nothing was judged.
+func (g *Gate) fault(pctx *pipeline.Context, reason, exchangeID string, waited time.Duration, extra map[string]string) pipeline.Action {
+	details, refusal := noVerdict(reason, exchangeID, waited, extra)
+	pctx.Record(pipeline.Invocation{Action: pipeline.ActionDeny, Reason: reason, Details: details})
+	return refuse(pctx, "policy.verdict-unavailable", http.StatusServiceUnavailable,
+		refusalMessage(pctx.Host, " No verdict was given, so nothing was judged and nothing is flagged.", nil, ""), refusal)
+}
+
+// fallback applies the fallback setting to a request a slow or dead service gave no
+// verdict for, recorded as the setting's outcome with the cause: allow delivers it
+// unjudged, deny refuses it with a 503.
+func (g *Gate) fallback(pctx *pipeline.Context, cause, exchangeID string, waited time.Duration, extra map[string]string) pipeline.Action {
+	details, refusal := noVerdict(cause, exchangeID, waited, extra)
+	details["no_verdict"] = cause
+	if g.cfg.Fallback == "allow" {
+		pctx.Record(pipeline.Invocation{Action: pipeline.ActionAllow, Reason: "fallback_allow", Details: details})
+		return pipeline.Action{Type: pipeline.Continue}
+	}
+	pctx.Record(pipeline.Invocation{Action: pipeline.ActionDeny, Reason: "fallback_deny", Details: details})
+	refusal["fallback"] = "deny"
+	return refuse(pctx, "policy.verdict-unavailable", http.StatusServiceUnavailable,
+		refusalMessage(pctx.Host, " No verdict arrived, so nothing was judged and nothing is flagged.", nil, ""), refusal)
+}
+
+// noVerdict is the record's details and the refusal's for a request with no verdict.
+func noVerdict(reason, exchangeID string, waited time.Duration, extra map[string]string) (map[string]string, map[string]any) {
 	details := map[string]string{"waited_ms": strconv.FormatInt(waited.Milliseconds(), 10)}
 	for k, v := range extra {
 		details[k] = v
@@ -533,9 +594,7 @@ func (g *Gate) unknown(pctx *pipeline.Context, reason, exchangeID string, waited
 		details["exchange_id"] = exchangeID
 		refusal["exchange_id"] = exchangeID
 	}
-	pctx.Record(pipeline.Invocation{Action: pipeline.ActionDeny, Reason: reason, Details: details})
-	return refuse(pctx, "policy.verdict-unavailable", http.StatusServiceUnavailable,
-		refusalMessage(pctx.Host, " No verdict was given, so nothing was judged and nothing is flagged.", nil, ""), refusal)
+	return details, refusal
 }
 
 // refuse renders a refusal in the reply the caller's client hands on. A stock MCP
@@ -657,26 +716,32 @@ func (g *Gate) ask(ctx context.Context, traceID, exchangeID string) (v verdict, 
 	if g.cfg.VerdictSecret != "" {
 		req.Header.Set("Authorization", "Bearer "+g.cfg.VerdictSecret)
 	}
+	// error_kind tells a call that got no answer (transport) from an answer that is
+	// not a verdict (answer) and a TLS setup that failed (tls), a fault that never
+	// clears.
 	resp, err := g.client.Do(req)
 	if err != nil {
-		return verdict{}, "verdict_error", map[string]string{"error": err.Error()}
+		if tlsSetupFault(err) {
+			return verdict{}, "verdict_error", map[string]string{"error": err.Error(), "error_kind": "tls"}
+		}
+		return verdict{}, "verdict_error", map[string]string{"error": err.Error(), "error_kind": "transport"}
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 	if err != nil {
-		return verdict{}, "verdict_error", map[string]string{"error": err.Error()}
+		return verdict{}, "verdict_error", map[string]string{"error": err.Error(), "error_kind": "transport"}
 	}
 	if resp.StatusCode != http.StatusOK {
 		return verdict{}, statusReason(resp.StatusCode, body), statusDetails(resp.StatusCode, body)
 	}
 	if err := json.Unmarshal(body, &v); err != nil {
-		return verdict{}, "verdict_error", map[string]string{"error": "verdict body: " + err.Error()}
+		return verdict{}, "verdict_error", map[string]string{"error": "verdict body: " + err.Error(), "error_kind": "answer"}
 	}
 	switch {
 	case v.State == "pending":
 		return v, "verdict_pending", nil
 	case v.State != "decided" && v.State != "unjudged":
-		return verdict{}, "verdict_error", map[string]string{"error": fmt.Sprintf("verdict state %.32q", v.State)}
+		return verdict{}, "verdict_error", map[string]string{"error": fmt.Sprintf("verdict state %.32q", v.State), "error_kind": "answer"}
 	case strings.TrimSpace(v.Verdict) == "":
 		// A record with no verdict is not an allow: nothing was judged.
 		return v, "verdict_empty", nil

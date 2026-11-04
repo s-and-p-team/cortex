@@ -3,6 +3,8 @@ package sentrygate
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -243,19 +245,219 @@ func TestPassHostsNeverAsk(t *testing.T) {
 	}
 }
 
-// No verdict in time is a 503: nothing was judged.
-func TestPendingRefuses(t *testing.T) {
+// Fallback: allow delivers a request the service has no verdict for yet, recorded
+// as the setting's outcome with the cause and how long the gate waited.
+func TestFallbackAllowDeliversPending(t *testing.T) {
 	srv, _, _ := verdictServer(t, 0, `{"state":"pending"}`)
 	pctx := outbound("outside.example", stamped())
-	act := gate(t, `{"verdict_url":"`+srv.URL+`"}`).OnRequest(context.Background(), pctx)
+	act := gate(t, `{"verdict_url":"`+srv.URL+`","fallback":"allow"}`).OnRequest(context.Background(), pctx)
+	if act.Type != pipeline.Continue {
+		t.Fatalf("action = %v, want Continue", act.Type)
+	}
+	inv := lastInvocation(t, pctx)
+	if inv.Action != pipeline.ActionAllow || inv.Reason != "fallback_allow" {
+		t.Errorf("invocation = %s/%s, want allow/fallback_allow", inv.Action, inv.Reason)
+	}
+	if inv.Details["no_verdict"] != "verdict_pending" || inv.Details["exchange_id"] != exchangeID {
+		t.Errorf("details = %v, want no_verdict verdict_pending and the exchange", inv.Details)
+	}
+	if _, err := strconv.Atoi(inv.Details["waited_ms"]); err != nil {
+		t.Errorf("waited_ms = %q, want a number", inv.Details["waited_ms"])
+	}
+}
+
+// Fallback: deny, given or by default, refuses the same request with a 503 as the
+// setting's outcome, with the same details, and the message says no verdict arrived.
+func TestFallbackDenyRefusesAsTheSetting(t *testing.T) {
+	srv, _, _ := verdictServer(t, 0, `{"state":"pending"}`)
+	for name, raw := range map[string]string{
+		"given":   `{"verdict_url":"` + srv.URL + `","fallback":"deny"}`,
+		"default": `{"verdict_url":"` + srv.URL + `"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			pctx := outbound("outside.example", stamped())
+			act := gate(t, raw).OnRequest(context.Background(), pctx)
+			if act.Type != pipeline.Reject {
+				t.Fatalf("action = %v, want Reject", act.Type)
+			}
+			if status, _, _ := act.Violation.Render(); status != http.StatusServiceUnavailable {
+				t.Errorf("status = %d, want 503", status)
+			}
+			if !strings.Contains(act.Violation.Reason, "No verdict arrived") {
+				t.Errorf("message = %q, want one saying no verdict arrived", act.Violation.Reason)
+			}
+			if d := act.Violation.Details; d["reason"] != "verdict_pending" || d["fallback"] != "deny" {
+				t.Errorf("refusal details = %v, want reason verdict_pending, fallback deny", d)
+			}
+			inv := lastInvocation(t, pctx)
+			if inv.Action != pipeline.ActionDeny || inv.Reason != "fallback_deny" {
+				t.Errorf("invocation = %s/%s, want deny/fallback_deny", inv.Action, inv.Reason)
+			}
+			if inv.Details["no_verdict"] != "verdict_pending" || inv.Details["exchange_id"] != exchangeID {
+				t.Errorf("details = %v, want no_verdict verdict_pending and the exchange", inv.Details)
+			}
+			if _, err := strconv.Atoi(inv.Details["waited_ms"]); err != nil {
+				t.Errorf("waited_ms = %q, want a number", inv.Details["waited_ms"])
+			}
+		})
+	}
+}
+
+// A verdict service that is not there (connection refused) is covered too:
+// fallback: allow delivers at once.
+func TestFallbackAllowCoversADeadService(t *testing.T) {
+	down := httptest.NewServer(http.NotFoundHandler())
+	url := down.URL
+	down.Close()
+	pctx := outbound("outside.example", stamped())
+	act := gate(t, `{"verdict_url":"`+url+`","fallback":"allow"}`).OnRequest(context.Background(), pctx)
+	if act.Type != pipeline.Continue {
+		t.Fatalf("action = %v, want Continue", act.Type)
+	}
+	inv := lastInvocation(t, pctx)
+	if inv.Reason != "fallback_allow" || inv.Details["no_verdict"] != "verdict_error" || inv.Details["error_kind"] != "transport" {
+		t.Errorf("invocation = %s %v, want fallback_allow, no_verdict verdict_error, error_kind transport", inv.Reason, inv.Details)
+	}
+	if ms, err := strconv.Atoi(inv.Details["waited_ms"]); err != nil || ms > 500 {
+		t.Errorf("waited_ms = %q, want a small number (nothing to wait for)", inv.Details["waited_ms"])
+	}
+}
+
+// A service that sends its headers and then stalls has not answered either: the body
+// read runs past wait_ms + 500 ms, recorded error_kind transport, and fallback: allow
+// delivers.
+func TestFallbackAllowCoversAStalledBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"state":`))
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	t.Cleanup(srv.Close)
+	pctx := outbound("outside.example", stamped())
+	act := gate(t, `{"verdict_url":"`+srv.URL+`","wait_ms":100,"fallback":"allow"}`).OnRequest(context.Background(), pctx)
+	if act.Type != pipeline.Continue {
+		t.Fatalf("action = %v, want Continue", act.Type)
+	}
+	inv := lastInvocation(t, pctx)
+	if inv.Reason != "fallback_allow" || inv.Details["no_verdict"] != "verdict_error" || inv.Details["error_kind"] != "transport" {
+		t.Errorf("invocation = %s %v, want fallback_allow, no_verdict verdict_error, error_kind transport", inv.Reason, inv.Details)
+	}
+}
+
+// A verdict service whose certificate the gate does not trust is a setup fault that
+// never clears: refused under verdict_error with error_kind tls, never the fallback's.
+func TestFallbackNeverCoversAnUntrustedCertificate(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"state":"pending"}`))
+	}))
+	t.Cleanup(srv.Close)
+	pctx := outbound("outside.example", stamped())
+	act := gate(t, `{"verdict_url":"`+srv.URL+`","fallback":"allow"}`).OnRequest(context.Background(), pctx)
 	if act.Type != pipeline.Reject {
 		t.Fatalf("action = %v, want Reject", act.Type)
 	}
-	if status, _, _ := act.Violation.Render(); status != http.StatusServiceUnavailable {
-		t.Errorf("status = %d, want 503", status)
+	inv := lastInvocation(t, pctx)
+	if inv.Reason != "verdict_error" || inv.Details["error_kind"] != "tls" || inv.Details["no_verdict"] != "" {
+		t.Errorf("invocation = %s %v, want verdict_error, error_kind tls, no no_verdict", inv.Reason, inv.Details)
 	}
-	if inv := lastInvocation(t, pctx); inv.Reason != "verdict_pending" {
-		t.Errorf("reason = %q, want verdict_pending", inv.Reason)
+}
+
+// The other TLS setup faults never clear either: a service that requires a client
+// certificate the gate does not send (a handshake alert) and a plain-HTTP service
+// addressed as https are refused under verdict_error with error_kind tls.
+func TestFallbackNeverCoversATLSSetupFault(t *testing.T) {
+	answer := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"state":"pending"}`))
+	})
+	wantsCert := httptest.NewUnstartedServer(answer)
+	wantsCert.TLS = &tls.Config{ClientAuth: tls.RequireAnyClientCert}
+	wantsCert.StartTLS()
+	t.Cleanup(wantsCert.Close)
+	plain := httptest.NewServer(answer)
+	t.Cleanup(plain.Close)
+	for name, tc := range map[string]struct {
+		url   string
+		roots *x509.CertPool
+	}{
+		"client certificate required": {wantsCert.URL, trusting(wantsCert)},
+		"plain HTTP at https":         {strings.Replace(plain.URL, "http://", "https://", 1), nil},
+	} {
+		t.Run(name, func(t *testing.T) {
+			g := gate(t, `{"verdict_url":"`+tc.url+`","fallback":"allow"}`)
+			g.transport.TLSClientConfig = &tls.Config{RootCAs: tc.roots}
+			pctx := outbound("outside.example", stamped())
+			if act := g.OnRequest(context.Background(), pctx); act.Type != pipeline.Reject {
+				t.Fatalf("action = %v, want Reject", act.Type)
+			}
+			inv := lastInvocation(t, pctx)
+			if inv.Reason != "verdict_error" || inv.Details["error_kind"] != "tls" || inv.Details["no_verdict"] != "" {
+				t.Errorf("invocation = %s %v, want verdict_error, error_kind tls, no no_verdict", inv.Reason, inv.Details)
+			}
+		})
+	}
+}
+
+func trusting(srv *httptest.Server) *x509.CertPool {
+	roots := x509.NewCertPool()
+	roots.AddCert(srv.Certificate())
+	return roots
+}
+
+// Under fallback: allow a fault is still refused under its own reason, never as a
+// fallback: a wrong path, a wrong secret, an answer that is not a verdict, an unjudged
+// answer, a request lineage did not stamp.
+func TestFallbackNeverCoversAFault(t *testing.T) {
+	answer := func(status int, body string) string {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(status)
+			fmt.Fprint(w, body)
+		}))
+		t.Cleanup(srv.Close)
+		return srv.URL
+	}
+	notFound := answer(http.StatusNotFound, "404 page not found")
+	for _, tc := range []struct {
+		name, url, reason string
+		lineage           bool
+	}{
+		{"404", notFound, "verdict_error", true},
+		{"401", answer(http.StatusUnauthorized, `{"error":"unauthorized"}`), "verdict_unauthorized", true},
+		{"not json", answer(http.StatusOK, `<html>hello</html>`), "verdict_error", true},
+		{"unjudged", answer(http.StatusOK, `{"state":"unjudged","verdict":"","reason":"body_truncated"}`), "verdict_empty", true},
+		{"no lineage stamp", notFound, "no_lineage_stamp", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pctx := &pipeline.Context{Direction: pipeline.Outbound, Host: "outside.example", Headers: stamped()}
+			if tc.lineage {
+				lineageStamped(pctx)
+			}
+			act := gate(t, `{"verdict_url":"`+tc.url+`","fallback":"allow"}`).OnRequest(context.Background(), pctx)
+			if act.Type != pipeline.Reject {
+				t.Fatalf("action = %v, want Reject", act.Type)
+			}
+			inv := lastInvocation(t, pctx)
+			if inv.Action != pipeline.ActionDeny || inv.Reason != tc.reason {
+				t.Errorf("invocation = %s/%s, want deny/%s", inv.Action, inv.Reason, tc.reason)
+			}
+			if _, ok := inv.Details["no_verdict"]; ok {
+				t.Errorf("details = %v: a fault recorded as a fallback", inv.Details)
+			}
+		})
+	}
+}
+
+// No fallback key is deny; anything but deny or allow, in any spelling, is refused
+// at load.
+func TestFallbackConfig(t *testing.T) {
+	if g := gate(t, `{"verdict_url":"http://x"}`); g.cfg.Fallback != "deny" {
+		t.Errorf("default fallback = %q, want deny", g.cfg.Fallback)
+	}
+	for _, v := range []string{`"Allow"`, `"open"`, `"DENY"`, `""`, `true`} {
+		err := New().Configure(json.RawMessage(`{"verdict_url":"http://x","fallback":` + v + `}`))
+		if err == nil {
+			t.Errorf("fallback %s accepted", v)
+		}
 	}
 }
 
@@ -426,9 +628,9 @@ func TestClientGoneDuringTheHoldIsNotAVerdictError(t *testing.T) {
 	}
 }
 
-// A verdict service that is down, slow past the budget, or answering garbage
-// is the same unknown — never a silent allow.
-func TestVerdictFailuresAreUnknown(t *testing.T) {
+// A verdict service that is down, slow past the budget, or failing with a 5xx
+// gets the default fallback, deny — never a silent allow.
+func TestSlowOrDeadServiceGetsTheDefaultFallback(t *testing.T) {
 	slow, _, _ := verdictServer(t, 2*time.Second, `{"state":"decided","verdict":"allow"}`)
 	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "boom", http.StatusInternalServerError)
@@ -450,8 +652,8 @@ func TestVerdictFailuresAreUnknown(t *testing.T) {
 			if act.Type != pipeline.Reject {
 				t.Fatalf("action = %v, want Reject", act.Type)
 			}
-			if inv := lastInvocation(t, pctx); inv.Reason != "verdict_error" {
-				t.Errorf("reason = %q, want verdict_error", inv.Reason)
+			if inv := lastInvocation(t, pctx); inv.Reason != "fallback_deny" || inv.Details["no_verdict"] != "verdict_error" {
+				t.Errorf("record = %s %v, want fallback_deny, no_verdict verdict_error", inv.Reason, inv.Details)
 			}
 			if name == "slow" && time.Since(start) > time.Second {
 				t.Errorf("held %v, want about wait_ms + grace", time.Since(start))
@@ -665,56 +867,80 @@ func TestSecretNeverRecordedOrEchoed(t *testing.T) {
 }
 
 // Each answer of the verdict service maps to one fact: a refusal of the
-// caller, a full waiter cap, and a decided record with no verdict are unknowns
+// caller, a full waiter cap, and a decided record with no verdict are causes
 // of their own, distinguishable in the record; anything else that is not a
-// decided verdict is verdict_error. None is an allow.
+// decided verdict is verdict_error. A slow or dead service (covered) is the
+// fallback's: deny records fallback_deny and allow fallback_allow, each naming the
+// cause. Every other answer is refused under its cause, whatever the fallback.
 func TestAnswerMapping(t *testing.T) {
 	for _, tc := range []struct {
-		name   string
-		status int
-		body   string
-		reason string
+		name    string
+		status  int
+		body    string
+		reason  string
+		covered bool
 	}{
-		{"401", http.StatusUnauthorized, `{"error":"unauthorized"}`, "verdict_unauthorized"},
-		{"503 busy", http.StatusServiceUnavailable, `{"error":"verdict_busy"}`, "verdict_busy"},
-		{"503 other", http.StatusServiceUnavailable, `{"error":"db down"}`, "verdict_error"},
-		{"400", http.StatusBadRequest, `{"error":"wait_ms_too_large","max":3000}`, "verdict_error"},
-		{"302", http.StatusFound, ``, "verdict_error"},
-		{"decided empty", http.StatusOK, `{"state":"decided","verdict":""}`, "verdict_empty"},
-		{"decided blank", http.StatusOK, `{"state":"decided","verdict":"  "}`, "verdict_empty"},
-		{"unknown state", http.StatusOK, `{"state":"thinking"}`, "verdict_error"},
-		{"no state", http.StatusOK, `{}`, "verdict_error"},
-		{"pending", http.StatusOK, `{"state":"pending","waited_ms":3000}`, "verdict_pending"},
-		{"unjudged allow", http.StatusOK, `{"state":"unjudged","verdict":"allow","reason":"body_not_captured"}`, "verdict_unjudged"},
-		{"unjudged truncated", http.StatusOK, `{"state":"unjudged","verdict":"allow","reason":"body_truncated"}`, "verdict_unjudged"},
-		{"unjudged empty", http.StatusOK, `{"state":"unjudged","verdict":""}`, "verdict_empty"},
+		{"401", http.StatusUnauthorized, `{"error":"unauthorized"}`, "verdict_unauthorized", false},
+		{"503 busy", http.StatusServiceUnavailable, `{"error":"verdict_busy"}`, "verdict_busy", true},
+		{"503 other", http.StatusServiceUnavailable, `{"error":"db down"}`, "verdict_error", true},
+		{"500", http.StatusInternalServerError, `boom`, "verdict_error", true},
+		{"400", http.StatusBadRequest, `{"error":"wait_ms_too_large","max":3000}`, "verdict_error", false},
+		{"404", http.StatusNotFound, `404 page not found`, "verdict_error", false},
+		{"302", http.StatusFound, ``, "verdict_error", false},
+		{"decided empty", http.StatusOK, `{"state":"decided","verdict":""}`, "verdict_empty", true},
+		{"decided blank", http.StatusOK, `{"state":"decided","verdict":"  "}`, "verdict_empty", true},
+		{"unknown state", http.StatusOK, `{"state":"thinking"}`, "verdict_error", false},
+		{"no state", http.StatusOK, `{}`, "verdict_error", false},
+		{"not json", http.StatusOK, `<html>hello</html>`, "verdict_error", false},
+		{"pending", http.StatusOK, `{"state":"pending","waited_ms":3000}`, "verdict_pending", true},
+		{"unjudged allow", http.StatusOK, `{"state":"unjudged","verdict":"allow","reason":"body_not_captured"}`, "verdict_unjudged", false},
+		{"unjudged truncated", http.StatusOK, `{"state":"unjudged","verdict":"allow","reason":"body_truncated"}`, "verdict_unjudged", false},
+		{"unjudged empty", http.StatusOK, `{"state":"unjudged","verdict":""}`, "verdict_empty", false},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				if tc.status == http.StatusFound {
-					w.Header().Set("Location", "http://elsewhere.example/")
-				}
-				w.WriteHeader(tc.status)
-				fmt.Fprint(w, tc.body)
-			}))
-			t.Cleanup(srv.Close)
+		for _, fallback := range []string{"deny", "allow"} {
+			t.Run(tc.name+"/"+fallback, func(t *testing.T) {
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					if tc.status == http.StatusFound {
+						w.Header().Set("Location", "http://elsewhere.example/")
+					}
+					w.WriteHeader(tc.status)
+					fmt.Fprint(w, tc.body)
+				}))
+				t.Cleanup(srv.Close)
 
-			pctx := outbound("outside.example", stamped())
-			act := gate(t, `{"verdict_url":"`+srv.URL+`"}`).OnRequest(context.Background(), pctx)
-			if act.Type != pipeline.Reject {
-				t.Fatalf("action = %v, want Reject", act.Type)
-			}
-			if status, _, _ := act.Violation.Render(); status != http.StatusServiceUnavailable {
-				t.Errorf("status = %d, want 503 (nothing was judged)", status)
-			}
-			inv := lastInvocation(t, pctx)
-			if inv.Action != pipeline.ActionDeny || inv.Reason != tc.reason {
-				t.Errorf("invocation = %s/%s, want deny/%s", inv.Action, inv.Reason, tc.reason)
-			}
-			if tc.status != http.StatusOK && inv.Reason == "verdict_error" && inv.Details["status"] != strconv.Itoa(tc.status) {
-				t.Errorf("details = %v, want status %d", inv.Details, tc.status)
-			}
-		})
+				pctx := outbound("outside.example", stamped())
+				act := gate(t, `{"verdict_url":"`+srv.URL+`","fallback":"`+fallback+`"}`).OnRequest(context.Background(), pctx)
+				inv := lastInvocation(t, pctx)
+				wantAction, wantReason := pipeline.ActionDeny, tc.reason
+				if tc.covered {
+					wantAction, wantReason = pipeline.ActionDeny, "fallback_deny"
+					if fallback == "allow" {
+						wantAction, wantReason = pipeline.ActionAllow, "fallback_allow"
+					}
+					if inv.Details["no_verdict"] != tc.reason {
+						t.Errorf("no_verdict = %q, want %s", inv.Details["no_verdict"], tc.reason)
+					}
+				}
+				if inv.Action != wantAction || inv.Reason != wantReason {
+					t.Errorf("invocation = %s/%s, want %s/%s", inv.Action, inv.Reason, wantAction, wantReason)
+				}
+				if wantAction == pipeline.ActionAllow {
+					if act.Type != pipeline.Continue {
+						t.Errorf("action = %v, want Continue", act.Type)
+					}
+					return
+				}
+				if act.Type != pipeline.Reject {
+					t.Fatalf("action = %v, want Reject", act.Type)
+				}
+				if status, _, _ := act.Violation.Render(); status != http.StatusServiceUnavailable {
+					t.Errorf("status = %d, want 503 (nothing was judged)", status)
+				}
+				if tc.status != http.StatusOK && tc.reason == "verdict_error" && inv.Details["status"] != strconv.Itoa(tc.status) {
+					t.Errorf("details = %v, want status %d", inv.Details, tc.status)
+				}
+			})
+		}
 	}
 }
 
@@ -852,11 +1078,20 @@ func TestRefusalIsOneMessage(t *testing.T) {
 			wantRecord: map[string]string{"unread": "body_truncated", "labels": "a"},
 		},
 		{
-			name:       "pending",
+			name:       "pending, refused by the fallback",
 			answer:     `{"state":"pending","exchange_id":"e","waited_ms":2000}`,
 			wantStatus: http.StatusServiceUnavailable, wantCode: "policy.verdict-unavailable",
-			wantMsg: opening + " No verdict was given, so nothing was judged and nothing is flagged.",
-			want:    map[string]any{"reason": "verdict_pending", "exchange_id": exchangeID},
+			wantMsg:    opening + " No verdict arrived, so nothing was judged and nothing is flagged.",
+			want:       map[string]any{"reason": "verdict_pending", "fallback": "deny", "exchange_id": exchangeID},
+			wantRecord: map[string]string{"no_verdict": "verdict_pending", "exchange_id": exchangeID},
+		},
+		{
+			name:       "an answer that is not a verdict, a fault",
+			answer:     `{"state":"thinking"}`,
+			wantStatus: http.StatusServiceUnavailable, wantCode: "policy.verdict-unavailable",
+			wantMsg:    opening + " No verdict was given, so nothing was judged and nothing is flagged.",
+			want:       map[string]any{"reason": "verdict_error", "exchange_id": exchangeID},
+			wantRecord: map[string]string{"error_kind": "answer", "exchange_id": exchangeID},
 		},
 		{
 			name:       "malformed rules, labels and text: the block stands",
@@ -1094,7 +1329,7 @@ func TestRefusalLeavesServiceErrorsInTheRecord(t *testing.T) {
 		t.Errorf("the refusal leaks the call: %s", raw)
 	}
 	inv := lastInvocation(t, pctx)
-	if inv.Reason != "verdict_error" || !strings.Contains(inv.Details["error"], strings.TrimPrefix(url, "http://")) {
+	if inv.Details["no_verdict"] != "verdict_error" || !strings.Contains(inv.Details["error"], strings.TrimPrefix(url, "http://")) {
 		t.Errorf("the record lost the error: %v", inv)
 	}
 	var body struct{ Details map[string]any }
