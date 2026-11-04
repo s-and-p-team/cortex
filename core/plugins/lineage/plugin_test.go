@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"maps"
 	"math/big"
+	"net"
 	"net/http"
 	"os"
 	"reflect"
@@ -29,6 +30,7 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace"
+	"google.golang.org/grpc"
 
 	"github.com/rossoctl/cortex/core/bypass"
 	"github.com/rossoctl/cortex/core/pipeline"
@@ -1184,6 +1186,107 @@ func TestConfig_MaxAttrBytes(t *testing.T) {
 	}
 }
 
+func TestConfig_ExportDelayMS(t *testing.T) {
+	cases := []struct {
+		raw     string
+		want    int
+		wantErr bool
+	}{
+		{raw: `{}`, want: 0},
+		{raw: `{"export_delay_ms": 0}`, want: 0},
+		{raw: `{"export_delay_ms": 100}`, want: 100},
+		{raw: `{"export_delay_ms": -1}`, wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.raw, func(t *testing.T) {
+			cfg, err := decodeConfig([]byte(tc.raw))
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("accepted a negative delay")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if cfg.ExportDelayMS != tc.want {
+				t.Fatalf("export_delay_ms = %d, want %d", cfg.ExportDelayMS, tc.want)
+			}
+		})
+	}
+}
+
+// export_delay_ms reaches the batch processor: with a short delay a recorded
+// exchange is exported on its own, no ForceFlush, well inside the SDK's 5 s
+// default — the property a reader that waits on the record depends on.
+func TestExportDelayExportsWithoutFlush(t *testing.T) {
+	exp := tracetest.NewInMemoryExporter()
+	tp := newTracerProvider(exp, resource.Empty(), 20*time.Millisecond)
+	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
+	p := NewLineageTelemetry()
+	p.cfg = defaultConfig()
+	p.bypassPaths, _ = bypass.NewMatcher(p.cfg.BypassPaths)
+	p.tp = tp
+	p.tracer = tp.Tracer("test")
+	p.selfID = "weather-service"
+	p.ready.Store(true)
+
+	run(t, p, fakeContext(pipeline.Outbound, http.Header{}), allow(200))
+	deadline := time.Now().Add(2 * time.Second)
+	for len(exp.GetSpans()) < 2 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := len(exp.GetSpans()); got != 2 {
+		t.Fatalf("exported %d spans within 2s at a 20ms delay, want 2", got)
+	}
+}
+
+// The same property through decode and Init: the configured export_delay_ms
+// reaches the batch processor Init builds, so a span arrives at the collector
+// on its own, long before the SDK's 5 s default. The collector is a bare gRPC
+// server that notes each call; the answer does not matter.
+func TestExportDelay_ThroughDecodeAndInit(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := make(chan string, 16)
+	srv := grpc.NewServer(grpc.UnknownServiceHandler(func(_ any, stream grpc.ServerStream) error {
+		m, _ := grpc.MethodFromServerStream(stream)
+		select {
+		case calls <- m:
+		default:
+		}
+		return nil
+	}))
+	go func() { _ = srv.Serve(lis) }()
+	t.Cleanup(srv.Stop)
+
+	p := NewLineageTelemetry()
+	raw := `{"otel_endpoint":"` + lis.Addr().String() + `","self_id":"weather-service","namespace":"team1","export_delay_ms":20}`
+	if err := p.Configure([]byte(raw)); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	if err := p.Init(context.Background()); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = p.Shutdown(ctx)
+	})
+
+	run(t, p, fakeContext(pipeline.Outbound, http.Header{}), allow(200))
+	select {
+	case m := <-calls:
+		if want := "/opentelemetry.proto.collector.trace.v1.TraceService/Export"; m != want {
+			t.Fatalf("collector call %q, want %q", m, want)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no export within 2s at export_delay_ms 20: the configured delay did not reach the batch processor")
+	}
+}
+
 // A valid traceparent with the sampled-out flag (…-00) must not suppress the
 // exchange: lineage is an audit record, and a caller-chosen flag is not an
 // opt-out from being graphed. Built on the provider Init installs — the
@@ -1191,7 +1294,7 @@ func TestConfig_MaxAttrBytes(t *testing.T) {
 // on the SDK default instead.
 func TestSampledOutParentStillExports(t *testing.T) {
 	exp := tracetest.NewInMemoryExporter()
-	tp := newTracerProvider(exp, resource.Empty())
+	tp := newTracerProvider(exp, resource.Empty(), 0)
 	p := NewLineageTelemetry()
 	p.cfg = defaultConfig()
 	p.bypassPaths, _ = bypass.NewMatcher(p.cfg.BypassPaths)

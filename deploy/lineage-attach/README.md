@@ -286,6 +286,7 @@ The generated ConfigMap's plugin entry:
     self_id: "<deploy>"   # ALWAYS set (SELF_ID, default: the Deployment name) — see below
     namespace: "<ns>"     # ALWAYS set (NAMESPACE): the plugin refuses to start without it
     # max_payload_bytes: 4096 — the plugin's default cap on a captured value (MAX_PAYLOAD_BYTES)
+    # export_delay_ms: 5000 — the SDK's default, the longest a span waits before it is sent (EXPORT_DELAY_MS)
 ```
 
 `namespace` is the pod's Kubernetes namespace and rides on every span as
@@ -306,7 +307,7 @@ a port out of the iptables redirect: an app's own telemetry export port, or a
 sidecar can and cannot see"). Never exclude LLM, tool, peer or S3 ports.
 `NO_EMIT=1` keeps the sidecar as a pure proxy — a clean A/B baseline.
 Script knobs: `NAME`/`DEPLOY`, `NAMESPACE` (default `team1`), `SELF_ID`, `OTEL_ENDPOINT`,
-`CAPTURE_IO`, `MAX_PAYLOAD_BYTES`, `APP_CONTAINER`, `APP_IMAGE`, `OUTBOUND_PORTS_EXCLUDE`, `SIDECAR_IMAGE`,
+`CAPTURE_IO`, `MAX_PAYLOAD_BYTES`, `EXPORT_DELAY_MS`, `APP_CONTAINER`, `APP_IMAGE`, `OUTBOUND_PORTS_EXCLUDE`, `SIDECAR_IMAGE`,
 `PROXY_INIT_IMAGE`, `NO_EMIT`, `EMIT`; each script's header documents its own.
 
 ---

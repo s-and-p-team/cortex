@@ -71,6 +71,9 @@
 #                   PII-bearing, credentials included: opt in.
 #   MAX_PAYLOAD_BYTES  cap on a captured value (plugin default 4096 when unset;
 #                   -1 = attach whole). Only meaningful with CAPTURE_IO=true.
+#   EXPORT_DELAY_MS the longest a span waits before it is sent (plugin default,
+#                   the SDK's 5000 ms, when unset). Set it low for a consumer
+#                   that reads the record while the exchange is in flight.
 #   OUTBOUND_PORTS_EXCLUDE  ports proxy-init must not intercept — an app's OWN
 #                   telemetry export port (e.g. 4317), or a plaintext non-HTTP
 #                   store (Postgres 5432, SMTP 1025: the outbound HTTP codec
@@ -181,6 +184,9 @@ parse_inputs() {
     esac
   fi
   MAX_PAYLOAD_BYTES="${MAX_PAYLOAD_BYTES:-}"
+  EXPORT_DELAY_MS="${EXPORT_DELAY_MS:-}"
+  [[ "$EXPORT_DELAY_MS" =~ ^([1-9][0-9]*)?$ ]] \
+    || { echo "error: EXPORT_DELAY_MS must be a positive integer (got '$EXPORT_DELAY_MS')" >&2; exit 2; }
   [[ "$MAX_PAYLOAD_BYTES" =~ ^(-1|[1-9][0-9]*)?$ ]] \
     || { echo "error: MAX_PAYLOAD_BYTES must be a positive integer or -1 (got '$MAX_PAYLOAD_BYTES')" >&2; exit 2; }
   # Published images by default; point at local tags when building from source.
@@ -258,6 +264,8 @@ build_plugin_entry() {
     # The plugin's own default applies when unset; an explicit value is emitted.
     [ -z "$MAX_PAYLOAD_BYTES" ] || lineage_plugin="${lineage_plugin}
               max_payload_bytes: ${MAX_PAYLOAD_BYTES}"
+    [ -z "$EXPORT_DELAY_MS" ] || lineage_plugin="${lineage_plugin}
+              export_delay_ms: ${EXPORT_DELAY_MS}"
   fi
 }
 

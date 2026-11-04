@@ -197,6 +197,18 @@ type Config struct {
 	// poller: an absent file is a wrong path or a missing mount, and refuses
 	// at start like an empty value. Ignored when Namespace is set.
 	NamespaceFile string `json:"namespace_file" description:"Read when namespace is empty, once at start (e.g. /var/run/secrets/kubernetes.io/serviceaccount/namespace); absent, blank or not a DNS label refuses at start."`
+
+	// ExportDelayMS is the longest a recorded span waits in the batch exporter
+	// before it is sent — the batch span processor's schedule delay. Zero (or
+	// unset) keeps the SDK's own default, 5000 ms, which is right for a
+	// consumer that reads the record later. A consumer that answers questions
+	// about an exchange while it is still in flight (a gate holding an egress
+	// request until the record's reader has a verdict on it) cannot wait that
+	// long: measured on a live cluster, the default put 3 s (p50) to 5 s (max)
+	// between a span's emission and its arrival, before any reading began. A
+	// short delay costs more, smaller export calls and nothing else; the spans
+	// and their facts are identical. Negative is refused at decode.
+	ExportDelayMS int `json:"export_delay_ms" description:"Longest a span waits in the batch exporter before it is sent; 0 or unset keeps the SDK default (5000 ms)."`
 }
 
 func defaultConfig() Config {
@@ -245,6 +257,9 @@ func decodeConfig(raw json.RawMessage) (Config, error) {
 	}
 	if cfg.MaxAttrBytes < unboundedPayload {
 		return Config{}, fmt.Errorf("lineage-telemetry config: max_attr_bytes %d is invalid; use -1 to remove the cap or a positive byte cap", cfg.MaxAttrBytes)
+	}
+	if cfg.ExportDelayMS < 0 {
+		return Config{}, fmt.Errorf("lineage-telemetry config: export_delay_ms %d is invalid; use 0 for the SDK default or a positive delay", cfg.ExportDelayMS)
 	}
 	// gRPC NewClient expects host:port only, so reduce a URL form (e.g.
 	// http://collector:4317/v1/traces) to its host — TrimPrefix left any path

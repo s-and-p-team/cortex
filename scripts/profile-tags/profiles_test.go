@@ -34,7 +34,7 @@ func TestTags_ReproduceTodaysDefaults(t *testing.T) {
 		want    []string
 	}{
 		{"full", []string{
-			"a2aparser", "ibac", "inferenceparser", "inferencerouter", "jwtvalidation", "lineage",
+			"a2aparser", "sentrygate", "ibac", "inferenceparser", "inferencerouter", "jwtvalidation", "lineage",
 			"litellm_budgettrack", "mcpparser", "opa", "script", "sparc", "staticinject",
 			"tokenbroker", "tokenexchange", "tokenexchangeaiac", "toolprune",
 		}},
@@ -50,7 +50,7 @@ func TestTags_ReproduceTodaysDefaults(t *testing.T) {
 			"mcpparser", "sparc", "tokenbroker", "tokenexchange", "tokenexchangeaiac",
 		}},
 		{"fullcpex", []string{
-			"a2aparser", "cpex", "ibac", "inferenceparser", "inferencerouter", "jwtvalidation",
+			"a2aparser", "cpex", "sentrygate", "ibac", "inferenceparser", "inferencerouter", "jwtvalidation",
 			"lineage", "litellm_budgettrack", "mcpparser", "opa", "script", "sparc", "staticinject",
 			"tokenbroker", "tokenexchange", "tokenexchangeaiac", "toolprune",
 		}},

@@ -60,6 +60,7 @@ import (
 	"net"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -375,7 +376,8 @@ func (p *LineageTelemetry) Init(ctx context.Context) error {
 		res = resource.Default()
 	}
 
-	p.tp = newTracerProvider(&exportObserver{SpanExporter: exporter, failures: &p.exportFailures}, res)
+	p.tp = newTracerProvider(&exportObserver{SpanExporter: exporter, failures: &p.exportFailures}, res,
+		time.Duration(p.cfg.ExportDelayMS)*time.Millisecond)
 	p.tracer = p.tp.Tracer("authbridge/" + pluginName)
 
 	if pending != "" {
@@ -466,9 +468,16 @@ func hasIdentity(id string) bool { return strings.Trim(id, "/") != "" }
 // The forwarded traceparent keeps the caller's flags (a valid one is never
 // modified); only what this producer exports ignores them. An explicit
 // sampler also means OTEL_TRACES_SAMPLER no longer overrides it.
-func newTracerProvider(exporter sdktrace.SpanExporter, res *resource.Resource) *sdktrace.TracerProvider {
+//
+// exportDelay is the batch processor's schedule delay (export_delay_ms); zero
+// leaves the SDK default in place, OTEL_BSP_SCHEDULE_DELAY included.
+func newTracerProvider(exporter sdktrace.SpanExporter, res *resource.Resource, exportDelay time.Duration) *sdktrace.TracerProvider {
+	var batch []sdktrace.BatchSpanProcessorOption
+	if exportDelay > 0 {
+		batch = append(batch, sdktrace.WithBatchTimeout(exportDelay))
+	}
 	return sdktrace.NewTracerProvider(
-		sdktrace.WithBatcher(exporter),
+		sdktrace.WithBatcher(exporter, batch...),
 		sdktrace.WithResource(res),
 		sdktrace.WithSampler(sdktrace.AlwaysSample()),
 	)
@@ -645,8 +654,16 @@ func (p *LineageTelemetry) OnRequest(ctx context.Context, pctx *pipeline.Context
 	// stamp (and any minted traceparent under it) is a header rewrite; when
 	// nothing was written — pure-observer config, or a refused Insert — the
 	// exchange was only recorded.
+	// capture_io travels with the record because a body's absence from the span
+	// means something only beside it: a gate later in this chain tells "capture
+	// is off" from "this body could not be captured" by reading it here, from the
+	// config that emitted this exchange's span, which a reload cannot separate.
 	if stamped {
-		pctx.Modify("stamped_tracestate")
+		pctx.Record(pipeline.Invocation{
+			Action:  pipeline.ActionModify,
+			Reason:  "stamped_tracestate",
+			Details: map[string]string{"capture_io": strconv.FormatBool(p.cfg.CaptureIO)},
+		})
 	} else {
 		pctx.Observe("recorded_request")
 	}
