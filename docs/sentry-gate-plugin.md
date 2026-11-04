@@ -99,7 +99,9 @@ faults, or a verdict about the request, and `allow` does not deliver them. The r
 `no_verdict` (the cause: `verdict_pending`, `verdict_busy`, `verdict_empty` or
 `verdict_error`), `exchange_id`, `waited_ms`, the cause's `status`, `error` and
 `error_kind` where it has them, `fail_mode_destination` when a row decided and `fail_mode_source` when a
-[slice](#slices-by-source) did. `allow` trades fail-closed for availability: while the
+[slice](#slices-by-source) did. Every record of a request that got no verdict (a fallback,
+a marked body, a fault) carries `fail_mode_revision` when the config sets it, so the record
+names the document that decided it; the refusal details do not. `allow` trades fail-closed for availability: while the
 service is slow, down or at its waiter cap, unlisted egress leaves unjudged, and only the record says so.
 
 A body that could not be judged whole is never the fallback's. With `capture_io` on,
@@ -220,5 +222,6 @@ that text can carry the internal URL, so a refusal never does.
 | `fallback` | string | `deny` | What a request gets when no verdict arrives from a slow or dead service ([the fallback](#the-fallback)): `deny` refuses it with a 503, `allow` delivers it unjudged. Any other value is refused. |
 | `fail_mode` | list | `[]` | Rows `{destination, wait_ms?, fallback?}` that set `wait_ms` and `fallback` for one host ([rows by destination](#rows-by-destination)). |
 | `sources` | map | `{}` | Slices `{wait_ms?, fallback?, fail_mode?}` by source workload, `lineage-telemetry`'s `self_id`, for that source's requests ([slices by source](#slices-by-source)). |
+| `fail_mode_revision` | string | `""` | The sha256 of the document `fail_mode` and `sources` were written from, 64 lowercase hex characters, written into every record of a request that got no verdict ([the fallback](#the-fallback)). Any other non-empty value is refused; empty writes nothing. |
 | `verdict_secret` | string | `""` | Sent as `Authorization: Bearer <secret>` on every verdict call. Masked in config echoes by its key name, never logged or recorded. |
 | `verdict_secret_file` | string | `""` | File holding the secret (a mounted Secret), read at configure, so a rotated secret is refused `verdict_unauthorized` until the config reloads. Exclusive with `verdict_secret`. |

@@ -732,6 +732,80 @@ func TestSourcesConfig(t *testing.T) {
 	}
 }
 
+const failModeRevision = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+
+// With fail_mode_revision set, every record of a request that got no verdict
+// carries it: fallback_allow, fallback_deny, a marked body and a fault. The refusal
+// details do not, and without the key, or with it empty, no record has it.
+func TestFailModeRevisionInEveryNoVerdictRecord(t *testing.T) {
+	srv, _, _ := verdictServer(t, 0, `{"state":"pending"}`)
+	withLineage := func(details map[string]string) *pipeline.Context {
+		pctx := &pipeline.Context{Direction: pipeline.Outbound, Host: "outside.example", Headers: stamped()}
+		pctx.Record(pipeline.Invocation{Plugin: "lineage-telemetry", Phase: pipeline.InvocationPhaseRequest,
+			Action: pipeline.ActionModify, Reason: "stamped_tracestate", Details: details})
+		return pctx
+	}
+	cases := []struct {
+		name, fallback, reason string
+		pctx                   func() *pipeline.Context
+	}{
+		{"fallback allow", "allow", "fallback_allow", func() *pipeline.Context { return withLineage(nil) }},
+		{"fallback deny", "deny", "fallback_deny", func() *pipeline.Context { return withLineage(nil) }},
+		{"marked body", "allow", "verdict_pending", func() *pipeline.Context { return withLineage(map[string]string{"body_cut": "true"}) }},
+		{"fault", "allow", "no_lineage_stamp", func() *pipeline.Context {
+			return &pipeline.Context{Direction: pipeline.Outbound, Host: "outside.example", Headers: stamped()}
+		}},
+	}
+	for key, rev := range map[string]string{
+		`,"fail_mode_revision":"` + failModeRevision + `"`: failModeRevision,
+		`,"fail_mode_revision":""`:                         "",
+		``:                                                 "",
+	} {
+		for _, tc := range cases {
+			pctx := tc.pctx()
+			act := gate(t, `{"verdict_url":"`+srv.URL+`","fallback":"`+tc.fallback+`"`+key+`}`).OnRequest(context.Background(), pctx)
+			inv := lastInvocation(t, pctx)
+			if inv.Reason != tc.reason {
+				t.Fatalf("%s: record %s %v, want %s", tc.name, inv.Reason, inv.Details, tc.reason)
+			}
+			if got, ok := inv.Details["fail_mode_revision"]; got != rev || ok != (rev != "") {
+				t.Errorf("%s, revision %q: record %v, want fail_mode_revision %q", tc.name, rev, inv.Details, rev)
+			}
+			if act.Violation != nil {
+				if _, ok := act.Violation.Details["fail_mode_revision"]; ok {
+					t.Errorf("%s: refusal details %v carry the revision", tc.name, act.Violation.Details)
+				}
+			}
+		}
+	}
+}
+
+// Fail_mode_revision is a sha256 in lowercase hex or nothing: anything else
+// refuses the config at load, and empty is the key left out.
+func TestFailModeRevisionConfig(t *testing.T) {
+	for name, rev := range map[string]string{
+		"63 chars":  failModeRevision[:63],
+		"65 chars":  failModeRevision + "0",
+		"uppercase": strings.ToUpper(failModeRevision),
+		"not hex":   "g" + failModeRevision[1:],
+		"a space":   " " + failModeRevision[1:],
+	} {
+		if err := New().Configure(json.RawMessage(`{"verdict_url":"http://x","fail_mode_revision":"` + rev + `"}`)); err == nil {
+			t.Errorf("%s: accepted %q", name, rev)
+		} else if !strings.Contains(err.Error(), "fail_mode_revision") {
+			t.Errorf("%s: error %v, want one naming fail_mode_revision", name, err)
+		}
+	}
+	for _, raw := range []string{
+		`{"verdict_url":"http://x","fail_mode_revision":""}`,
+		`{"verdict_url":"http://x","fail_mode_revision":"` + failModeRevision + `"}`,
+	} {
+		if err := New().Configure(json.RawMessage(raw)); err != nil {
+			t.Errorf("refused %s: %v", raw, err)
+		}
+	}
+}
+
 // A record that did not see the whole body has no answer about the rest of it,
 // unless what it did see is already refused.
 func TestUnjudgedRefusesAndADenyStillDenies(t *testing.T) {

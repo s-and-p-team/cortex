@@ -161,6 +161,7 @@ var (
 	protocolVersion = regexp.MustCompile(`^"[0-9]{4}-[0-9]{2}-[0-9]{2}"$`)
 	clientName      = regexp.MustCompile(`^"[A-Za-z0-9._-]{1,32}"$`)
 	clientVersion   = regexp.MustCompile(`^"[A-Za-z0-9._-]{1,16}"$`)
+	revision        = regexp.MustCompile(`^[0-9a-f]{64}$`)
 )
 
 func init() {
@@ -184,6 +185,8 @@ type Config struct {
 	Sources  map[string]Slice `json:"sources" description:"Slices by source workload (lineage's self_id), each {wait_ms?, fallback?, fail_mode?} for its requests; a default left out is the top-level key."`
 	unnamed  failSlice
 	sources  map[string]failSlice
+	// The document the two were written from, by its sha256.
+	FailModeRevision string `json:"fail_mode_revision" description:"sha256 (64 lowercase hex) of the document fail_mode and sources were written from, recorded with every request that got no verdict."`
 }
 
 func defaultConfig() Config {
@@ -220,6 +223,9 @@ func decodeConfig(raw json.RawMessage) (Config, error) {
 	}
 	if err = decodeSlices(&cfg); err != nil {
 		return Config{}, err
+	}
+	if cfg.FailModeRevision != "" && !revision.MatchString(cfg.FailModeRevision) {
+		return Config{}, fmt.Errorf("sentry-gate config: fail_mode_revision %q must be a sha256, 64 lowercase hex characters", cfg.FailModeRevision)
 	}
 	if len(cfg.DenyOn) == 0 {
 		return Config{}, errors.New("sentry-gate config: deny_on is empty, so no verdict could ever reject; remove the plugin instead")
@@ -578,7 +584,7 @@ func slowOrDead(reason string, v verdict, extra map[string]string) bool {
 // fault refuses a request the gate got no verdict for because something is set up or
 // answering wrong, whatever the fallback. A 503 rather than a 403: nothing was judged.
 func (g *Gate) fault(pctx *pipeline.Context, reason, exchangeID string, waited time.Duration, extra map[string]string) pipeline.Action {
-	details, refusal := noVerdict(reason, exchangeID, waited, extra)
+	details, refusal := g.noVerdict(reason, exchangeID, waited, extra)
 	pctx.Record(pipeline.Invocation{Action: pipeline.ActionDeny, Reason: reason, Details: details})
 	return refuse(pctx, "policy.verdict-unavailable", http.StatusServiceUnavailable,
 		refusalMessage(pctx.Host, " No verdict was given, so nothing was judged and nothing is flagged.", nil, ""), refusal)
@@ -588,7 +594,7 @@ func (g *Gate) fault(pctx *pipeline.Context, reason, exchangeID string, waited t
 // verdict for, the row's or the default, recorded as the setting's outcome with the
 // cause: allow delivers it unjudged, deny refuses it with a 503.
 func (g *Gate) fallback(pctx *pipeline.Context, row failRow, cause, exchangeID string, waited time.Duration, extra map[string]string) pipeline.Action {
-	details, refusal := noVerdict(cause, exchangeID, waited, extra)
+	details, refusal := g.noVerdict(cause, exchangeID, waited, extra)
 	details["no_verdict"] = cause
 	if row.destination != "" {
 		details["fail_mode_destination"], refusal["fail_mode_destination"] = row.destination, row.destination
@@ -610,7 +616,7 @@ func (g *Gate) fallback(pctx *pipeline.Context, row failRow, cause, exchangeID s
 // verdict for whose body lineage marked as cut (body_cut) or not captured
 // (body_not_captured): the verdict would have said unjudged. Recorded under its cause.
 func (g *Gate) markedBody(pctx *pipeline.Context, mark, cause, exchangeID string, waited time.Duration, extra map[string]string) pipeline.Action {
-	details, refusal := noVerdict(cause, exchangeID, waited, extra)
+	details, refusal := g.noVerdict(cause, exchangeID, waited, extra)
 	details[mark], refusal[mark] = "true", true
 	pctx.Record(pipeline.Invocation{Action: pipeline.ActionDeny, Reason: cause, Details: details})
 	return refuse(pctx, "policy.verdict-unavailable", http.StatusServiceUnavailable,
@@ -618,8 +624,12 @@ func (g *Gate) markedBody(pctx *pipeline.Context, mark, cause, exchangeID string
 }
 
 // noVerdict is the record's details and the refusal's for a request with no verdict.
-func noVerdict(reason, exchangeID string, waited time.Duration, extra map[string]string) (map[string]string, map[string]any) {
+// The record carries the fail-mode revision; the refusal does not.
+func (g *Gate) noVerdict(reason, exchangeID string, waited time.Duration, extra map[string]string) (map[string]string, map[string]any) {
 	details := map[string]string{"waited_ms": strconv.FormatInt(waited.Milliseconds(), 10)}
+	if g.cfg.FailModeRevision != "" {
+		details["fail_mode_revision"] = g.cfg.FailModeRevision
+	}
 	for k, v := range extra {
 		details[k] = v
 	}
