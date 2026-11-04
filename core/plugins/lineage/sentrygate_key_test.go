@@ -266,3 +266,319 @@ func TestSentryGate_CaptureOffComesFromLineage(t *testing.T) {
 		})
 	}
 }
+
+// The body mark. With capture on, lineage marks its record of the pass when it cut
+// the request body at max_payload_bytes (body_cut) or captured none of a body that
+// has bytes (body_not_captured). The gate reads the mark only when a slow or dead
+// service gave no verdict: a marked body is refused whatever the fallback, because
+// the verdict would have said unjudged. These run the real lineage beside the real
+// gate in one pipeline, the order the gate's Requires enforces.
+
+// markCap is the max_payload_bytes the mark tests run under.
+const markCap = 64
+
+// markedChain runs one outbound request through the real lineage (capture_io as
+// given, max_payload_bytes markCap) and then the real gate (fallback as given),
+// against a verdict service that gives one answer.
+func markedChain(t *testing.T, capture bool, fallback string, status int, answer string, pctx *pipeline.Context) pipeline.Action {
+	t.Helper()
+	return markedChainWith(t, capture, `"fallback":"`+fallback+`"`, status, answer, pctx)
+}
+
+// markedChainWith is markedChain with the gate's config after verdict_url as given.
+func markedChainWith(t *testing.T, capture bool, gateCfg string, status int, answer string, pctx *pipeline.Context) pipeline.Action {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(status)
+		fmt.Fprint(w, answer)
+	}))
+	t.Cleanup(srv.Close)
+	p, _ := newTestPlugin(t)
+	p.bypassPaths, _ = bypass.NewMatcher(nil)
+	p.cfg.CaptureIO = capture
+	p.cfg.MaxPayloadBytes = markCap
+	g := sentrygate.New()
+	if err := g.Configure(json.RawMessage(`{"verdict_url":"` + srv.URL + `",` + gateCfg + `}`)); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	pl, err := pipeline.New([]pipeline.Plugin{p, g})
+	if err != nil {
+		t.Fatalf("pipeline.New: %v", err)
+	}
+	return pl.Run(context.Background(), pctx)
+}
+
+// withBody is an outbound plain-HTTP request to an unlisted host carrying body.
+func withBody(body string) *pipeline.Context {
+	pctx := fakeContext(pipeline.Outbound, propagated())
+	pctx.Host = "outside.example:8000"
+	pctx.Body = []byte(body)
+	return pctx
+}
+
+// mcpNoParams is an MCP tools/call with no params: the body has bytes, and the
+// parser's reduction, which capture takes, is nothing.
+func mcpNoParams() *pipeline.Context {
+	pctx := withBody(`{"jsonrpc":"2.0","id":7,"method":"tools/call"}`)
+	pctx.Extensions.MCP = &pipeline.MCPExtension{Method: "tools/call", RPCID: 7}
+	return pctx
+}
+
+// lineageRecord is lineage-telemetry's request-pass record and its index among the
+// pass's records.
+func lineageRecord(t *testing.T, pctx *pipeline.Context) (pipeline.Invocation, int) {
+	t.Helper()
+	if inv := pctx.Extensions.Invocations; inv != nil {
+		for i, rec := range inv.Outbound {
+			if rec.Plugin == "lineage-telemetry" && rec.Phase == pipeline.InvocationPhaseRequest {
+				return rec, i
+			}
+		}
+	}
+	t.Fatal("lineage recorded nothing")
+	return pipeline.Invocation{}, -1
+}
+
+const (
+	answerPending = `{"state":"pending"}`
+	answerAllow   = `{"state":"decided","verdict":"allow","version":1}`
+	answerUnread  = `{"state":"unjudged","verdict":"allow","reason":"body_not_captured","version":1}`
+)
+
+// wantMarkedRefusal checks a marked-body refusal: a 503 under the cause, the mark in
+// the record and in the refusal details, never a fallback outcome.
+func wantMarkedRefusal(t *testing.T, act pipeline.Action, pctx *pipeline.Context, cause, mark string) {
+	t.Helper()
+	if act.Type != pipeline.Reject || act.Violation == nil {
+		t.Fatalf("action = %v, want Reject", act.Type)
+	}
+	inv := gateInvocation(t, pctx)
+	if inv.Action != pipeline.ActionDeny || inv.Reason != cause || inv.Details[mark] != "true" {
+		t.Errorf("record = %s/%s %v, want deny/%s with %s", inv.Action, inv.Reason, inv.Details, cause, mark)
+	}
+	if _, ok := inv.Details["no_verdict"]; ok || strings.HasPrefix(inv.Reason, "fallback_") {
+		t.Errorf("record = %s %v: a marked body is never the fallback's", inv.Reason, inv.Details)
+	}
+	v := act.Violation
+	if v.Status != http.StatusServiceUnavailable || v.Code != "policy.verdict-unavailable" {
+		t.Errorf("refusal = %d %s, want 503 policy.verdict-unavailable", v.Status, v.Code)
+	}
+	if v.Details["reason"] != cause || v.Details[mark] != true || v.Details["fallback"] != nil {
+		t.Errorf("refusal details = %v, want reason %s and %s, no fallback", v.Details, cause, mark)
+	}
+	if !strings.Contains(v.Reason, "No verdict arrived, and the request body could not be judged in full") {
+		t.Errorf("message = %q, want it to say the body was not fully judged", v.Reason)
+	}
+}
+
+// A body over the cap, no verdict in time: refused under its cause with body_cut,
+// whatever the fallback. The mark touches nothing else: a verdict that arrived
+// decides, and a fault stays a fault.
+func TestSentryGate_CutBodyIsRefusedWhateverTheFallback(t *testing.T) {
+	cut := strings.Repeat("x", markCap+1)
+	for _, fallback := range []string{"allow", "deny"} {
+		for _, tc := range []struct {
+			name   string
+			status int
+			answer string
+			cause  string
+		}{
+			{"pending", http.StatusOK, answerPending, "verdict_pending"},
+			{"5xx", http.StatusInternalServerError, `{}`, "verdict_error"},
+		} {
+			t.Run(fallback+"/"+tc.name, func(t *testing.T) {
+				pctx := withBody(cut)
+				act := markedChain(t, true, fallback, tc.status, tc.answer, pctx)
+				wantMarkedRefusal(t, act, pctx, tc.cause, "body_cut")
+			})
+		}
+	}
+	t.Run("a verdict that arrived decides", func(t *testing.T) {
+		pctx := withBody(cut)
+		if act := markedChain(t, true, "allow", http.StatusOK, answerAllow, pctx); act.Type != pipeline.Continue {
+			t.Fatalf("action = %v, want Continue", act.Type)
+		}
+		if inv := gateInvocation(t, pctx); inv.Reason != "verdict_allow" || inv.Details["body_cut"] != "" {
+			t.Errorf("record = %s %v, want verdict_allow with no mark", inv.Reason, inv.Details)
+		}
+	})
+	t.Run("a fault stays a fault", func(t *testing.T) {
+		pctx := withBody(cut)
+		if act := markedChain(t, true, "allow", http.StatusNotFound, `{}`, pctx); act.Type != pipeline.Reject {
+			t.Fatalf("action = %v, want Reject", act.Type)
+		}
+		inv := gateInvocation(t, pctx)
+		if inv.Reason != "verdict_error" || inv.Details["status"] != "404" || inv.Details["body_cut"] != "" {
+			t.Errorf("record = %s %v, want the fault verdict_error 404 with no mark", inv.Reason, inv.Details)
+		}
+	})
+}
+
+// A body the parser reduces to nothing, no verdict in time: refused with
+// body_not_captured under an allow fallback.
+func TestSentryGate_UncapturedBodyIsRefusedWhateverTheFallback(t *testing.T) {
+	pctx := mcpNoParams()
+	act := markedChain(t, true, "allow", http.StatusOK, answerPending, pctx)
+	wantMarkedRefusal(t, act, pctx, "verdict_pending", "body_not_captured")
+}
+
+// Capture off writes no mark and changes nothing: an unjudged answer for an unread
+// body continues as unread_capture_off, and with no verdict the fallback decides.
+func TestSentryGate_CaptureOffWritesNoMark(t *testing.T) {
+	for name, body := range map[string]func() *pipeline.Context{
+		"over the cap":  func() *pipeline.Context { return withBody(strings.Repeat("x", markCap+1)) },
+		"mcp no params": mcpNoParams,
+	} {
+		for _, tc := range []struct{ answer, want string }{
+			{answerUnread, "unread_capture_off"},
+			{answerPending, "fallback_allow"},
+		} {
+			t.Run(name+"/"+tc.want, func(t *testing.T) {
+				pctx := body()
+				if act := markedChain(t, false, "allow", http.StatusOK, tc.answer, pctx); act.Type != pipeline.Continue {
+					t.Fatalf("action = %v, want Continue", act.Type)
+				}
+				if rec, _ := lineageRecord(t, pctx); rec.Details["body_cut"] != "" || rec.Details["body_not_captured"] != "" {
+					t.Errorf("lineage record = %v, want no mark with capture off", rec.Details)
+				}
+				if inv := gateInvocation(t, pctx); inv.Reason != tc.want {
+					t.Errorf("record = %s %v, want %s", inv.Reason, inv.Details, tc.want)
+				}
+			})
+		}
+	}
+}
+
+// gateFirst is the real gate without its Requires, so a chain can run it before
+// lineage, which the Requires otherwise refuses at build.
+type gateFirst struct{ *sentrygate.Gate }
+
+func (gateFirst) Capabilities() pipeline.PluginCapabilities { return pipeline.PluginCapabilities{} }
+
+// The mark is written in lineage's request-pass record, before the gate reads
+// it: in order, lineage's marked record precedes the gate's, which carries the mark;
+// a gate run before lineage sees no record and so no mark.
+func TestSentryGate_MarkIsWrittenBeforeTheGateReads(t *testing.T) {
+	t.Run("lineage first", func(t *testing.T) {
+		pctx := withBody(strings.Repeat("x", markCap+1))
+		markedChain(t, true, "allow", http.StatusOK, answerPending, pctx)
+		rec, at := lineageRecord(t, pctx)
+		inv := gateInvocation(t, pctx)
+		if rec.Details["body_cut"] != "true" || inv.Details["body_cut"] != "true" {
+			t.Errorf("lineage %v, gate %v: want the mark in both", rec.Details, inv.Details)
+		}
+		if gateAt := len(pctx.Extensions.Invocations.Outbound) - 1; at >= gateAt {
+			t.Errorf("lineage record at %d, gate at %d: lineage must write first", at, gateAt)
+		}
+	})
+	t.Run("gate first", func(t *testing.T) {
+		p, _ := newTestPlugin(t)
+		p.bypassPaths, _ = bypass.NewMatcher(nil)
+		p.cfg.CaptureIO = true
+		p.cfg.MaxPayloadBytes = markCap
+		g, asked := askedGate(t, `,"fallback":"allow"`)
+		pl, err := pipeline.New([]pipeline.Plugin{gateFirst{g}, p})
+		if err != nil {
+			t.Fatalf("pipeline.New: %v", err)
+		}
+		pctx := withBody(strings.Repeat("x", markCap+1))
+		pl.Run(context.Background(), pctx)
+		inv := pctx.Extensions.Invocations.Outbound[0]
+		if inv.Plugin != "sentry-gate" || inv.Reason != "no_lineage_stamp" || inv.Details["body_cut"] != "" {
+			t.Errorf("gate record = %s %s %v, want sentry-gate no_lineage_stamp with no mark", inv.Plugin, inv.Reason, inv.Details)
+		}
+		if got := asked.Load().(string); got != "" {
+			t.Errorf("the gate asked %s before lineage stamped", got)
+		}
+	})
+}
+
+// A body exactly at the cap is captured whole: no mark, and the fallback
+// decides. One byte more is cut.
+func TestSentryGate_BodyAtTheCapIsTheFallbacks(t *testing.T) {
+	for _, tc := range []struct {
+		fallback   string
+		wantAction pipeline.ActionType
+		wantReason string
+	}{
+		{"allow", pipeline.Continue, "fallback_allow"},
+		{"deny", pipeline.Reject, "fallback_deny"},
+	} {
+		t.Run(tc.fallback, func(t *testing.T) {
+			pctx := withBody(strings.Repeat("x", markCap))
+			if act := markedChain(t, true, tc.fallback, http.StatusOK, answerPending, pctx); act.Type != tc.wantAction {
+				t.Fatalf("action = %v, want %v", act.Type, tc.wantAction)
+			}
+			rec, _ := lineageRecord(t, pctx)
+			inv := gateInvocation(t, pctx)
+			if rec.Details["body_cut"] != "" || inv.Reason != tc.wantReason || inv.Details["no_verdict"] != "verdict_pending" {
+				t.Errorf("lineage %v, gate %s %v: want no mark and %s", rec.Details, inv.Reason, inv.Details, tc.wantReason)
+			}
+		})
+	}
+	t.Run("one byte over", func(t *testing.T) {
+		pctx := withBody(strings.Repeat("x", markCap+1))
+		act := markedChain(t, true, "allow", http.StatusOK, answerPending, pctx)
+		wantMarkedRefusal(t, act, pctx, "verdict_pending", "body_cut")
+	})
+}
+
+// A fail_mode row's allow is the fallback's, so a marked body is refused under
+// it too, never fallback_allow. The same row delivers a body at the cap, so it applied.
+func TestSentryGate_CutBodyIsRefusedWhateverTheRow(t *testing.T) {
+	row := `"fallback":"deny","fail_mode":[{"destination":"outside.example","fallback":"allow"}]`
+	t.Run("cut", func(t *testing.T) {
+		pctx := withBody(strings.Repeat("x", markCap+1))
+		act := markedChainWith(t, true, row, http.StatusOK, answerPending, pctx)
+		wantMarkedRefusal(t, act, pctx, "verdict_pending", "body_cut")
+	})
+	t.Run("at the cap", func(t *testing.T) {
+		pctx := withBody(strings.Repeat("x", markCap))
+		if act := markedChainWith(t, true, row, http.StatusOK, answerPending, pctx); act.Type != pipeline.Continue {
+			t.Fatalf("action = %v, want Continue", act.Type)
+		}
+		if inv := gateInvocation(t, pctx); inv.Reason != "fallback_allow" || inv.Details["fail_mode_destination"] != "outside.example" {
+			t.Errorf("record = %s %v, want fallback_allow naming outside.example", inv.Reason, inv.Details)
+		}
+	})
+}
+
+// Lineage's record names the source as its span does, the last segment of a
+// SPIFFE ID, and the gate picks that source's slice by it; another source gets the top
+// level.
+func TestSentryGate_SliceIsPickedByLineagesSelfID(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, answerPending)
+	}))
+	t.Cleanup(srv.Close)
+	for _, tc := range []struct {
+		selfID, source, want string
+	}{
+		{"spiffe://cluster.local/ns/team1/sa/desk", "desk", "fallback_allow"},
+		{"spiffe://cluster.local/ns/team1/sa/other", "", "fallback_deny"},
+	} {
+		seg := tc.selfID[strings.LastIndex(tc.selfID, "/")+1:]
+		t.Run(seg, func(t *testing.T) {
+			p, _ := newTestPlugin(t)
+			p.bypassPaths, _ = bypass.NewMatcher(nil)
+			p.selfID = tc.selfID
+			g := sentrygate.New()
+			if err := g.Configure(json.RawMessage(`{"verdict_url":"` + srv.URL + `","fallback":"deny","sources":{"desk":{"fallback":"allow"}}}`)); err != nil {
+				t.Fatalf("Configure: %v", err)
+			}
+			pl, err := pipeline.New([]pipeline.Plugin{p, g})
+			if err != nil {
+				t.Fatalf("pipeline.New: %v", err)
+			}
+			pctx := withBody("hello")
+			pl.Run(context.Background(), pctx)
+			rec, _ := lineageRecord(t, pctx)
+			if rec.Details["self_id"] != seg {
+				t.Errorf("lineage record = %v, want self_id %s", rec.Details, seg)
+			}
+			if inv := gateInvocation(t, pctx); inv.Reason != tc.want || inv.Details["fail_mode_source"] != tc.source {
+				t.Errorf("gate record = %s %v, want %s, fail_mode_source %q", inv.Reason, inv.Details, tc.want, tc.source)
+			}
+		})
+	}
+}

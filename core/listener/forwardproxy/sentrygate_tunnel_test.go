@@ -149,7 +149,7 @@ func connect(t *testing.T, proxyURL, target string) (net.Conn, *bufio.Reader) {
 	return conn, br
 }
 
-func TestSentryGate_OpaqueTunnelIsUnjudgedAndOpens(t *testing.T) {
+func TestSentryGate_OpaqueTunnelIsNotInspectedAndOpens(t *testing.T) {
 	origin, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -183,8 +183,8 @@ func TestSentryGate_OpaqueTunnelIsUnjudgedAndOpens(t *testing.T) {
 	probe.mu.Lock()
 	rec := probe.seen[http.MethodConnect]
 	probe.mu.Unlock()
-	if rec.Action != pipeline.ActionAllow || rec.Reason != "unjudged" || rec.Details["kind"] != "tunnel" {
-		t.Errorf("gate record on the CONNECT = %s/%s %v, want allow/unjudged kind=tunnel", rec.Action, rec.Reason, rec.Details)
+	if rec.Action != pipeline.ActionAllow || rec.Reason != "not_inspected" || rec.Details["kind"] != "tunnel" {
+		t.Errorf("gate record on the CONNECT = %s/%s %v, want allow/not_inspected kind=tunnel", rec.Action, rec.Reason, rec.Details)
 	}
 }
 
@@ -286,7 +286,7 @@ func bridgedRequestIsJudged(t *testing.T, method string) {
 	probe.mu.Lock()
 	rec := probe.seen[http.MethodConnect]
 	probe.mu.Unlock()
-	if rec.Reason != "unjudged" {
-		t.Errorf("gate record on the CONNECT = %s/%s, want allow/unjudged", rec.Action, rec.Reason)
+	if rec.Reason != "not_inspected" {
+		t.Errorf("gate record on the CONNECT = %s/%s, want allow/not_inspected", rec.Action, rec.Reason)
 	}
 }
