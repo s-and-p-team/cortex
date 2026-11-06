@@ -54,6 +54,7 @@ Per-plugin reference docs: [a2a-parser](a2a-parser-plugin.md),
 | If you want to… | Read |
 |---|---|
 | Set up model pricing and gateway discounts, or read the `cost` record | [`pricing.md`](pricing.md) |
+| See which Claude Code permission rules apply to a directory, and where each comes from | [`agentop-access.md`](agentop-access.md) |
 | Read sessions and events over HTTP — endpoints, event schema, SSE | [`session-api.md`](session-api.md) |
 | See the rates actually in effect | `agentop pricing [--host <gateway>]` |
 | See how many people install Cortex | [install stats](https://rossoctl.github.io/cortex/install-stats/) — estimated from GitHub's release-download counts, never from your machine. The page is explicit that the figures still include maintainers and contributors |
