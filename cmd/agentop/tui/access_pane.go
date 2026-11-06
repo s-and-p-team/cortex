@@ -2,7 +2,6 @@ package tui
 
 import (
 	"fmt"
-	"strings"
 
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
@@ -184,17 +183,21 @@ func (m *model) handleAccessLoaded(msg accessLoadedMsg) {
 	m.access.policy, m.access.err = &p, nil
 }
 
-// accessBody is the pane's drawn lines in the viewport, searched. Task 4 replaces the body of
-// this with the real rendering; until then it shows the reasons and errors.
+// accessBody is the pane's drawn lines in the viewport, searched.
 func (m *model) accessBody() string {
+	t := m.access.target
 	var lines []string
-	switch t := m.access.target; {
-	case !t.Kind.resolvable():
-		lines = append(lines, strings.Split(t.Reason, "\n")...)
-	case m.access.err != nil:
+	switch {
+	case m.access.err != nil && t.Kind.resolvable():
 		lines = append(lines, "could not resolve: "+access.Clean(m.access.err.Error()))
-	case m.access.loading && m.access.policy == nil:
-		lines = append(lines, "resolving…")
+	default:
+		// accessLines is the one place that refuses to draw a policy for a target that cannot
+		// resolve, so a stale policy still held here cannot leak onto a refusal.
+		var p access.Policy
+		if m.access.policy != nil {
+			p = *m.access.policy
+		}
+		lines = accessLines(p, t, max(m.width, 20), m.access.loading)
 	}
 	m.accessViews.doc.setLines(lines, 0)
 	return m.accessViews.doc.render(m.searchQuery(paneAccess))
