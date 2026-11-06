@@ -17,15 +17,15 @@
 - Run Go per-module with `GOWORK=off` for `cmd/agentop`. Run `gofmt -l cmd/agentop` and `go vet` before pushing.
 - Red-first: each test is written, run, and seen to fail before its implementation.
 - Read-only: the resolver never writes and only opens the named settings files.
-- **No Go toolchain was on PATH when this plan was written.** Install one (`go 1.26.10`) before Task 1; nothing below has been compiled or run.
+- **Go toolchain:** 1.26.10, installed outside the repo at `agentop/.tools/go` (checksum-verified). `source agentop/.tools/env.sh` before any `go` command. Module downloads need the sandbox off (macOS TLS verification), so the first `go build` fetches dependencies outside it.
 
-## Task 0: Confirm the rules (blocks Task 2)
+## Task 0: Confirm the rules (blocks Task 2) — DONE 2026-11-06
 
-The precedence and pattern rules in the spec are a reading of Claude Code's documentation, not verified against its source.
+Verified against code.claude.com/docs (`settings`, `permissions`, `managed-settings`, `settings-reference`). The spec's "Resolution rules" section now carries the verified rules and marks the five corrections to the first draft: the CLI layer is `--settings` (not permission flags), managed drop-ins merge after the base file, `auto`/`bypassPermissions` `defaultMode` is ignored from project/local, the project local file lives at the git root, and `allowManagedPermissionRulesOnly` voids lower-layer rules.
 
-- [ ] Re-read the current Claude Code docs for settings files, permissions, and managed settings. Record in `access/doc.go` the exact: layer order, which keys merge vs override, the managed-settings paths per OS, and the rule syntax forms.
-- [ ] Where the docs are silent, test empirically with a scratch directory and `claude` and record the observed behavior in the same comment. Do not guess.
-- [ ] If any rule differs from the spec, update the spec first, in the same PR.
+Still unverified and **not** modeled in v1: the exact `hooks` and `sandbox` JSON shapes beyond key names (the settings-reference page was truncated). Task 2 decodes only `sandbox.enabled` and treats hooks as an opaque count until those pages are read.
+
+- [ ] Record the verified rules (layer order, merge vs override, managed paths per OS, rule syntax) in `access/doc.go`, citing the doc pages and the date.
 
 ## Review Focus
 

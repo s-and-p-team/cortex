@@ -126,26 +126,83 @@ type Rule struct {
 func Resolve(in Input) (Policy, error)
 ```
 
-Resolution rules (to be confirmed against current Claude Code docs — see
-Risks):
+Resolution rules. **Verified 2026-11-06 against code.claude.com/docs**
+(`settings`, `permissions`, `managed-settings`, `settings-reference`); the
+corrections to the first draft are marked *(corrected)*:
 
-- Layer order, highest first: managed (`/Library/Application
-  Support/ClaudeCode/managed-settings.json` plus `managed-settings.d/*.json` on
-  macOS; platform paths for Linux), CLI flags, `<cwd>/.claude/settings.local.json`,
-  `<cwd>/.claude/settings.json`, `<ConfigDir>/settings.json`.
-- Rule lists (`permissions.allow|ask|deny`, `additionalDirectories`) **merge**
-  across layers. Among merged rules, deny beats ask beats allow regardless of
-  layer.
-- Scalars (`permissions.defaultMode`, sandbox enabled) take the highest layer
-  that sets them. Managed values are not overridable.
+- **Layer order, highest first:** managed, command line (`--settings`),
+  project local (`<cwd>/.claude/settings.local.json`), shared project
+  (`<cwd>/.claude/settings.json`), user (`<ConfigDir>/settings.json`).
+  - Managed files: macOS `/Library/Application Support/ClaudeCode/`, Linux and
+    WSL `/etc/claude-code/`, Windows `C:\Program Files\ClaudeCode\`.
+    `managed-settings.json` merges first, then `managed-settings.d/*.json` in
+    alphabetical order *(corrected: the drop-ins come after the base file)*.
+    Managed settings can also arrive from MDM or the claude.ai console; those
+    are **not files and cannot be read**, so the Managed layer is reported as
+    "file sources only".
+  - *(corrected)* "CLI flags" is `--settings <file-or-json>`, which is a
+    settings document, not `--permission-mode`/`--allowedTools`. Those flags are
+    separate per-session inputs that are not in the file stack; v1 does not model
+    them (they are not recoverable from disk).
+- **Rule lists** (`permissions.allow|ask|deny`, `additionalDirectories`)
+  **merge** across layers. Evaluation is deny, then ask, then allow, and the
+  first match wins regardless of specificity or layer *(confirmed)*. A broad
+  deny beats a narrower allow; a matching ask prompts even if a narrower allow
+  also matches.
+- **Scalars** (`permissions.defaultMode`, `sandbox.enabled`) take the highest
+  layer that sets them. *(corrected)* Exceptions: `defaultMode` values `auto`
+  and `bypassPermissions` **do not take effect from project or local settings**,
+  only from user or managed. The resolver must report such a value as
+  "ignored" with the reason, not as the effective mode.
+- *(new)* A few restrictive keys honor a stricter lower-layer value over a
+  managed one (`permissions.blockReadsOutsideWorkingDirectories`,
+  `blockWritesOutsideWorkingDirectories` — `true` from any scope wins).
+- *(new)* `allowManagedPermissionRulesOnly` in managed settings makes managed
+  the only source of `allow`/`ask`/`deny` rules; user, project, local and
+  `--settings` rules are ignored. The resolver marks those rules "ignored by
+  managed policy" instead of dropping them silently.
+- *(new)* **The project local file lives at the git repository root**, not
+  necessarily `<cwd>`, when Claude Code was started in a subdirectory (since
+  v2.1.211; in a worktree it is the main checkout's root). A file left in the
+  starting directory by older versions is still read, and rules from both
+  apply. Exceptions: no git repo, repo root is `$HOME`, Windows, or the repo
+  root/`.git`/`.claude` not owned by the user — then it stays with
+  `.claude/settings.json`. The shared `settings.json` is read from the
+  session's primary working directory only.
+- *(new)* Project `allow` rules and `additionalDirectories` take effect only
+  after the user trusts the folder; `deny` and `ask` apply immediately. Trust
+  state is not in the settings files, so the resolver flags project `allow`
+  rules as "needs workspace trust" rather than asserting they apply.
 - A missing file is `Present: false`, not an error. A malformed file sets
-  `Layer.Err` and contributes nothing; the rest still resolves.
+  `Layer.Err` and contributes nothing; the rest still resolves. (Claude Code
+  itself skips a broken user/project/local file and keeps going; a broken
+  *managed* file stops it starting. Report that case prominently.)
 - Read-only: never writes, never follows a path outside the named files.
 
-Risk flags are computed in the resolver: `bypassPermissions`, an allow rule
-whose pattern is `*` or whose tool is bare (`Bash`), `sandbox` off, an
-`additionalDirectories` entry that is `/` or `$HOME`, and a deny that a lower
-layer's allow can never override (informational).
+Rule syntax *(for the matcher in phase 4; recorded here because it fixes what
+the parser must accept)*:
+
+- `Tool` or `Tool(specifier)`; a bare tool name matches all uses, and `Bash(*)`
+  is equivalent to `Bash`. A bare-name deny removes the tool from Claude's
+  context entirely.
+- Bash: `*` matches any text including spaces, anywhere in the pattern. A
+  trailing ` *` (space then `*`) as the only wildcard also matches the bare
+  command (`Bash(ls *)` matches `ls`; `Bash(ls*)` also matches `lsof`). The
+  legacy `:*` suffix is equivalent to a trailing ` *` and is recognized only at
+  the end of a pattern.
+- `WebFetch(domain:example.com)` is exact; `domain:*.example.com` matches any
+  subdomain depth but not the apex; `domain:*` is not the same as bare
+  `WebFetch`.
+- Hooks do not override rules: a matching deny blocks and a matching ask prompts
+  even if a `PreToolUse` hook returned allow; a hook that exits 2 blocks even
+  when an allow rule matches.
+
+Risk flags are computed in the resolver: `bypassPermissions` as the effective
+or configured mode, an allow rule that is a bare tool (`Bash`, `Bash(*)`),
+`sandbox.enabled` not true, an `additionalDirectories` entry that is `/` or the
+home directory, `permissions.disableBypassPermissionsMode` unset where a
+managed layer exists, and a `defaultMode` that the docs say is ignored in its
+layer (informational).
 
 ### 3. Matching a tool call to rules
 
