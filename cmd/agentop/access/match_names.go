@@ -32,6 +32,21 @@ func evaluate(r Rule, c Call, ctx MatchContext) evalResult {
 // evaluateSpecifier handles rules with a parenthesised specifier. Each tool family adds a case
 // here; until a family exists its rules are unevaluable.
 func evaluateSpecifier(r Rule, pattern string, c Call, ctx MatchContext, res evalResult) evalResult {
+	if strings.HasPrefix(r.Tool, "mcp__") {
+		// Claude Code skips an mcp__ rule that has parentheses.
+		res.state = evalNoMatch
+		return res
+	}
+
+	// Tool(param:value) is decided FIRST, before any tool family reads the specifier as its own:
+	// otherwise Read(file_path:/etc/passwd) is taken for a path pattern and Agent(model:opus) for
+	// a subagent called "model:opus". A name:value specifier is a parameter rule when the name is
+	// a primary content field (which Claude Code ignores), a documented parameter of the tool, or
+	// a field this call carries. Bash(git:status) is none of those, so it stays a command pattern.
+	if name, value, ok := isParamRule(r.Tool, pattern, c); ok && !(r.Tool == "WebFetch" && name == "domain") {
+		return evaluateParam(r, name, value, c, res)
+	}
+
 	// Rules that Claude Code accepts but never matches against a path: Write, Grep, Glob,
 	// NotebookEdit and MultiEdit(path) with a path other than *. Say so, so a user who believes
 	// Write(docs/**) protects docs learns that it does not.
@@ -42,16 +57,15 @@ func evaluateSpecifier(r Rule, pattern string, c Call, ctx MatchContext, res eva
 			r.Raw, equivalentPathRule(r.Tool, pattern)))
 		return res
 	}
-	if strings.HasPrefix(r.Tool, "mcp__") {
-		// Claude Code skips an mcp__ rule that has parentheses.
-		res.state = evalNoMatch
-		return res
-	}
-	if r.Tool == "Bash" {
+	switch {
+	case r.Tool == "Bash":
 		return evaluateBash(r, pattern, c, res)
-	}
-	if pathRuleFamily(r.Tool) {
+	case pathRuleFamily(r.Tool):
 		return evaluatePath(r, pattern, c, ctx, res)
+	case r.Tool == "WebFetch":
+		return evaluateWebFetch(r, pattern, c, res)
+	case r.Tool == "Agent" || r.Tool == "Skill":
+		return evaluateNamed(r, pattern, c, res)
 	}
 	res.state = evalUnknown
 	return res
