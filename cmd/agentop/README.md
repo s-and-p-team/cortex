@@ -1368,6 +1368,38 @@ agentop is for, and the other four are surfaces you visit and leave.
   result. Sessions recorded before the proxy captured agent ids show their
   subagents as one row; other agents show host rows alone. A proxy too old to
   serve the endpoint gets a line saying so.
+- **Access**: one session's Claude Code permission policy, opened by `V` from Sessions
+  (the highlighted row), Events or Detail. It is the same answer `agentop access
+  --session` prints, drawn as scrolling lines: the five settings layers, highest
+  precedence first (each listed even when absent, with its path and rule counts); the
+  mode configured and the mode the session was last recorded in; the sandbox, hook
+  events and extra directories; risk flags, worst first; and every rule in the order
+  Claude Code checks them (deny, then ask, then allow; the first match wins), each
+  with the layer it came from. A rule another rule makes unreachable is dimmed and
+  says what shadows it; one Claude Code disregards says why; a project `allow` says it
+  applies only after the folder is trusted.
+
+  The policy is resolved from the directory the session **started** in and the config
+  directory its transcript came from, both read from the harvested
+  `~/.cortex/session-metadata.json`, so it needs the harvest to have reached the
+  session. It is read from files **as they are now**, not as they were when the
+  session began; `r` reads them again, and there is no timer. `↑↓`, `g`/`G` and the
+  page keys scroll, `/` searches the lines, `esc` returns to where `V` was pressed.
+
+  It says so, in words, when it cannot answer, and shows nothing then:
+  - **a session on another machine** (any connection other than this machine's
+    Cortex, including a port-forward to a pod): its settings files are not here, and
+    this machine's would be the wrong answer;
+  - **a session the harvest has not read yet**: `r` checks again;
+  - **a session another agent ran**;
+  - **a session with no recorded directory**: the user and managed layers are shown,
+    and the project ones are said to be missing, never filled from the directory
+    agentop was started in.
+
+  Settings files can come from any repository, so every string drawn from one has its
+  terminal escape sequences and control characters removed first. Managed policy
+  delivered by MDM or the claude.ai console is not a file and is not shown. See
+  [`docs/agentop-access.md`](../../docs/agentop-access.md).
 - **Catalog**: registered-plugin browser, opened by `P` from any
   session-view pane. Lists every plugin the running binary knows how to
   construct, including ones not in the active pipeline. Useful for
@@ -1497,6 +1529,7 @@ Layered on top of all of them:
 | `t` | events | back to the live tail from a paged-back timeline — resumes receiving updates |
 | `u` | sessions, events, detail | open the usage charts (sessions: all sessions; events/detail: the selected session) |
 | `T` | sessions, events, detail | open the timeline (sessions: the highlighted row; events/detail: the selected session) |
+| `V` | sessions, events, detail | open the access pane: the selected session's Claude Code permission policy (sessions: the highlighted row; events/detail: the selected session) |
 | `w` | timeline | cycle window: 5m / 1h / 24h / all, only the windows shorter than the session |
 | `←` `→` / `h` `l` | timeline | pick a moment, skipping collapsed stretches; the line below lists the tools running then |
 | `↑` `↓` / `k` `j` | timeline | scroll the agent rows, then the host rows, when they do not all fit |

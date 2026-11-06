@@ -105,4 +105,13 @@ are `[]` and never `null`, and the output is byte-identical across runs for the 
 files: rules are ordered by decision, tool, pattern and layer. A shadowed rule
 carries `shadowedBy` with the decision, text and layer of the rule that shadows it.
 
+## In the viewer
+
+`V` opens the same answer in `agentop observe`, over the selected session. It is drawn
+as scrolling lines rather than a table so a shadowed rule can be dimmed. The pane
+shows nothing, and says why, for a session on another machine (including a
+port-forward to a pod), one the harvest has not read yet, or one another agent ran.
+A session with no recorded directory shows the user and managed layers only. See the
+`Access` entry in [`cmd/agentop/README.md`](../cmd/agentop/README.md).
+
 Design: [`superpowers/specs/2026-11-06-agentop-access-view-design.md`](superpowers/specs/2026-11-06-agentop-access-view-design.md).
