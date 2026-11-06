@@ -901,6 +901,7 @@ func TestSpendDrawerHost_CoversEveryPane(t *testing.T) {
 		panePods:         false, // likewise
 		paneUsage:        false, // already a breakdown, and it owns w/b/m
 		paneTimeline:     false, // owns w
+		paneAccess:       false, // a policy document; the drawer's rows would shrink what scrolls
 		paneAgents:       true,  // its rows scope the drawer; see spendDrawerHostPane
 		paneSessions:     true,
 		paneEvents:       true,

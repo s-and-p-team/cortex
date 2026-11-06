@@ -35,6 +35,8 @@ func (m *model) surface(t paneID) searchSurface {
 		return usageSurface{m}
 	case paneTimeline:
 		return timelineSurface{m}
+	case paneAccess:
+		return docSurface{m, t, &m.accessViews.vp, &m.accessViews.doc}
 	}
 	return nil
 }

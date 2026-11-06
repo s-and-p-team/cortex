@@ -542,7 +542,9 @@ func TestHelpOverlayScrollKeys(t *testing.T) {
 // It has earned that three times now. Adding the MOVING AROUND THIS HELP group took the
 // body from 86 lines to 91, adding the AGENTS pane took it from 91 to 99, the AGENTS
 // pane's S took it from 101 to 102, and search's n / N on SESSIONS and EVENTS took it to
-// 104 — each time this failed naming the value to use rather than going quiet again.
+// 104 — each time this failed naming the value to use rather than going quiet again. The ACCESS
+// pane's entry (title, purpose, three bindings) took the body from 114 to 119 and this from 117
+// to 122; it was kept to those five lines, with no note, for that reason.
 //
 // A PANE COSTS ITS TITLE, ITS PURPOSE, ITS BINDINGS AND ITS NOTES, so this constant
 // moves whenever a pane is added or its prose changes — and it is only ever right as
@@ -554,7 +556,7 @@ func TestHelpOverlayScrollKeys(t *testing.T) {
 // that no longer existed. Too small fails loudly; too large fails silently.
 const (
 	helpWideTerminal   = 100
-	helpNoScrollHeight = 117
+	helpNoScrollHeight = 122
 )
 
 // With everything visible there must be no scroll affordance — it would be noise

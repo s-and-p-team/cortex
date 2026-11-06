@@ -2,10 +2,13 @@ package tui
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/rossoctl/cortex/cmd/agentop/access"
 	"github.com/rossoctl/cortex/cmd/agentop/apiclient"
@@ -407,5 +410,217 @@ func TestUpdate_RoutesAccessLoadedMsg(t *testing.T) {
 	updated, _ := m.Update(msg)
 	if updated.(*model).access.policy == nil {
 		t.Error("Update did not route accessLoadedMsg to the pane")
+	}
+}
+
+// --- the pane inside the viewer ---------------------------------------------------------------
+
+// sizedAccessModel is a model with a terminal size and the pane open on a resolved policy.
+func sizedAccessModel(t *testing.T, w, h int) *model {
+	t.Helper()
+	m, _ := openedAccessModel(localURL, okEntry, true)
+	m.width, m.height = w, h
+	m.detailVp.Width, m.detailVp.Height = w, h
+	m.layout()
+	p := richPolicy()
+	m.pane = paneSessions
+	m.openAccess("s1")
+	m.access.policy, m.access.loading = &p, false
+	return m
+}
+
+func TestAccessPane_ViewShowsTheTitleAndThePolicy(t *testing.T) {
+	m := sizedAccessModel(t, 120, 40)
+	view := ansi.Strip(m.View())
+	for _, want := range []string{"access", "s1", "LAYERS", "Read(.env)"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("View lacks %q:\n%s", want, view)
+		}
+	}
+}
+
+func TestAccessPane_TitleCarriesTheSessionHeader(t *testing.T) {
+	m := sizedAccessModel(t, 120, 40)
+	m.sessionsData["s1"] = SessionMetadata{Title: "fix it", Cwd: "/w/proj", AgentType: "Claude Code", AgentConfigDir: "/w/claude"}
+	if got := ansi.Strip(m.View()); !strings.Contains(got, "fix it") {
+		t.Errorf("the title should name the session by its harvested title:\n%.300s", got)
+	}
+}
+
+func TestAccessPane_EscReturnsToWhereItWasOpenedFrom(t *testing.T) {
+	for _, from := range []paneID{paneSessions, paneEvents, paneDetail} {
+		m, _ := openedAccessModel(localURL, okEntry, true)
+		m.pane = from
+		m.openAccess("s1")
+		m.handleKey(tea.KeyMsg{Type: tea.KeyEsc})
+		if m.pane != from {
+			t.Errorf("opened from %v, esc went to %v", from, m.pane)
+		}
+	}
+	// With no recorded caller it falls back to the sessions list, never to a dead pane.
+	m, _ := openedAccessModel(localURL, okEntry, true)
+	m.pane = paneAccess
+	m.access.returnPane = paneNone
+	m.handleKey(tea.KeyMsg{Type: tea.KeyEsc})
+	if m.pane != paneSessions {
+		t.Errorf("esc with no caller went to %v, want the sessions list", m.pane)
+	}
+}
+
+// left/h also back out on the other panes. Here they must NOT be needed to scroll: this pane has
+// no horizontal axis, so they behave as back, like the catalog.
+func TestAccessPane_LeftAlsoGoesBack(t *testing.T) {
+	m, _ := openedAccessModel(localURL, okEntry, true)
+	m.pane = paneEvents
+	m.openAccess("s1")
+	m.handleKey(tea.KeyMsg{Type: tea.KeyLeft})
+	if m.pane != paneEvents {
+		t.Errorf("left went to %v", m.pane)
+	}
+}
+
+func TestAccessPane_ScrollsAndJumps(t *testing.T) {
+	m := sizedAccessModel(t, 100, 12) // short, so the policy does not fit
+	p := richPolicy()
+	for i := 0; i < 60; i++ {
+		p.Rules = append(p.Rules, access.Rule{Decision: access.Allow, Raw: fmt.Sprintf("Bash(cmd%02d *)", i), Source: access.Local})
+	}
+	m.access.policy = &p
+	m.accessViews.vp.SetContent(m.accessBody())
+	if m.accessViews.vp.TotalLineCount() <= m.accessViews.vp.Height {
+		t.Fatalf("fixture does not overflow: %d lines in %d rows", m.accessViews.vp.TotalLineCount(), m.accessViews.vp.Height)
+	}
+	m.handleKey(keyRune('G'))
+	if !m.accessViews.vp.AtBottom() {
+		t.Error("G did not reach the bottom")
+	}
+	m.handleKey(keyRune('g'))
+	if !m.accessViews.vp.AtTop() {
+		t.Error("g did not reach the top")
+	}
+	m.handleKey(tea.KeyMsg{Type: tea.KeyDown})
+	if m.accessViews.vp.YOffset == 0 {
+		t.Error("down did not scroll")
+	}
+	m.handleKey(tea.KeyMsg{Type: tea.KeyPgDown})
+	if m.accessViews.vp.YOffset <= 1 {
+		t.Error("page down did not page")
+	}
+}
+
+func TestAccessPane_FooterAdvertisesOnlyWhatWorks(t *testing.T) {
+	m := sizedAccessModel(t, 100, 40)
+	foot := m.helpView()
+	for _, want := range []string{"[r]", "[esc]", "[?]", "[q]"} {
+		if !strings.Contains(foot, want) {
+			t.Errorf("footer %q lacks %s", foot, want)
+		}
+	}
+	// A remote session can never resolve and has nothing to scroll: [r] there would be inert.
+	r, _ := openedAccessModel(remoteURL, okEntry, true)
+	r.openAccess("s1")
+	if f := r.helpView(); strings.Contains(f, "[r]") || strings.Contains(f, "scroll") {
+		t.Errorf("a remote refusal's footer advertises a key that does nothing: %q", f)
+	}
+	// A not-yet-harvested session CAN resolve later, so there [r] does something and is said.
+	u, _ := openedAccessModel(localURL, SessionMetadata{}, false)
+	u.openAccess("s1")
+	if f := u.helpView(); !strings.Contains(f, "[r]") {
+		t.Errorf("an unharvested session's footer should offer [r]: %q", f)
+	}
+}
+
+func TestAccessPane_SlashSearchesTheRenderedLines(t *testing.T) {
+	m := sizedAccessModel(t, 120, 40)
+	if m.surface(paneAccess) == nil {
+		t.Fatal("the pane has no search surface: `/` would do nothing")
+	}
+	m.accessViews.vp.SetContent(m.accessBody())
+	m.searchInput = newSearchInput()
+	m.handleKey(keyRune('/'))
+	for _, r := range "WebFetch" {
+		m.handleKey(keyRune(r))
+	}
+	m.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
+	if got := m.surface(paneAccess).matchLines(); len(got) == 0 {
+		t.Errorf("searching WebFetch found nothing in the rendered rules")
+	}
+}
+
+// The tall policy must reflow when the terminal is resized, not keep the width it was drawn at.
+func TestAccessPane_ResizeRedraws(t *testing.T) {
+	m := sizedAccessModel(t, 120, 40)
+	wide := ansi.Strip(m.View())
+	m.width = 50
+	m.layout()
+	narrow := ansi.Strip(m.View())
+	if wide == narrow {
+		t.Error("the pane did not redraw after a resize")
+	}
+	for _, l := range strings.Split(narrow, "\n") {
+		if w := lipgloss.Width(l); w > 50 {
+			t.Fatalf("after shrinking to 50 columns a line is %d wide: %q", w, l)
+		}
+	}
+}
+
+func TestAccessPane_AZeroValueModelRendersEveryPaneIncludingThisOne(t *testing.T) {
+	m := &model{pane: paneAccess}
+	_ = m.View() // must not panic with no client, no session, no sizes
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	_ = m.View()
+}
+
+// `T` and `C` are in no footer (the session-pane footers are at their width budget and drop
+// hints from the front), so `V` is advertised where they are: the [?] overlay's jump section,
+// from exactly the panes it works from.
+func TestAccessKey_IsInTheJumpSectionFromThePanesItWorksFrom(t *testing.T) {
+	for _, from := range []paneID{paneEvents, paneDetail} {
+		var got bool
+		for _, jt := range jumpsFrom(from) {
+			got = got || jt.key == "V"
+		}
+		if !got {
+			t.Errorf("pane %v: the jump section does not list V", from)
+		}
+	}
+	for _, from := range []paneID{paneNamespaces, panePods, paneAccess, panePipeline, paneCatalog, paneUsage, paneAgents, paneTimeline} {
+		for _, jt := range jumpsFrom(from) {
+			if jt.key == "V" {
+				t.Errorf("pane %v lists V, where it does nothing", from)
+			}
+		}
+	}
+}
+
+// `r` on a refusal is not inert: the cause may have gone. A session the harvest had not reached
+// is the common case, and the reader should not have to leave the pane and come back.
+func TestRefreshAccess_AfterTheHarvestReachesTheSessionItResolves(t *testing.T) {
+	m, r := openedAccessModel(localURL, SessionMetadata{}, false)
+	if cmd := m.openAccess("s1"); cmd != nil {
+		t.Fatal("an unharvested session started a resolve")
+	}
+	if m.access.target.Kind != targetNoEntry {
+		t.Fatalf("Kind = %v, want targetNoEntry", m.access.target.Kind)
+	}
+	m.sessionsData["s1"] = okEntry // the background harvest lands
+	cmd := m.handleKey(keyRune('r'))
+	if cmd == nil {
+		t.Fatal("r after the harvest reached the session did nothing")
+	}
+	m.handleAccessLoaded(cmd().(accessLoadedMsg))
+	if m.access.target.Kind != targetOK || m.access.policy == nil || len(r.calls) != 1 {
+		t.Errorf("Kind %v policy %v calls %d, want a resolved policy", m.access.target.Kind, m.access.policy, len(r.calls))
+	}
+}
+
+func TestRefreshAccess_OnAStillUnresolvableTargetReadsNothing(t *testing.T) {
+	m, r := openedAccessModel(remoteURL, okEntry, true)
+	m.openAccess("s1")
+	if cmd := m.handleKey(keyRune('r')); cmd != nil {
+		cmd()
+	}
+	if len(r.calls) != 0 {
+		t.Errorf("r on a remote session read files: %+v", r.calls)
 	}
 }

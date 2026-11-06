@@ -126,6 +126,9 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 
 	// The Access pane re-reads the files on r; everything else falls through to scrolling.
 	if m.pane == paneAccess && !m.searching && msg.String() == "r" {
+		// On a refusal this re-decides the target and, when the cause has gone (the harvest has
+		// since reached the session), resolves it. refreshAccess reads no file for a target that
+		// still cannot resolve.
 		return m.refreshAccess()
 	}
 
@@ -571,6 +574,14 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 			if m.pane == paneTimeline {
 				return m.resumeTimeline()
 			}
+		case paneAccess:
+			// A pane with no horizontal axis, so left/h go back like the catalog's.
+			if m.access.returnPane != paneNone && m.access.returnPane != paneAccess {
+				m.pane = m.access.returnPane
+			} else {
+				m.pane = paneSessions
+			}
+			m.access.returnPane = paneNone
 		case paneTimeline:
 			// esc only: the pane binds left/h to its cursor, ahead of this arm.
 			if m.timeline.returnPane != paneNone {
@@ -1029,6 +1040,10 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		var cmd tea.Cmd
 		m.detailVp, cmd = m.detailVp.Update(msg)
 		return cmd
+	case paneAccess:
+		var cmd tea.Cmd
+		m.accessViews.vp, cmd = m.accessViews.vp.Update(msg)
+		return cmd
 	case panePipeline:
 		prev := m.pipelineTbl.Cursor()
 		var cmd tea.Cmd
@@ -1088,6 +1103,8 @@ func (m *model) goTop() {
 		m.detailCursorKey("g")
 	case panePluginDetail:
 		m.detailVp.GotoTop()
+	case paneAccess:
+		m.accessViews.vp.GotoTop()
 	}
 }
 
@@ -1109,6 +1126,8 @@ func (m *model) goBottom() {
 		m.detailCursorKey("G")
 	case panePluginDetail:
 		m.detailVp.GotoBottom()
+	case paneAccess:
+		m.accessViews.vp.GotoBottom()
 	}
 }
 
@@ -1146,6 +1165,10 @@ func (m *model) pageActivePane(msg tea.KeyMsg) tea.Cmd {
 	case panePluginDetail:
 		var cmd tea.Cmd
 		m.detailVp, cmd = m.detailVp.Update(msg)
+		return cmd
+	case paneAccess:
+		var cmd tea.Cmd
+		m.accessViews.vp, cmd = m.accessViews.vp.Update(msg)
 		return cmd
 	}
 	return nil
@@ -1344,6 +1367,17 @@ func (m *model) helpView() string {
 		return base + "  " + m.searchHints(m.pane) + "  [?] keys  [q] quit"
 	case panePluginDetail:
 		return "[↑↓] scroll  " + m.searchHints(m.pane) + "  [esc] back  [?] keys  [q] quit"
+	case paneAccess:
+		// [r] and the scroll keys only when there is a policy to re-read or scroll: a key that
+		// does nothing on screen reads as broken.
+		switch k := m.access.target.Kind; {
+		case k == targetNoEntry:
+			// The one refusal that time can fix: the harvest may reach the session.
+			return "[r] check again  [esc] back  [?] keys  [q] quit"
+		case !k.resolvable():
+			return "[esc] back  [?] keys  [q] quit"
+		}
+		return "[↑↓] scroll  [r] re-read files  " + m.searchHints(m.pane) + "  [esc] back  [?] keys  [q] quit"
 	case paneTimeline:
 		// [↑↓] only when there are rows to scroll to: a key that does nothing on screen reads as
 		// broken.
@@ -1527,6 +1561,8 @@ func (m *model) layout() {
 	m.agentsTbl.SetHeight(bodyH)
 	m.detailVp.Width = m.width
 	m.detailVp.Height = bodyH
+	m.accessViews.vp.Width = m.width
+	m.accessViews.vp.Height = bodyH
 	// Re-clamp the scroll offset to the new height, for the PLUGIN detail pane:
 	// nothing re-renders that one on a resize, so this is the only place its offset can
 	// be reconciled. The events detail pane is re-rendered just below and clamps itself

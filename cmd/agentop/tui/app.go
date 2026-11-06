@@ -2665,6 +2665,10 @@ func (m *model) paneView() string {
 	case paneTimeline:
 		title = m.sessionHeader(m.timeline.session, "timeline")
 		body = m.timelineBody()
+	case paneAccess:
+		title = m.sessionHeader(m.access.session, "access")
+		m.accessViews.vp.SetContent(m.accessBody())
+		body = m.accessViews.vp.View()
 	case paneCatalog:
 		title = fmt.Sprintf("%s · %s · catalog", m.appName(), m.endpoint)
 		if m.catalog == nil {

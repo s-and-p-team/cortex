@@ -1150,6 +1150,7 @@ func TestSpendBandNeedsScopeMarker_EveryPaneIsClassified(t *testing.T) {
 		paneEvents:   true, // one session's timeline
 		paneDetail:   true, // one event of it, manifest view included
 		paneTimeline: true, // one session's agents and hosts
+		paneAccess:   true, // one session's permission policy
 	}
 	// The panes that do not. Usage is listed here for its own reason: it states its scope in
 	// its own header, and a user who scoped it to one session chose that.
@@ -1168,7 +1169,7 @@ func TestSpendBandNeedsScopeMarker_EveryPaneIsClassified(t *testing.T) {
 		}
 		// A session is selected throughout: that is the state the marker exists for, and the
 		// state every pane is reachable in. The Timeline names its own, set when it opens.
-		m := &model{pane: p, selectedSess: "s1", timeline: timelineState{session: "s1"}}
+		m := &model{pane: p, selectedSess: "s1", timeline: timelineState{session: "s1"}, access: accessState{session: "s1"}}
 		if got := m.spendBandNeedsScopeMarker(); got != singleSession[p] {
 			t.Errorf("pane %v: spendBandNeedsScopeMarker() = %v, want %v", p, got, singleSession[p])
 		}

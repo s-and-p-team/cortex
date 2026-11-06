@@ -205,6 +205,8 @@ var jumpTargets = []jumpTarget{
 			"sessions table, the selected one from events"},
 	{key: "T", pane: paneTimeline,
 		desc: "the selected session's agents, tools and hosts on a time axis"},
+	{key: "V", pane: paneAccess,
+		desc: "the selected session's Claude Code permission rules and where each came from"},
 	{key: "P", pane: panePipeline,
 		desc: "the plugin chain this proxy runs, editable in $EDITOR"},
 	{key: "C", pane: paneCatalog,
@@ -235,7 +237,7 @@ func jumpsFrom(p paneID) []jumpTarget {
 			continue
 		}
 		switch jt.key {
-		case "T":
+		case "T", "V":
 			// Only where a session is already chosen. On Sessions it opens the highlighted
 			// row, so whether it works depends on the table, not the pane; its footer says so.
 			switch p {
@@ -394,6 +396,15 @@ var paneKeys = map[paneID]keyGroup{
 			{"esc / ← / h", "back"},
 		},
 	},
+	paneAccess: {
+		title:   "ACCESS (this pane)",
+		purpose: "the session's Claude Code permission policy, layer by layer",
+		bindings: []keyBinding{
+			{"↑↓ / jk", "scroll; g and G jump to the top and bottom"},
+			{"r", "re-read the settings files"},
+			{"esc / ← / h", "back"},
+		},
+	},
 	paneAgents: {
 		title: "AGENTS (this pane)",
 		// "coding" is load-bearing and pinned by
@@ -435,7 +446,7 @@ var paneKeys = map[paneID]keyGroup{
 // the overlay is stable across openings (Go map iteration is random).
 var otherPaneOrder = []paneID{
 	paneNamespaces, panePods, paneSessions, paneEvents,
-	paneDetail, paneAgents, paneUsage, paneTimeline, panePipeline, panePluginDetail, paneCatalog,
+	paneDetail, paneAgents, paneUsage, paneTimeline, paneAccess, panePipeline, panePluginDetail, paneCatalog,
 }
 
 // helpKeyColWidth is the fixed width of the key column so descriptions

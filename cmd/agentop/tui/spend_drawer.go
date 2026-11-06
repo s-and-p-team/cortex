@@ -290,6 +290,11 @@ func spendDrawerHostPane(pane paneID) (bool, string) {
 	case paneTimeline:
 		// Its own [w] picks the time window, and runs before the drawer's.
 		return false, "spend: the timeline's [w] is its window — open the drawer from the events pane"
+	case paneAccess:
+		// A permission policy has no spend to break down, and its body is a scrolling document
+		// sized by layout(): the drawer's rows would come out of the one thing on screen that
+		// needs them.
+		return false, "spend: the access pane shows permissions, not spend — open the drawer from the events pane"
 	case paneAgents:
 		// THE ROW UNDER THE CURSOR SCOPES THE DRAWER, and that is what makes this pane host it
 		// where the usage pane refuses. The pane's rows are a per-agent breakdown of ONE window,
