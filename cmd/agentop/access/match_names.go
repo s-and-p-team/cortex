@@ -50,6 +50,9 @@ func evaluateSpecifier(r Rule, pattern string, c Call, ctx MatchContext, res eva
 	if r.Tool == "Bash" {
 		return evaluateBash(r, pattern, c, res)
 	}
+	if pathRuleFamily(r.Tool) {
+		return evaluatePath(r, pattern, c, ctx, res)
+	}
 	res.state = evalUnknown
 	return res
 }
@@ -168,6 +171,7 @@ func mcpMatches(r Rule, name, tool string) (bool, []string, string) {
 // none). The whole string must match. It is the classic two-pointer algorithm: linear in
 // len(s) + len(pattern) for the work done per star, with no backtracking blow-up.
 func globMatch(pattern, s string) bool {
+	pattern = collapseStars(pattern)
 	p, i := 0, 0
 	star, mark := -1, 0
 	for i < len(s) {
