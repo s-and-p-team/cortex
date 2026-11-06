@@ -174,6 +174,16 @@ Rules (docs, "WebFetch", "MCP", "Agent", "Match by input parameter"):
 - [ ] `docs/agentop-access.md`, `cmd/agentop/README.md` (the RULE column, `--explain`, the verdict table and "what a match is not"), spec status.
 - [ ] `gofmt`, `go vet ./...`, `go test -race ./access/ ./tui/` and the `-run` selections in `.`.
 
+## Result of the real-data check (Task 7, 2026-11-06)
+
+Run over every tool call in the local transcripts (2,261 calls across 96 sessions, 1,134 with a recorded decision), each matched against the settings in effect for the directory it ran in. This is a sanity check, not a proof: transcripts record a decision for half the calls and name a rule for two.
+
+- The two calls Claude Code rejected because of a user-settings rule (`Read(.env)`, `Read(.env.*)`, both reached through `grep` on a `.env` file) were reported `none` by a rule-by-rule matcher. That was a real error, and the only one the check found. The matcher now treats any literal word of a Bash command, and any redirection target, as a possible file, and reports `unknown` when a Read or Edit deny or ask rule covers it. Both calls are now `unknown`; 22 calls overall are.
+- `2>&1`, `>&2` and `&>file` were split at the `&`, so `npm test 2>&1` read as two commands and an allow rule for `npm test *` gave `partial` on one of the commonest shell spellings. Fixed in the splitter.
+- No `deny` or `ask` verdict was produced for any call: the user has four deny rules, all file reads, and no ask rules. The deny and ask paths are therefore exercised by the docs' own tables and by mutation tests, not by this data.
+- The five `bashMiss:no-rule-match` records all come out `none`, as they should.
+- 49 calls Claude Code prompted for (`accept/user_temporary`) came out `partial` or `none`; none came out `allow`, except 3 where the allow rule is in the shared project file and waits for workspace trust, which the verdict says.
+
 ## Out of scope
 
 Recorded-decision display (granted vs used), policy-change detection, other agents (phase 5). Read/Edit rules applied to files named inside Bash commands (`cat`, `sed`, redirections) are not evaluated; the result says so when such rules exist.

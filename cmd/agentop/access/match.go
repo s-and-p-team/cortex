@@ -117,6 +117,19 @@ func (p Policy) Match(c Call, ctx MatchContext) Result {
 		res.Caveats = append(res.Caveats, s)
 	}
 
+	// A Bash command that names a file a Read or Edit deny or ask rule covers may have been
+	// refused for it (see match_bash_files.go). This view cannot tell which commands Claude Code
+	// treats as file commands, so such a command's verdict is unknown unless a higher rule
+	// already decided it.
+	var fileFound, fileUnknown []Rule
+	if c.Tool == "Bash" {
+		var cvs []string
+		fileFound, fileUnknown, cvs = bashNamedFileGuard(p.Rules, c, ctx)
+		for _, cv := range cvs {
+			addCaveat(cv)
+		}
+	}
+
 	for _, d := range [...]Decision{Deny, Ask, Allow} {
 		var matched, unknown []Rule
 		for _, r := range p.Rules {
@@ -135,6 +148,13 @@ func (p Policy) Match(c Call, ctx MatchContext) Result {
 			}
 		}
 
+		// The file guard counts as an unevaluable rule of its own decision: deny rules are checked
+		// first, then ask, so a guard from an ask rule does not hide a matching deny.
+		for _, g := range append(append([]Rule{}, fileFound...), fileUnknown...) {
+			if g.Decision == d {
+				unknown = append(unknown, g)
+			}
+		}
 		switch {
 		case d == Allow:
 			res.Unevaluated = append(res.Unevaluated, unknown...)

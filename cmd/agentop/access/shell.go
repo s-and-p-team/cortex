@@ -267,6 +267,20 @@ func (s *splitter) scanList(depth int, closer string) {
 			}
 
 		case '<', '>':
+			// ">&" and "<&" duplicate a file descriptor: the & belongs to the redirection, so it is
+			// consumed with it and is never taken for the background operator.
+			if s.i+1 < len(s.src) && s.src[s.i+1] == '&' {
+				cur.WriteByte(c)
+				cur.WriteByte('&')
+				s.i += 2
+				continue
+			}
+			// ">|" is the clobber redirect, not a pipe.
+			if c == '>' && s.i+1 < len(s.src) && s.src[s.i+1] == '|' {
+				cur.WriteString(">|")
+				s.i += 2
+				continue
+			}
 			if (c == '<' || c == '>') && s.i+1 < len(s.src) && s.src[s.i+1] == '(' {
 				// process substitution: a command list in its own right
 				start := s.i
@@ -322,6 +336,11 @@ func (s *splitter) scanList(depth int, closer string) {
 
 		case '&':
 			switch {
+			// "&>" and "&>>" redirect both streams to a file. They are redirections, so the word
+			// continues; the target is read by the file-word extraction.
+			case s.peek("&>"):
+				cur.WriteByte(c)
+				s.i++
 			case s.peek("&&"):
 				if strings.TrimSpace(cur.String()) == "" && len(nested) == 0 && !hadCommand {
 					s.fail("a command starts with &&")

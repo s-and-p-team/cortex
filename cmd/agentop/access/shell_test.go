@@ -313,3 +313,59 @@ func TestSplitCommand_DescribesWhatIsUnterminated(t *testing.T) {
 		}
 	}
 }
+
+// "2>&1" and its relatives redirect a file descriptor. The & in them is not the background
+// operator, and treating it as one splits `npm test 2>&1` into two commands, which makes an allow
+// rule for `npm test *` report "partial" for one of the most common spellings there is.
+func TestSplitCommand_DescriptorRedirectionsAreNotSeparators(t *testing.T) {
+	cases := []struct {
+		in   string
+		want []string
+	}{
+		{"npm test 2>&1", []string{"npm test 2>&1"}},
+		{"npm test 2>&1 | tail -5", []string{"npm test 2>&1", "tail -5"}},
+		{"cmd >&2", []string{"cmd >&2"}},
+		{"cmd <&0", []string{"cmd <&0"}},
+		{"cmd 1>&2 2>&1", []string{"cmd 1>&2 2>&1"}},
+		{"cmd >&/dev/null", []string{"cmd >&/dev/null"}},
+		{"cmd 2>&1 && other", []string{"cmd 2>&1", "other"}},
+		// &> and &>> are redirections of both streams to a file, not a background operator
+		{"cmd &>f", []string{"cmd &>f"}},
+		{"cmd &>>f", []string{"cmd &>>f"}},
+		{"cmd &> f", []string{"cmd &> f"}},
+		// the real background operator still separates
+		{"a & b", []string{"a", "b"}},
+		{"a &", []string{"a"}},
+		{"a && b", []string{"a", "b"}},
+		{"a&b", []string{"a", "b"}},
+		// |& pipes both streams; it is a separator
+		{"a |& b", []string{"a", "b"}},
+		// the clobber redirect >| is a redirection, not a pipe
+		{"cmd >| f", []string{"cmd >| f"}},
+		{"cmd >|f", []string{"cmd >|f"}},
+	}
+	for _, c := range cases {
+		p := splitCommand(c.in)
+		if !p.ok {
+			t.Errorf("splitCommand(%q) unparseable: %s", c.in, p.reason)
+			continue
+		}
+		if strings.Join(p.subs, "\x00") != strings.Join(c.want, "\x00") {
+			t.Errorf("splitCommand(%q) = %q, want %q", c.in, p.subs, c.want)
+		}
+	}
+}
+
+func TestMatch_AnAllowRuleStillCoversACommandWithAFileDescriptorRedirect(t *testing.T) {
+	allow := pol(rl(Allow, "Bash(npm test *)"))
+	for _, cmd := range []string{"npm test 2>&1", "npm test 2>&1 | tail -5", "npm test >out.log 2>&1", "npm test &>out.log"} {
+		got := allow.Match(bash(cmd), MatchContext{})
+		want := VerdictAllow
+		if strings.Contains(cmd, "tail") {
+			want = VerdictPartial // tail -5 is a second command no rule covers
+		}
+		if got.Verdict != want {
+			t.Errorf("Bash(npm test *) vs %q: %v, want %v\n%+v", cmd, got.Verdict, want, got.Caveats)
+		}
+	}
+}

@@ -136,6 +136,17 @@ Bash command text split into subcommands (compounds, `$( )`, subshells, loops, w
 `timeout` and `nohup`, leading assignments), Read and Edit paths with the four anchors, WebFetch
 domains, `Agent(name)`, `Skill(name)`, and `Tool(param:value)` rules.
 
+**Files named inside a Bash command.** Claude Code applies `Read(...)` and `Edit(...)` deny and
+ask rules to the files that file commands name inside Bash (`cat`, `head`, `sed`, `tee`, ...) and
+to redirection targets. It does not list which commands count, and a recorded session shows
+`grep` does: two commands were refused by `Read(.env)` and `Read(.env.*)` that a rule-by-rule
+reading calls unmatched. So any literal word of a Bash command, and any redirection target, is
+treated as a possible file. When a Read or Edit deny or ask rule covers one, the verdict is
+`unknown`, with the rule listed, and not `none`. The cost is a few `unknown`s for commands that
+merely mention a guarded name (`echo .env`); the alternative is calling a refused command
+"no rule matches". Words built from `$VAR`, globs or substitutions are not expanded, and the
+note says so.
+
 What it will not guess at: `!` negation, `[...]` classes and backslash escapes in path
 patterns; a command it cannot split (unterminated quote, dangling `&&`, over 10,000
 characters); symlinks; a Skill's aliases; and the `/path` anchor of a `--settings` file. Each
