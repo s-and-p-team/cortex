@@ -600,6 +600,9 @@ type model struct {
 	// accessResolve is the resolver; nil means access.Resolve. A field so tests do not read the
 	// real home directory.
 	accessResolve func(access.Input) (access.Policy, error)
+	// rulePolicy is the policy the RULE column and the event detail's ACCESS block match against;
+	// see access_rule_col.go.
+	rulePolicy *rulePolicyState
 
 	// spend backs the always-on spend strip. Separate from usage on purpose —
 	// see spendState, which records why sharing one poll chain would blank the
@@ -1373,6 +1376,17 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if m.pane != before {
 		cmd = tea.Batch(tea.ClearScreen, cmd)
 	}
+	// The RULE column's work is started HERE, after the message is handled and never from a cell:
+	// resolving a policy and fetching responses are I/O, and a cell runs on every rebuild.
+	// ruleWork returns nil unless the column is on, and ruleResolvedMsg and ruleCallsMsg call it
+	// themselves, so this is what starts the first resolve.
+	switch msg.(type) {
+	case ruleResolvedMsg, ruleCallsMsg:
+	default:
+		if w := m.ruleWork(); w != nil {
+			cmd = tea.Batch(cmd, w)
+		}
+	}
 	return next, cmd
 }
 
@@ -1633,6 +1647,16 @@ func (m *model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case accessLoadedMsg:
 		m.handleAccessLoaded(msg)
 		return m, nil
+
+	case ruleResolvedMsg:
+		m.applyRuleResolved(msg)
+		m.rebuildEventsTable()
+		return m, m.ruleWork()
+
+	case ruleCallsMsg:
+		m.applyRuleCalls(msg)
+		m.rebuildEventsTable()
+		return m, m.ruleWork()
 
 	case timelineTickMsg:
 		return m, m.handleTimelineTick(msg)

@@ -86,9 +86,8 @@ directory by an older version is read too, and rules from both apply.
   a cluster has no entry here, and a local session whose directory has since been
   deleted is noted as such.
 
-Matching a specific tool call against these rules is not implemented yet, so the
-output says which rules exist and which shadow each other, not what happened to
-a given call.
+Without `--explain` the output says which rules exist and which shadow each other. With it,
+which of them applies to one call.
 
 ## Secrets
 
@@ -105,6 +104,43 @@ are `[]` and never `null`, and the output is byte-identical across runs for the 
 files: rules are ordered by decision, tool, pattern and layer. A shadowed rule
 carries `shadowedBy` with the decision, text and layer of the rule that shadows it.
 
+## Which rule applies to a tool call
+
+`--explain` takes a call written the way a rule is and says which rule applies:
+
+```sh
+agentop access --explain 'Bash(git push origin main)'
+agentop access --session 0834b33b --explain 'Read(./.env)'
+agentop access --explain 'WebFetch(domain:example.com)' --json
+```
+
+The answer is one of six verdicts, and it is a statement about **rules**, not about what
+happened:
+
+| Verdict | Meaning |
+|---|---|
+| `deny` | a deny rule matches. Claude Code refuses the call; no hook or mode lifts a deny rule. |
+| `ask` | an ask rule matches and no deny does. Claude Code prompts, even if an allow rule also matches. |
+| `allow` | allow rules cover the whole call (every subcommand, for Bash) and no deny or ask matches. |
+| `partial` | Bash only: some subcommands are covered by allow rules and some are not. |
+| `none` | no rule matches. **This is not "allowed" and not "prompts".** |
+| `unknown` | a rule that could outrank the result cannot be evaluated here, so no lower decision is reported past it. |
+
+`none` is the one to read twice. The built-in read-only command set (`ls`, `cat`, read-only
+`git`, ...), the permission mode, the auto-mode classifier, hooks and the sandbox decide what
+happens when no rule matches, and none of them is a rule. The deciding rule is shown with the
+layer and file it came from, and every condition on the answer is listed as a `NOTE`.
+
+What is matched, following the permissions docs: tool names and globs, `mcp__server__tool`,
+Bash command text split into subcommands (compounds, `$( )`, subshells, loops, wrappers such as
+`timeout` and `nohup`, leading assignments), Read and Edit paths with the four anchors, WebFetch
+domains, `Agent(name)`, `Skill(name)`, and `Tool(param:value)` rules.
+
+What it will not guess at: `!` negation, `[...]` classes and backslash escapes in path
+patterns; a command it cannot split (unterminated quote, dangling `&&`, over 10,000
+characters); symlinks; a Skill's aliases; and the `/path` anchor of a `--settings` file. Each
+makes the rule `unknown` or adds a note rather than a wrong answer.
+
 ## In the viewer
 
 `V` opens the same answer in `agentop observe`, over the selected session. It is drawn
@@ -113,5 +149,18 @@ shows nothing, and says why, for a session on another machine (including a
 port-forward to a pod), one the harvest has not read yet, or one another agent ran.
 A session with no recorded directory shows the user and managed layers only. See the
 `Access` entry in [`cmd/agentop/README.md`](../cmd/agentop/README.md).
+
+### The RULE column and the ACCESS block
+
+In the events pane, the column picker (`c`) offers a **RULE** column, off by default. For a
+response in which the model asked for tools it shows the strongest verdict among the calls, with
+a count (`deny`, `ask ×2`). It is blank on every other row, `…` while the calls are being
+fetched, and `n/a` for a session whose policy cannot be shown here.
+
+The events list is fetched without message bodies (`view=summary`), which drops the tool calls.
+So the column fetches each tool-call *response* in full, four at a time, only while it is on. A
+response is small (median 433 bytes, 95th percentile 3.9 KB across 2,219 real tool-call turns),
+and the detail pane already makes the same request per row. Opening the detail of such a
+response shows an **ACCESS** block: each call, the rule that applies, and the notes.
 
 Design: [`superpowers/specs/2026-11-06-agentop-access-view-design.md`](superpowers/specs/2026-11-06-agentop-access-view-design.md).

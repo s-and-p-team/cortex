@@ -155,18 +155,13 @@ func relUnder(base, target string) (string, bool) {
 	return "", false
 }
 
-// pathPatternMatches matches rel (a path relative to the anchor) against rest (the pattern with
+// pathPatternMatchesBounded matches rel (a path relative to the anchor) against rest (the pattern with
 // its anchor prefix removed), applying gitignore's depth rules.
 //
 // A pattern with no slash in it (".env", "*.env") is a bare name: gitignore matches it at any
 // depth under the anchor. A pattern with a slash is matched from the anchor. The one exception
 // the docs spell out is a single-segment DIRECTORY pattern written without an anchor ("src/**"):
 // a deny or ask rule matches it at any depth, an allow rule only at the anchor.
-func pathPatternMatches(d Decision, original, rest, rel string) bool {
-	ok, _ := pathPatternMatchesBounded(d, original, rest, rel)
-	return ok
-}
-
 func pathPatternMatchesBounded(d Decision, original, rest, rel string) (matched, evaluated bool) {
 	rest = strings.TrimSuffix(rest, "/")
 	if rest == "" {
@@ -194,11 +189,6 @@ func pathPatternMatchesBounded(d Decision, original, rest, rel string) (matched,
 		// A multi-segment pattern ("src/components/**", "docs/*.md") matches from the anchor.
 		return pathGlobBounded(rest, rel)
 	}
-}
-
-// matchAtAnyDepth matches pattern against rel as if it were prefixed with **/.
-func matchAtAnyDepth(pattern, rel string) bool {
-	return pathGlob("**/"+pattern, rel)
 }
 
 // unsupportedPathSyntax reports pattern syntax this matcher does not implement.

@@ -245,3 +245,71 @@ func TestStripWrappers_TerminatesAndNeverPanics(t *testing.T) {
 		_, _ = stripWrappers(in)
 	}
 }
+
+// Inside double quotes only $( ), backticks and the closing quote are special. The branches that
+// handle each are the ones a quoted string can hide a command in.
+func TestSplitCommand_DoubleQuotedConstructs(t *testing.T) {
+	cases := []struct {
+		in       string
+		want     []string // among the subcommands
+		wantFail bool
+	}{
+		{`echo "a $(rm x) b"`, []string{"rm x"}, false},
+		{"echo \"a `rm x` b\"", []string{"rm x"}, false},
+		{`echo "$(echo $(rm x))"`, []string{"rm x"}, false},
+		{`echo "arith $((1+2)) done"`, nil, false},
+		{`echo "escaped \" quote $(rm y)"`, []string{"rm y"}, false},
+		{`echo "tail \`, nil, true},
+		{`echo "unterminated $(rm x`, nil, true},
+		{`echo "arith $((1+2`, nil, true},
+		{"echo \"a `rm x", nil, true},
+		{`echo "never closes`, nil, true},
+	}
+	for _, c := range cases {
+		p := splitCommand(c.in)
+		if p.ok == c.wantFail {
+			t.Errorf("splitCommand(%q) ok=%v, want ok=%v (%s)", c.in, p.ok, !c.wantFail, p.reason)
+			continue
+		}
+		for _, w := range c.want {
+			found := false
+			for _, s := range p.subs {
+				found = found || s == w
+			}
+			if !found {
+				t.Errorf("splitCommand(%q) = %q, missing %q", c.in, p.subs, w)
+			}
+		}
+	}
+}
+
+func TestSplitCommand_ArithmeticAndExpansionAreNotCommands(t *testing.T) {
+	for _, in := range []string{`echo $((rm x))`, `echo ${rm}`, `echo ${x:-$(ls)}`} {
+		p := splitCommand(in)
+		if !p.ok {
+			t.Errorf("splitCommand(%q) unparseable: %s", in, p.reason)
+			continue
+		}
+		for _, s := range p.subs {
+			if s == "rm x" || s == "rm" {
+				t.Errorf("splitCommand(%q) surfaced %q as a command", in, s)
+			}
+		}
+	}
+}
+
+func TestSplitCommand_DescribesWhatIsUnterminated(t *testing.T) {
+	for in, want := range map[string]string{
+		"(ls":               "parenthesis",
+		"echo `ls":          "backtick",
+		"{ ls":              "brace group",
+		"echo $(ls":         "parenthesis",
+		`echo $'abc`:        "$'",
+		"for x in a; do ls": "compound",
+	} {
+		p := splitCommand(in)
+		if p.ok || !strings.Contains(p.reason, want) {
+			t.Errorf("splitCommand(%q): ok=%v reason=%q, want a reason mentioning %q", in, p.ok, p.reason, want)
+		}
+	}
+}

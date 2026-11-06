@@ -629,11 +629,11 @@ inside agentop. `agentop script` installs one in a single step:
 
 ## Reading an agent's permission policy (`agentop access`)
 
-`agentop access [--cwd PATH | --session ID] [--json]` prints the Claude Code permission rules in
+`agentop access [--cwd PATH | --session ID] [--explain 'Tool(content)'] [--json]` prints the Claude Code permission rules in
 effect for a directory, merged across the managed, `--settings`, local, project
 and user layers, with the file each came from, which rules shadow which, and
 anything risky (`bypassPermissions`, an unrestricted `Bash` allow, the sandbox off).
-`--session` resolves it for a harvested session, from the directory it started in and the mode it was recorded in. It reads settings files as they are now: managed policy from MDM or the claude.ai
+`--session` resolves it for a harvested session, from the directory it started in and the mode it was recorded in. `--explain 'Bash(git push origin main)'` says which rule applies to one tool call (deny, ask, allow, partial, none or unknown) and where it came from; `none` means no rule matches, not that the call is allowed. In the viewer, the events pane's column picker offers a RULE column (off by default) and a tool-call response's detail gets an ACCESS block. It reads settings files as they are now: managed policy from MDM or the claude.ai
 console, launch flags and workspace trust are not on disk and are not shown. See
 [`docs/agentop-access.md`](../../docs/agentop-access.md).
 

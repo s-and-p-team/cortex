@@ -372,3 +372,27 @@ func TestMatch_TrustCaveatIsPrecise(t *testing.T) {
 		t.Errorf("a deny does not wait for trust: %q", got.Caveats)
 	}
 }
+
+func TestVerdictAndDecisionAndLayerNames(t *testing.T) {
+	for d, s := range map[Decision]string{Deny: "deny", Ask: "ask", Allow: "allow", Decision(9): "unknown"} {
+		if d.String() != s {
+			t.Errorf("Decision(%d) = %q, want %q", d, d.String(), s)
+		}
+	}
+	for k, s := range map[LayerKind]string{Managed: "managed", CLI: "cli", Local: "local", Project: "project", User: "user", LayerKind(9): "unknown"} {
+		if k.String() != s {
+			t.Errorf("LayerKind(%d) = %q, want %q", k, k.String(), s)
+		}
+	}
+	for v, s := range map[Severity]string{Low: "low", Medium: "medium", High: "high", Severity(9): "unknown"} {
+		if v.String() != s {
+			t.Errorf("Severity(%d) = %q, want %q", v, v.String(), s)
+		}
+	}
+	if b, _ := Deny.MarshalText(); string(b) != "deny" {
+		t.Errorf("Deny.MarshalText = %q", b)
+	}
+	if isEditTool("Read") || !isEditTool("MultiEdit") || !isEditTool("NotebookEdit") {
+		t.Error("isEditTool mis-classifies a tool")
+	}
+}

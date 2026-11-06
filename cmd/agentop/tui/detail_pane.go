@@ -52,7 +52,7 @@ func (m *model) showDetail(r eventRow, resetScroll bool) {
 		if r.tunnel != nil {
 			tunnel = tunnelHeader(r.tunnel)
 		}
-		for _, h := range []string{tlsHeader(e.TLS), rewriteHeader(e), servedHeader(e), timingHeader(e), tunnel} {
+		for _, h := range []string{tlsHeader(e.TLS), rewriteHeader(e), servedHeader(e), timingHeader(e), tunnel, m.accessDetailBlock(e)} {
 			if h != "" {
 				m.detailHead = append(m.detailHead, strings.Split(h, "\n")...)
 				m.detailHead = append(m.detailHead, "")

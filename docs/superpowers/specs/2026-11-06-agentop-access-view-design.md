@@ -277,7 +277,11 @@ Each phase is independently shippable.
    printed settings text raw, which is a terminal-injection path from a cloned
    repo's `.claude/settings.json` and is fixed first. *Done.* The remote test is
    the one `e` and `S` use, and an unknown local endpoint counts as remote.
-4. **Matching:** `Policy.Match`, `RULE` column, detail-pane fold.
+4. **Matching:** `Policy.Match`, `RULE` column, detail-pane fold. *Done.* Beyond the
+   plan: the events list is fetched with `view=summary`, which drops `ToolCalls`, so the
+   column fetches tool-call *responses* in full (four at a time, only while it is on); and
+   a glob table that recursed once per path segment cost 7 s under the race detector, so
+   it is bottom-up and bounded.
    Planned in `docs/superpowers/plans/2026-11-06-agentop-access-match.md`. Findings
    that shaped it: tool calls (name + JSON arguments) are already on response
    events, so no transcript is needed; transcripts record a decision for only 981

@@ -34,6 +34,7 @@ const (
 	colCost     eventColumnID = "COST"
 	colHost     eventColumnID = "HOST"
 	colBytes    eventColumnID = "BYTES"
+	colRule     eventColumnID = "RULE"
 )
 
 // cellContext is what a cell function needs beyond the event itself.
@@ -293,6 +294,16 @@ var eventColumns = []eventColumn{
 	// severity for topInvocation's "which invocation headlines this row" question;
 	// a user sorting the ACTION column is grouping like with like, and a severity
 	// order would put rows under a heading whose alphabet they do not follow.
+	// RULE: which permission rule applies to the tool calls a response asked for. OFF by default
+	// because it costs a small request per tool call (see access_rule_col.go), and keepLow so a
+	// narrow terminal gives it up before anything the reader already relies on.
+	{id: colRule, width: 10, defaultOn: false, keep: keepLow,
+		desc: "which permission RULE applies to the tool calls a response asked for (deny, ask, allow, partial, none, unknown): about rules, not outcomes",
+		cell: func(c cellContext) string {
+			return trunc(c.m.ruleCell(c.row.event), c.width)
+		},
+		full:    func(c cellContext) string { return c.m.ruleCell(c.row.event) },
+		sortKey: func(c cellContext) sortValue { return strKey(c.m.ruleCell(c.row.event)) }},
 	{id: colAction, width: actionColWidth, defaultOn: true, keep: keepNormal,
 		desc:    "what took effect: deny, modify, observe, allow, or tunnel",
 		cell:    func(c cellContext) string { return c.action },
