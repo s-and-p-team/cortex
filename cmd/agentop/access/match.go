@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 )
 
 // Verdict is what the rules say about one tool call. It is a statement about RULES, never about
@@ -137,15 +138,13 @@ func (p Policy) Match(c Call, ctx MatchContext) Result {
 		switch {
 		case d == Allow:
 			res.Unevaluated = append(res.Unevaluated, unknown...)
+			if c.Tool == "Bash" {
+				finishBashAllow(&res, p.Rules, matched, c, len(unknown), addCaveat)
+				return res
+			}
 			if len(matched) > 0 {
 				res.Verdict, res.Rules = VerdictAllow, matched
-				needTrust := true
-				for _, r := range matched {
-					needTrust = needTrust && r.NeedsTrust
-				}
-				if needTrust {
-					addCaveat("this allow rule is in the shared project file, so it applies only after the folder is trusted")
-				}
+				noteTrust(matched, addCaveat)
 				return res
 			}
 			if len(unknown) > 0 {
@@ -165,6 +164,65 @@ func (p Policy) Match(c Call, ctx MatchContext) Result {
 		}
 	}
 	return res
+}
+
+// noteTrust adds the workspace-trust caveat when EVERY matching allow rule lives in the shared
+// project file: one that does not wait for trust makes the caveat noise.
+func noteTrust(matched []Rule, addCaveat func(string)) {
+	for _, r := range matched {
+		if !r.NeedsTrust {
+			return
+		}
+	}
+	addCaveat("this allow rule is in the shared project file, so it applies only after the folder is trusted")
+}
+
+// finishBashAllow settles the allow stage for a Bash call, which is not "some rule matched": it
+// is "every subcommand is covered". It runs only after no deny or ask rule applied, and it
+// fills res in place.
+//
+// matched holds the allow rules that matched the call as a whole, which for Bash means the
+// bare ones (Bash, Bash(*)): they cover every use, whatever the command, parseable or not.
+func finishBashAllow(res *Result, rules, matched []Rule, c Call, unknownAllows int, addCaveat func(string)) {
+	if cv := bashBoundaryCaveat(rules, c); cv != "" {
+		addCaveat(cv)
+	}
+	if len(matched) > 0 {
+		res.Verdict, res.Rules = VerdictAllow, matched
+		noteTrust(matched, addCaveat)
+		return
+	}
+	covered, total, uncovered, ok := bashAllowCoverage(rules, c)
+	if !ok {
+		if unknownAllows > 0 {
+			addCaveat(fmt.Sprintf("%d allow rule(s) could not be evaluated; they could only have allowed this call", unknownAllows))
+		}
+		return
+	}
+	var deciding []Rule
+	for _, r := range rules {
+		if r.Tool == "Bash" && r.Decision == Allow && r.Ignored == "" && bashRuleCoversSome(r, c) {
+			deciding = append(deciding, r)
+		}
+	}
+	switch {
+	case covered == total && total > 0:
+		res.Verdict, res.Rules = VerdictAllow, deciding
+		noteTrust(deciding, addCaveat)
+	case covered > 0:
+		res.Verdict, res.Rules = VerdictPartial, deciding
+		addCaveat(fmt.Sprintf("%d of %d subcommands are covered by allow rules; not covered: %s. Whether those run is decided by the read-only command set, the permission mode and the classifier, none of which are rules",
+			covered, total, quoteList(uncovered)))
+		noteTrust(deciding, addCaveat)
+	}
+}
+
+func quoteList(items []string) string {
+	q := make([]string, len(items))
+	for i, s := range items {
+		q[i] = fmt.Sprintf("%q", abbreviate(s))
+	}
+	return strings.Join(q, ", ")
 }
 
 func verdictOf(d Decision) Verdict {

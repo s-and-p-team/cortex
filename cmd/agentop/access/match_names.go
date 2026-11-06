@@ -47,6 +47,9 @@ func evaluateSpecifier(r Rule, pattern string, c Call, ctx MatchContext, res eva
 		res.state = evalNoMatch
 		return res
 	}
+	if r.Tool == "Bash" {
+		return evaluateBash(r, pattern, c, res)
+	}
 	res.state = evalUnknown
 	return res
 }
