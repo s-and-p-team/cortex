@@ -271,6 +271,11 @@ Each phase is independently shippable.
    a `rev` so an older entry is re-read once, since the mtime-based incremental
    skip would otherwise leave them without the new fields indefinitely.
 3. **`paneAccess`:** layer stack, scalars, rules table, risk strip.
+   Planned in `docs/superpowers/plans/2026-11-06-agentop-access-pane.md`. Two
+   findings from reading the code: the rules view is a text viewport, not a table
+   (table cells cannot carry the ANSI that dims a shadowed rule), and `Text()`
+   printed settings text raw, which is a terminal-injection path from a cloned
+   repo's `.claude/settings.json` and is fixed first.
 4. **Matching:** `Policy.Match`, `RULE` column, detail-pane fold.
 5. **Later:** granted-vs-used report, policy-change detection mid-session,
    other agents.
