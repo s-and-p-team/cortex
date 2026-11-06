@@ -102,7 +102,44 @@ type SessionMetadata struct {
 	// the raw id (which is what a non-Claude-Code agent or an agent-team teammate
 	// renders anyway, having no meta.json to join to).
 	Subagents map[string]SubagentInfo `json:"subagents,omitempty"`
+	// Cwd is the directory the session STARTED in, verbatim: an absolute path with no
+	// normalisation beyond a trailing slash. Empty when the transcript records none, or only
+	// ones that are not usable as a path (relative, control characters, longer than a path
+	// can be). The access view resolves a session's settings files from it, so a value that
+	// had been repaired would name a different directory and show another tree's policy;
+	// dropping is the safe failure.
+	//
+	// The FIRST cwd, not the last, and not the one Title falls back to. A transcript's cwd
+	// follows a Bash `cd`, so it wanders within a session (measured: 44 of 96 transcripts
+	// held more than one), while Claude Code reads project settings from the directory the
+	// session started in, which is also the directory its transcript is filed under (the
+	// first cwd matched that name in 96 of 96, the last in 62).
+	//
+	// KNOWN GAP: `/cd` moves the session's primary working directory, and with it the
+	// project settings files Claude Code reads. A transcript does not distinguish that from
+	// a `cd` in a command, so a session that used `/cd` is reported at its starting
+	// directory.
+	Cwd string `json:"cwd,omitempty"`
+	// PermissionMode is the latest permission mode the transcript records for the session
+	// (default, acceptEdits, plan, auto, bypassPermissions, dontAsk, ...), as written. A
+	// session's mode changes while it runs (13 of 94 recording transcripts changed it), so
+	// this is the mode it ended in, not the configured default. A short identifier or "".
+	PermissionMode string `json:"permissionMode,omitempty"`
+	// HarvestRev is the revision of the harvester that wrote this entry; see
+	// CurrentHarvestRev. Zero means written before revisions existed.
+	HarvestRev int `json:"rev,omitempty"`
 }
+
+// CurrentHarvestRev is the revision of what ReadSessions extracts from a transcript. An
+// incremental harvest skips a transcript whose mtime has not moved, which is only sound if
+// the entry already holds everything this release would read; an entry below this revision
+// cannot vouch for that, so it is re-read once and stamped.
+//
+// Bump it when ReadSessions starts reading something new from a transcript. Not for a
+// change to how an existing field is displayed.
+//
+// History: 1 added Cwd and PermissionMode.
+const CurrentHarvestRev = 1
 
 // SubagentInfo is one harvested subagent: what Claude Code's own record of it says
 // that the wire does not carry. Every field optional, for the same reason as

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -468,7 +469,7 @@ func ReadSessions(configDir string, since map[string]SessionMetadata) (map[strin
 				continue
 			}
 			won[id] = st.ModTime()
-			title, terr := titleFromTranscript(path)
+			facts, terr := readTranscript(path)
 			if terr != nil {
 				// Collected rather than returned: one bad transcript must not cost the
 				// other hundred names, which is the whole reason this is best-effort. The
@@ -477,7 +478,10 @@ func ReadSessions(configDir string, since map[string]SessionMetadata) (map[strin
 				partial = append(partial, fmt.Sprintf("%s: %v", path, terr))
 			}
 			out[id] = SessionMetadata{
-				Title:          title,
+				Title:          facts.title,
+				Cwd:            facts.cwd,
+				PermissionMode: facts.mode,
+				HarvestRev:     CurrentHarvestRev,
 				AgentType:      "Claude Code",
 				AgentConfigDir: configDir,
 				LogFile:        path,
@@ -550,10 +554,33 @@ func harvestedAt(m SessionMetadata, want string) time.Time {
 	if m.LogFile == "" || m.LogFile != want {
 		return time.Time{}
 	}
+	// An entry from an older harvester lacks what this one reads (see CurrentHarvestRev), and
+	// the transcript's mtime cannot say so. Re-read it once.
+	if m.HarvestRev < CurrentHarvestRev {
+		return time.Time{}
+	}
 	return m.LogModTime
 }
 
-// titleFromTranscript reads one transcript and returns the best name for it.
+// transcriptFacts is what one pass over a transcript yields.
+type transcriptFacts struct {
+	title string
+	// cwd is the first usable working directory; see SessionMetadata.Cwd.
+	cwd string
+	// mode is the latest usable permission mode; see SessionMetadata.PermissionMode.
+	mode string
+}
+
+// titleFromTranscript is readTranscript's title alone, for callers that want nothing else.
+func titleFromTranscript(path string) (string, error) {
+	f, err := readTranscript(path)
+	return f.title, err
+}
+
+// readTranscript reads one transcript and returns the best name for it, plus the starting
+// directory and permission mode it records (transcriptFacts).
+//
+// The rest of this comment is about the TITLE, which is the original job.
 //
 // The model-generated title when the transcript carries one, otherwise the working
 // directory it ran in, otherwise "". Both are LAST-wins: a session can be titled more
@@ -577,10 +604,10 @@ func harvestedAt(m SessionMetadata, want string) time.Time {
 // function's fallbacks make a truncated read indistinguishable from a session that simply
 // has no title, and the difference matters when the answer is a stale title from early in
 // a long session rather than the current one.
-func titleFromTranscript(path string) (string, error) {
+func readTranscript(path string) (transcriptFacts, error) {
 	f, err := os.Open(path) //nolint:gosec // operator-supplied transcript dir
 	if err != nil {
-		return "", err
+		return transcriptFacts{}, err
 	}
 	defer f.Close() //nolint:errcheck // read-only
 
@@ -604,6 +631,8 @@ func titleFromTranscript(path string) (string, error) {
 	//   blocks — text extracted from a content ARRAY. Last resort: these are where the harness
 	//            injects, and a "Base directory for this skill: …" title came from one.
 	var title, cwd, lastPrompt, human, str, blocks string
+	// startCwd and mode are NOT part of the title: see SessionMetadata.Cwd and .PermissionMode.
+	var startCwd, mode string
 	for sc.Scan() {
 		line := sc.Bytes()
 		// Hot path: most lines are conversation turns carrying neither field. A
@@ -621,6 +650,7 @@ func titleFromTranscript(path string) (string, error) {
 		if !bytes.Contains(line, []byte(`"aiTitle"`)) &&
 			!bytes.Contains(line, []byte(`"agentName"`)) &&
 			!bytes.Contains(line, []byte(`"cwd"`)) &&
+			!bytes.Contains(line, []byte(`"permissionMode"`)) &&
 			!bytes.Contains(line, []byte(`"lastPrompt"`)) &&
 			!bytes.Contains(line, []byte(`"role"`)) &&
 			// A UNICODE-ESCAPED member name would not match any literal above: JSON permits
@@ -646,6 +676,17 @@ func titleFromTranscript(path string) (string, error) {
 		// deliberately keeps its full length and the renderer truncates from the left.
 		if c := normalizeTitle(e.Cwd); c != "" {
 			cwd = c
+		}
+		// The starting directory is a separate question from the title fallback above: first
+		// usable wins, and the value is checked rather than normalised, since a repaired path
+		// names a different directory.
+		if startCwd == "" {
+			if c, ok := usableStartCwd(e.Cwd); ok {
+				startCwd = c
+			}
+		}
+		if m, ok := usablePermissionMode(e.PermissionMode); ok {
+			mode = m
 		}
 		// Guarded on Type as well as on the value: "aiTitle" appearing on some other
 		// line kind is not a title claim.
@@ -749,20 +790,23 @@ func titleFromTranscript(path string) (string, error) {
 	// bare `!= ""` and clipTitle then empties it, so the tier below was skipped and the cell came
 	// out blank — testing the clipped value is what makes each guard mean "this tier has
 	// something to show".
+	done := func(t string) (transcriptFacts, error) {
+		return transcriptFacts{title: t, cwd: startCwd, mode: mode}, err
+	}
 	title, lastPrompt = clipTitle(title), clipTitle(lastPrompt)
 	human, str = clipTitle(human), clipTitle(str)
 	blocks = clipTitle(blocks)
 	switch {
 	case title != "":
-		return title, err
+		return done(title)
 	case lastPrompt != "":
-		return lastPrompt, err
+		return done(lastPrompt)
 	case human != "":
-		return human, err
+		return done(human)
 	case str != "":
-		return str, err
+		return done(str)
 	case blocks != "":
-		return blocks, err
+		return done(blocks)
 	}
 	// THE CWD IS NOT CLIPPED. A path's distinguishing end is its LEAF, and clipping keeps the
 	// head: two sibling worktrees under a prefix of 80 runes or more clip to byte-identical
@@ -793,7 +837,7 @@ func titleFromTranscript(path string) (string, error) {
 	// whether it is empty, and this call is the guarantee for the RETURN. normalizeTitle is idempotent
 	// (asserted, since its fixed-point loop is what makes that true), so the second pass costs one
 	// walk and means this line does not depend on every assignment upstream having been normalised.
-	return clipCwd(normalizeTitle(cwd)), err
+	return done(clipCwd(normalizeTitle(cwd)))
 }
 
 // MaxCwdLen caps the cwd fallback, in RUNES.
@@ -1845,6 +1889,8 @@ type transcriptMeta struct {
 	// Measured, 129 of 130 transcripts carry one, so it is the usual case rather than a bonus.
 	LastPrompt string `json:"lastPrompt"`
 	Cwd        string `json:"cwd"`
+	// PermissionMode is written on {"type":"permission-mode"} lines and on user turns.
+	PermissionMode string `json:"permissionMode"`
 	// Message is the turn body, decoded only far enough to recover a typed prompt.
 	//
 	// Content is json.RawMessage because Claude Code writes it two ways: a plain string for a
@@ -2094,4 +2140,64 @@ func SaveMetadata(path string, meta map[string]SessionMetadata) error {
 		return err
 	}
 	return nil
+}
+
+// maxStartCwdLen bounds a recorded starting directory, in bytes. PATH_MAX is 4096 on Linux
+// and 1024 on macOS; a longer value is not a path, and the transcript is a file anything can
+// write.
+const maxStartCwdLen = 4096
+
+// usableStartCwd reports whether s can be used as the session's starting directory, and the
+// form to store.
+//
+// It DROPS what it cannot use rather than repairing it. Title handling collapses whitespace
+// and strips markup, which is right for a label and wrong for an identifier: "/a/My  Dir"
+// repaired to "/a/My Dir" names another directory, and the access view would then show that
+// tree's policy as this session's. The only change made is a trailing slash, which names the
+// same directory.
+//
+// Absolute means a leading "/": the resolver reads through a "/"-rooted filesystem, so a
+// Windows drive path is not usable by it and is dropped, not mis-resolved. A path that
+// path.Clean would change (".." or "." segments, doubled slashes) is dropped too: a recorded
+// cwd is what the shell reports, which is always clean.
+func usableStartCwd(s string) (string, bool) {
+	if len(s) > 1 {
+		s = strings.TrimRight(s, "/")
+		if s == "" {
+			s = "/"
+		}
+	}
+	if s == "" || s[0] != '/' || len(s) > maxStartCwdLen || !utf8.ValidString(s) || path.Clean(s) != s {
+		return "", false
+	}
+	for _, r := range s {
+		// U+FFFD is what encoding/json substitutes for a lone surrogate or invalid byte, so it
+		// marks a value that was already repaired once on the way in.
+		if r == utf8.RuneError || unicode.IsControl(r) ||
+			unicode.Is(unicode.Cf, r) || unicode.Is(unicode.Zl, r) || unicode.Is(unicode.Zp, r) {
+			return "", false
+		}
+	}
+	return s, true
+}
+
+// maxPermissionModeLen bounds a recorded mode. The longest real one is 17 characters.
+const maxPermissionModeLen = 32
+
+// usablePermissionMode reports whether s looks like a permission-mode identifier. It does not
+// check s against a list of modes: Claude Code adds them (dontAsk is recent), and a list here
+// would drop a real one until this package caught up. An identifier shape is enough to keep a
+// hostile transcript from putting text into a table cell.
+func usablePermissionMode(s string) (string, bool) {
+	if s == "" || len(s) > maxPermissionModeLen {
+		return "", false
+	}
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '-':
+		default:
+			return "", false
+		}
+	}
+	return s, true
 }

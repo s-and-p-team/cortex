@@ -503,6 +503,7 @@ func TestReadSessions_IncrementalSkipStillHonoursNewestWins(t *testing.T) {
 		Title:      "newer",
 		LogFile:    filepath.Join(newer, id+".jsonl"),
 		LogModTime: base.Add(time.Hour),
+		HarvestRev: CurrentHarvestRev, // a current entry; an older one is re-read, see harvestedAt
 	}}
 
 	out, _, skipped, err := ReadSessions(cfg, since)
@@ -541,6 +542,7 @@ func TestReadSessions_IncrementalSkipWinsWhenSeenFirst(t *testing.T) {
 		Title:      "newer",
 		LogFile:    filepath.Join(newer, id+".jsonl"),
 		LogModTime: base.Add(time.Hour),
+		HarvestRev: CurrentHarvestRev, // a current entry; an older one is re-read, see harvestedAt
 	}}
 
 	out, _, skipped, err := ReadSessions(cfg, since)
