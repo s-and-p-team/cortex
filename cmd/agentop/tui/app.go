@@ -52,13 +52,16 @@ const (
 	// paneTimeline draws one session's Claude Code agents, tool calls and hosts on a time
 	// axis; see timeline_pane.go.
 	paneTimeline
+	// paneAccess shows one session's effective Claude Code permission policy; see
+	// access_pane.go. Opened with `V` from the pane that opened the timeline.
+	paneAccess
 )
 
 // lastPaneID is the highest valid paneID. Kept adjacent to the iota block so
 // adding a pane means updating one line here, and TestPaneKeysCoverAllPanes then
 // fails until that pane is documented in paneKeys — which is how paneUsage
 // shipped reachable by `u` but named in no footer and no help overlay.
-const lastPaneID = paneTimeline
+const lastPaneID = paneAccess
 
 // paneNone is the explicit "no previous pane recorded" sentinel for
 // model.previousPane. Using paneNamespaces (the zero value) as a
@@ -590,6 +593,9 @@ type model struct {
 	// timeline is the Timeline pane's state, and timelineDoc its drawn lines, searched.
 	timeline    timelineState
 	timelineDoc searchDoc
+	// access is the Access pane's state, and accessViews its scrolling, searched text.
+	access      accessState
+	accessViews accessViews
 
 	// spend backs the always-on spend strip. Separate from usage on purpose —
 	// see spendState, which records why sharing one poll chain would blank the

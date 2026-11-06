@@ -216,6 +216,23 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		}
 	}
 
+	// `V` opens the Access pane for one session, from the panes `T` does and gated the same way:
+	// not while searching or in the column picker, where it is a typed letter. "View the policy";
+	// the other capitals nearby are taken ($ A C G P S T X).
+	if msg.String() == "V" && !m.searching && !m.colPicker && m.editState.phase == editPhaseDone {
+		session := ""
+		switch m.pane {
+		case paneEvents, paneDetail:
+			session = m.selectedSess
+		case paneSessions:
+			session = m.selectedSessionID()
+		}
+		if session != "" {
+			m.openAccess(session)
+			return nil
+		}
+	}
+
 	// The spend drawer's three keys, handled where `u` is and gated the same way: not
 	// while searching (they are characters the user is typing), not under the column
 	// picker, not mid-edit.
