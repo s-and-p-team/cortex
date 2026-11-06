@@ -86,7 +86,92 @@ type Layer struct {
 	Counts Counts
 }
 
-// Policy is the resolved result. Task 2 fills the rest of it.
+// Decision is what a rule does. The order is evaluation order: Claude Code
+// checks deny, then ask, then allow, and the first match wins.
+type Decision int
+
+const (
+	Deny Decision = iota
+	Ask
+	Allow
+)
+
+func (d Decision) String() string {
+	switch d {
+	case Deny:
+		return "deny"
+	case Ask:
+		return "ask"
+	case Allow:
+		return "allow"
+	}
+	return "unknown"
+}
+
+// Rule is one permission rule from one settings file.
+type Rule struct {
+	Decision Decision
+	// Raw is the rule exactly as written, e.g. "Bash(git push *)".
+	Raw string
+	// Tool and Pattern are Raw split at its parentheses. Pattern is empty for
+	// a bare tool name, which matches every use of the tool.
+	Tool, Pattern string
+	Source        LayerKind
+	// File is the settings file the rule was read from.
+	File string
+	// ShadowedBy is the rule that makes this one unreachable: a deny over an
+	// ask or allow, or an ask over an allow, for the same pattern or for the
+	// whole tool. Nil when nothing is known to shadow it. v1 recognises only
+	// identical patterns and match-all, never glob subsumption.
+	ShadowedBy *Rule
+	// Ignored is why Claude Code disregards the rule, or "".
+	Ignored string
+	// NeedsTrust is set on project allow rules, which apply only after the
+	// user trusts the folder. Trust state is not in any settings file.
+	NeedsTrust bool
+}
+
+// Scalar is a single-valued setting and the layer that decided it.
+type Scalar[T any] struct {
+	Value T
+	Layer LayerKind
+	Set   bool
+}
+
+// IgnoredSetting is a value present in a file that Claude Code does not honour
+// from that layer, so it is reported rather than treated as effective.
+type IgnoredSetting struct {
+	Key, Value string
+	Layer      LayerKind
+	File       string
+	Reason     string
+}
+
+// Dir is an additionalDirectories entry.
+type Dir struct {
+	Path   string
+	Source LayerKind
+	// NeedsTrust is set when every layer that grants the directory is the
+	// shared project file.
+	NeedsTrust bool
+}
+
+// Hook records that a layer registers hooks for an event. Commands are
+// deliberately not recorded: they are paths and scripts, not policy.
+type Hook struct {
+	Event  string
+	Source LayerKind
+}
+
+// Policy is the resolved result.
 type Policy struct {
-	Layers []Layer
+	Layers  []Layer
+	Mode    Scalar[string]
+	Sandbox Scalar[bool]
+	// Rules is every rule from every layer, deny first, then ask, then allow,
+	// highest layer first within each decision.
+	Rules   []Rule
+	Dirs    []Dir
+	Hooks   []Hook
+	Ignored []IgnoredSetting
 }

@@ -12,6 +12,10 @@ const (
 	localSettingsFile = "settings.local.json"
 	managedFile       = "managed-settings.json"
 	managedDropInDir  = "managed-settings.d"
+
+	// inlineSettingsPath names the CLI layer's single "file" when --settings
+	// was given as inline JSON rather than a path.
+	inlineSettingsPath = "(inline --settings)"
 )
 
 // discoverLayers lists the five layers, highest precedence first, with each
@@ -68,7 +72,7 @@ func cliLayer(in Input) Layer {
 		return l
 	}
 	if strings.HasPrefix(strings.TrimSpace(in.CLISettings), "{") {
-		l.Path = "(inline --settings)"
+		l.Path = inlineSettingsPath
 		l.Files = []File{{Path: l.Path, Present: true}}
 		return finish(l)
 	}
