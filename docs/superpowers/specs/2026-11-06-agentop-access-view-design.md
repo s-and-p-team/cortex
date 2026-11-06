@@ -278,6 +278,14 @@ Each phase is independently shippable.
    repo's `.claude/settings.json` and is fixed first. *Done.* The remote test is
    the one `e` and `S` use, and an unknown local endpoint counts as remote.
 4. **Matching:** `Policy.Match`, `RULE` column, detail-pane fold.
+   Planned in `docs/superpowers/plans/2026-11-06-agentop-access-match.md`. Findings
+   that shaped it: tool calls (name + JSON arguments) are already on response
+   events, so no transcript is needed; transcripts record a decision for only 981
+   of 2,108 calls and name a rule for 5, so they cannot validate the matcher and
+   the docs' own tables are the fixtures; and the verdict vocabulary is
+   deliberately `deny | ask | allow | partial | none | unknown`, where `none`
+   (no rule matches) is **not** "allowed" or "prompts", because the read-only
+   command set, the mode, the classifier, hooks and the sandbox decide those.
 5. **Later:** granted-vs-used report, policy-change detection mid-session,
    other agents.
 
