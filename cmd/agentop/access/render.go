@@ -10,6 +10,12 @@ import (
 func (p Policy) Text() string {
 	var b strings.Builder
 
+	for _, n := range p.Notes {
+		fmt.Fprintf(&b, "%s\n", n)
+	}
+	if len(p.Notes) > 0 {
+		b.WriteString("\n")
+	}
 	b.WriteString("LAYERS (highest precedence first)\n")
 	for _, l := range p.Layers {
 		fmt.Fprintf(&b, "  %-8s", l.Kind)
@@ -43,6 +49,9 @@ func (p Policy) Text() string {
 		fmt.Fprintf(&b, "  mode     %s (%s)\n", p.Mode.Value, p.Mode.Layer)
 	} else {
 		b.WriteString("  mode     not set in any layer (Claude Code's built-in default applies)\n")
+	}
+	if p.SessionMode != "" {
+		fmt.Fprintf(&b, "  session  %s (the mode recorded for this session; \"mode\" above is the configured default for new ones)\n", p.SessionMode)
 	}
 	if p.Sandbox.Set {
 		fmt.Fprintf(&b, "  sandbox  %s (%s)\n", onOff(p.Sandbox.Value), p.Sandbox.Layer)

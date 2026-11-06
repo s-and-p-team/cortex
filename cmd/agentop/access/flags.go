@@ -31,6 +31,13 @@ func computeFlags(in Input, p Policy, bypassDisabled bool) []RiskFlag {
 			"the default mode is bypassPermissions (set in %s settings): permission prompts are skipped", p.Mode.Layer)
 	}
 
+	// Configured and recorded modes are different facts: a session can be started in
+	// bypassPermissions from the command line, which no settings file shows.
+	if p.SessionMode == "bypassPermissions" {
+		add("session-bypass", High,
+			"this session was recorded in bypassPermissions mode: permission prompts were skipped")
+	}
+
 	for _, r := range p.Rules {
 		if r.Decision != Allow || r.Ignored != "" || r.ShadowedBy != nil {
 			continue

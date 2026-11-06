@@ -246,3 +246,60 @@ func TestText_ShowsShadowIgnoredAndTrustNotes(t *testing.T) {
 		}
 	}
 }
+
+func TestSessionMode_IsReportedBesideTheConfiguredOne(t *testing.T) {
+	in := input(map[string]string{userFile: `{"permissions":{"defaultMode":"default"}}`})
+	in.SessionMode = "acceptEdits"
+	p := mustResolve(t, in)
+	if p.SessionMode != "acceptEdits" {
+		t.Errorf("SessionMode = %q, want acceptEdits", p.SessionMode)
+	}
+	js, _ := json.Marshal(p)
+	if !strings.Contains(string(js), `"sessionMode":"acceptEdits"`) {
+		t.Errorf("JSON lacks sessionMode: %s", js)
+	}
+	text := p.Text()
+	for _, want := range []string{"default (user)", "acceptEdits", "this session"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("Text() lacks %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestSessionMode_AbsentWhenNotGiven(t *testing.T) {
+	p := mustResolve(t, input(nil))
+	js, _ := json.Marshal(p)
+	if strings.Contains(string(js), "sessionMode") {
+		t.Errorf("sessionMode written with no session: %s", js)
+	}
+	if strings.Contains(p.Text(), "this session") {
+		t.Errorf("Text() mentions a session when there is none:\n%s", p.Text())
+	}
+}
+
+func TestSessionMode_BypassIsFlaggedEvenWhenTheConfiguredModeIsNot(t *testing.T) {
+	// Claude Code does not apply bypassPermissions from project or local settings, but a session
+	// can still be started in it (--permission-mode, Shift+Tab). The transcript says so.
+	in := input(map[string]string{userFile: `{"permissions":{"defaultMode":"default"}}`})
+	in.SessionMode = "bypassPermissions"
+	f, ok := flagCodes(mustResolve(t, in))["session-bypass"]
+	if !ok || f.Severity != High {
+		t.Errorf("a session that ended in bypassPermissions should carry a high flag: %+v", f)
+	}
+	in.SessionMode = "plan"
+	if _, ok := flagCodes(mustResolve(t, in))["session-bypass"]; ok {
+		t.Error("a plan-mode session must not be flagged")
+	}
+}
+
+func TestNotes_AreCarriedIntoTheOutputAndNeverNull(t *testing.T) {
+	p := mustResolve(t, input(nil))
+	js, _ := json.Marshal(p)
+	if !strings.Contains(string(js), `"notes":[]`) {
+		t.Errorf("notes must be [] not null: %s", js)
+	}
+	p.Notes = []string{"session abc started in /w/x"}
+	if !strings.Contains(p.Text(), "session abc started in /w/x") {
+		t.Errorf("Text() lacks the note:\n%s", p.Text())
+	}
+}

@@ -262,7 +262,14 @@ Each phase is independently shippable.
 
 1. **Resolver + CLI.** `cmd/agentop/access`, `agentop access --cwd`, golden
    tests over fixture settings trees. No TUI change. Proves the hierarchy logic.
-2. **Harvest `Cwd`** field and `--session` lookup. Degraded-state text.
+2. **Harvest `Cwd`** field and `--session` lookup. Degraded-state text. *Done.*
+   Findings that changed the design: the transcript's cwd wanders (44 of 96
+   sessions hold more than one), so the **first** cwd is recorded, which matched
+   the transcript's project directory in 96 of 96; the **latest permission
+   mode** is recorded too (the transcript does carry it, and it changes in-session
+   in 13 of 94); both are validated and dropped, never repaired; and entries carry
+   a `rev` so an older entry is re-read once, since the mtime-based incremental
+   skip would otherwise leave them without the new fields indefinitely.
 3. **`paneAccess`:** layer stack, scalars, rules table, risk strip.
 4. **Matching:** `Policy.Match`, `RULE` column, detail-pane fold.
 5. **Later:** granted-vs-used report, policy-change detection mid-session,
@@ -303,8 +310,8 @@ already shows Cortex outcomes, so the real first deliverable is the resolver.)
 - **Remote / Kubernetes sessions:** the files are on another machine. v1 shows
   "unavailable"; do not read local files for a remote session — that would show
   the wrong policy confidently.
-- **Does the transcript carry permission mode?** If yes, record it; if not,
-  mode shown is the configured default only. To check in phase 2.
+- **Does the transcript carry permission mode?** Yes (`permissionMode` on
+  `permission-mode` lines and on user turns); recorded in phase 2.
 - **Key choice:** `V` is a proposal; confirm free.
 - **Privacy:** settings files can contain secrets in `env` blocks. The pane
   must show only `permissions`, `sandbox`, `hooks` (command names), and

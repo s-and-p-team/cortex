@@ -14,7 +14,7 @@ func Resolve(in Input) (Policy, error) {
 	if in.FS == nil {
 		return Policy{}, errors.New("access: Input.FS is nil")
 	}
-	p := Policy{Layers: discoverLayers(in)}
+	p := Policy{Layers: discoverLayers(in), SessionMode: in.SessionMode, Notes: in.Notes}
 
 	// docs[i][j] is the decoded j'th file of layer i, or nil if it is absent
 	// or failed to read or parse.
@@ -238,5 +238,8 @@ func normalize(p *Policy) {
 	}
 	if p.Flags == nil {
 		p.Flags = []RiskFlag{}
+	}
+	if p.Notes == nil {
+		p.Notes = []string{}
 	}
 }

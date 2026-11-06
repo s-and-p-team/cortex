@@ -51,6 +51,13 @@ type Input struct {
 	// CLISettings is the value of --settings: a file path or inline JSON.
 	// Empty means the flag was not given.
 	CLISettings string
+	// SessionMode is the permission mode the session was last recorded in (from its
+	// transcript), or "". It is what the session actually ran under, which differs from the
+	// configured default whenever a mode was chosen at launch or switched mid-session.
+	SessionMode string
+	// Notes are caller-supplied lines about where this input came from (for example which
+	// session it was derived from), carried into the output unchanged.
+	Notes []string
 	// FS is read-only access to the filesystem, rooted at "/": a path
 	// "/a/b" is opened as "a/b".
 	FS fs.FS
@@ -250,9 +257,14 @@ type RiskFlag struct {
 
 // Policy is the resolved result.
 type Policy struct {
-	Layers  []Layer        `json:"layers"`
-	Mode    Scalar[string] `json:"mode"`
-	Sandbox Scalar[bool]   `json:"sandbox"`
+	Layers []Layer        `json:"layers"`
+	Mode   Scalar[string] `json:"mode"`
+	// SessionMode is Input.SessionMode: the mode this session was recorded in, when known.
+	SessionMode string `json:"sessionMode,omitempty"`
+	// Notes is Input.Notes.
+	Notes []string `json:"notes"`
+
+	Sandbox Scalar[bool] `json:"sandbox"`
 	// Rules is every rule from every layer, ordered by decision (deny, ask,
 	// allow), then tool, pattern and layer.
 	Rules   []Rule           `json:"rules"`
