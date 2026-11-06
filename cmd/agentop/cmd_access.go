@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -31,6 +32,7 @@ func runAccess(args []string, stdout, stderr io.Writer) int {
 	sessionID := fs.String("session", "", "resolve for a harvested Claude Code session: its id or a unique prefix of it")
 	configDir := fs.String("config-dir", "", "Claude Code config directory holding the user settings.json (default: $CLAUDE_CONFIG_DIR, else ~/.claude)")
 	cliSettings := fs.String("settings", "", "the --settings value the session was started with: a file path or inline JSON")
+	explain := fs.String("explain", "", "say which rule applies to a tool call, written like a rule: 'Bash(git push origin main)', 'Read(./.env)', 'WebFetch(domain:example.com)'")
 	asJSON := fs.Bool("json", false, "emit the policy as JSON")
 	fs.Usage = func() {
 		fmt.Fprint(stderr, `agentop access — show the Claude Code permission policy for a directory
@@ -41,6 +43,8 @@ Usage:
   agentop access --session ID         the policy for a Claude Code session, from the
                                       directory and config dir it ran in
   agentop access --json               the same, as JSON
+  agentop access --explain 'Bash(git push origin main)'
+                                      which rule applies to that call, and where it came from
 
 Layers, highest precedence first: managed, --settings, project local
 (.claude/settings.local.json, kept at the git root), shared project
@@ -55,6 +59,13 @@ permission mode it was last recorded in. A session with no recorded directory
 still shows the user and managed layers, and says why the project ones are
 missing. --cwd and --config-dir override what the session recorded; --cwd cannot
 be combined with --session.
+
+--explain takes a tool call in the syntax a rule is written in and answers about the RULES:
+deny, ask, allow, partial (Bash: some subcommands covered, some not), none, or unknown.
+"none" means no rule matches. It does not mean the call is allowed, or that it prompts: the
+built-in read-only command set, the permission mode, the classifier, hooks and the sandbox
+decide that, and none of them is a rule. The Bash splitter is not a shell parser; what it
+cannot read it says so and refuses to guess.
 
 What this cannot see:
   - It reads the files as they are now ("as of now"), not as they were when a
@@ -83,6 +94,17 @@ Flags:
 		fmt.Fprintf(stderr, "agentop access: unexpected argument %q\n\n", fs.Arg(0))
 		fs.Usage()
 		return 2
+	}
+
+	var explainCall access.Call
+	if fs.Lookup("explain").Value.String() != "" || explainGiven(args) {
+		c, err := access.ParseExplain(*explain)
+		if err != nil {
+			fmt.Fprintf(stderr, "agentop access: --explain: %v\n\n", err)
+			fs.Usage()
+			return 2
+		}
+		explainCall = c
 	}
 
 	if *sessionID != "" && *cwd != "" {
@@ -124,17 +146,49 @@ Flags:
 		return 1
 	}
 
+	var match *access.Result
+	if explainCall.Tool != "" {
+		ctx := access.MatchContext{Cwd: in.Cwd, Home: in.Home, ConfigDir: in.ConfigDir}
+		if ctx.ConfigDir == "" && in.Home != "" {
+			ctx.ConfigDir = filepath.Join(in.Home, ".claude")
+		}
+		m := policy.Match(explainCall, ctx)
+		match = &m
+	}
+
 	if *asJSON {
 		enc := json.NewEncoder(stdout)
 		enc.SetIndent("", "  ")
-		if err := enc.Encode(policy); err != nil {
+		var payload any = policy
+		if match != nil {
+			payload = struct {
+				access.Policy
+				Match access.Result `json:"match"`
+			}{policy, *match}
+		}
+		if err := enc.Encode(payload); err != nil {
 			fmt.Fprintf(stderr, "agentop access: %v\n", err)
 			return 1
 		}
 		return 0
 	}
+	if match != nil {
+		fmt.Fprint(stdout, match.Text(explainCall))
+		return 0
+	}
 	fmt.Fprint(stdout, policy.Text())
 	return 0
+}
+
+// explainGiven reports whether --explain appears in args at all, so an EMPTY value
+// (--explain ”) is rejected as malformed instead of being taken for "not given".
+func explainGiven(args []string) bool {
+	for _, a := range args {
+		if a == "--explain" || a == "-explain" || strings.HasPrefix(a, "--explain=") || strings.HasPrefix(a, "-explain=") {
+			return true
+		}
+	}
+	return false
 }
 
 // sessionRef is what the metadata file knows about one session, reduced to what the

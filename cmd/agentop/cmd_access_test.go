@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"github.com/rossoctl/cortex/cmd/agentop/access"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -449,6 +450,304 @@ func TestRunAccess_HelpDescribesSession(t *testing.T) {
 	for _, want := range []string{"--session", "read-claude-sessions"} {
 		if !strings.Contains(errs, want) {
 			t.Errorf("--help lacks %q:\n%s", want, errs)
+		}
+	}
+}
+
+// --- --explain ---------------------------------------------------------------------------------
+
+// explainFixture is a project whose rules cover each verdict.
+func explainFixture(t *testing.T) (args []string) {
+	t.Helper()
+	root := t.TempDir()
+	project := filepath.Join(root, "proj")
+	cfg := filepath.Join(root, "claude")
+	writeAccessFile(t, filepath.Join(cfg, "settings.json"),
+		`{"permissions":{"deny":["Read(./.env)","Bash(rm *)"],"allow":["Bash(git status)","Bash(npm test *)"]}}`)
+	writeAccessFile(t, filepath.Join(project, ".claude", "settings.json"),
+		`{"permissions":{"ask":["Bash(git push *)","WebFetch(domain:example.com)"]}}`)
+	return []string{"--cwd", project, "--config-dir", cfg}
+}
+
+func explain(t *testing.T, base []string, what string, extra ...string) (code int, out, errs string) {
+	t.Helper()
+	return runAccessCapture(append(append(append([]string{}, base...), "--explain", what), extra...)...)
+}
+
+func TestRunAccess_ExplainEachVerdict(t *testing.T) {
+	base := explainFixture(t)
+	for _, c := range []struct {
+		what    string
+		verdict string
+		rule    string // the deciding rule, when there is one
+	}{
+		{"Read(./.env)", "deny", "Read(./.env)"},
+		{"Bash(rm -rf build)", "deny", "Bash(rm *)"},
+		{"Bash(git push origin main)", "ask", "Bash(git push *)"},
+		{"WebFetch(domain:example.com)", "ask", "WebFetch(domain:example.com)"},
+		{"Bash(git status)", "allow", "Bash(git status)"},
+		{"Bash(git status && ls)", "partial", ""},
+		{"Bash(ls -la)", "none", ""},
+		{"Read(./README.md)", "none", ""},
+	} {
+		code, out, errs := explain(t, base, c.what)
+		if code != 0 {
+			t.Errorf("%s: exit %d: %s", c.what, code, errs)
+			continue
+		}
+		if !strings.Contains(out, "VERDICT") || !strings.Contains(out, c.verdict) {
+			t.Errorf("%s: output lacks the %q verdict:\n%s", c.what, c.verdict, out)
+		}
+		if c.rule != "" && !strings.Contains(out, c.rule) {
+			t.Errorf("%s: output lacks the deciding rule %q:\n%s", c.what, c.rule, out)
+		}
+	}
+}
+
+// The explanation says WHERE the deciding rule came from, which is the point of asking.
+func TestRunAccess_ExplainNamesTheLayerAndFile(t *testing.T) {
+	base := explainFixture(t)
+	_, out, _ := explain(t, base, "Bash(git push origin main)")
+	if !strings.Contains(out, "project") || !strings.Contains(out, "settings.json") {
+		t.Errorf("output should name the project layer and its file:\n%s", out)
+	}
+}
+
+// "none" must say what it is not, or the reader takes it for "allowed".
+func TestRunAccess_ExplainNoneSaysItIsNotAllowed(t *testing.T) {
+	_, out, _ := explain(t, explainFixture(t), "Bash(ls -la)")
+	for _, want := range []string{"no rule matches", "not", "mode"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("a 'none' verdict should explain itself; lacks %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestRunAccess_ExplainJSON(t *testing.T) {
+	base := explainFixture(t)
+	code, out, errs := explain(t, base, "Bash(git push origin main)", "--json")
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, errs)
+	}
+	var got struct {
+		Match struct {
+			Verdict string `json:"verdict"`
+			Rules   []struct {
+				Raw    string `json:"raw"`
+				Source string `json:"source"`
+			} `json:"rules"`
+			Caveats []string `json:"caveats"`
+		} `json:"match"`
+		Layers []any `json:"layers"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("not valid JSON: %v\n%s", err, out)
+	}
+	if got.Match.Verdict != "ask" || len(got.Match.Rules) != 1 || got.Match.Rules[0].Source != "project" {
+		t.Errorf("match = %+v", got.Match)
+	}
+	if len(got.Layers) != 5 {
+		t.Errorf("the policy is still in the JSON: layers = %d", len(got.Layers))
+	}
+	// without --explain there is no match key
+	_, plain, _ := runAccessCapture(append(base, "--json")...)
+	if strings.Contains(plain, `"match"`) {
+		t.Errorf("a match key without --explain:\n%.200s", plain)
+	}
+}
+
+func TestRunAccess_ExplainAcceptsTheToolWithNoParentheses(t *testing.T) {
+	base := explainFixture(t)
+	code, out, _ := explain(t, base, "Bash")
+	if code != 0 || !strings.Contains(out, "VERDICT") {
+		t.Errorf("exit %d:\n%s", code, out)
+	}
+}
+
+func TestRunAccess_ExplainToolSyntax(t *testing.T) {
+	base := explainFixture(t)
+	for _, c := range []struct {
+		what string
+		want string // a substring of the output
+	}{
+		{"Read(./.env)", "deny"},
+		{"Edit(./.env)", "deny"},                   // a Read deny blocks Edit on the same path
+		{"WebFetch(https://example.com/x)", "ask"}, // a URL is the primary field; the domain is derived
+		{"Agent(Explore)", "none"},
+		{"mcp__srv__tool", "none"},
+	} {
+		code, out, errs := explain(t, base, c.what)
+		if code != 0 || !strings.Contains(out, c.want) {
+			t.Errorf("%s: exit %d want %q:\n%s%s", c.what, code, c.want, out, errs)
+		}
+	}
+}
+
+func TestRunAccess_ExplainWithASession(t *testing.T) {
+	sessionFixture(t, map[string]map[string]any{
+		"aaaa1111": {"title": "t", "cwd": "@PROJECT@", "agentConfigDir": "@CONFIG@", "permissionMode": "acceptEdits"},
+	})
+	code, out, errs := runAccessCapture("--session", "aaaa", "--explain", "Bash(git push origin main)")
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, errs)
+	}
+	if !strings.Contains(out, "ask") || !strings.Contains(out, "Bash(git push *)") {
+		t.Errorf("the session's project rules should decide:\n%s", out)
+	}
+}
+
+func TestRunAccess_ExplainMalformedIsExit2WithUsage(t *testing.T) {
+	base := explainFixture(t)
+	// "Bash(a)(b)" is NOT here: the docs say parentheses inside a specifier are literal, so it is
+	// the command `a)(b`. It is accepted, and TestRunAccess_ExplainParenthesesInsideAreLiteral
+	// says what it means.
+	for _, bad := range []string{"", "   ", "Bash(", "(x)", "Bash(a) trailing", "bad tool(x)", "Bash(x", "mcp__srv__tool(x)", strings.Repeat("a", 20000)} {
+		code, out, errs := explain(t, base, bad)
+		if code != 2 {
+			t.Errorf("%q: exit %d, want 2 (stdout %q)", bad[:min(len(bad), 20)], code, out)
+		}
+		if !strings.Contains(errs, "--explain") {
+			t.Errorf("%q: stderr lacks the usage:\n%.200s", bad[:min(len(bad), 20)], errs)
+		}
+	}
+}
+
+// What the user types is echoed back. A terminal escape in it must not reach the terminal.
+func TestRunAccess_ExplainNeverEchoesControlBytes(t *testing.T) {
+	base := explainFixture(t)
+	evil := "Bash(echo \x1b]0;pwned\x07\x1b[2J hi)"
+	_, out, errs := explain(t, base, evil)
+	for _, s := range []string{out, errs} {
+		for i := 0; i < len(s); i++ {
+			if b := s[i]; (b < 0x20 && b != '\n') || b == 0x7f {
+				t.Fatalf("output carries control byte %#x: %q", b, s)
+			}
+		}
+		if strings.Contains(s, "pwned") {
+			t.Errorf("the escape sequence's payload was echoed: %q", s)
+		}
+	}
+}
+
+func TestRunAccess_ExplainHelpDocumentsItAndWhatItCannotSay(t *testing.T) {
+	_, _, errs := runAccessCapture("--help")
+	for _, want := range []string{"--explain", "read-only", "mode", "none"} {
+		if !strings.Contains(errs, want) {
+			t.Errorf("--help lacks %q:\n%s", want, errs)
+		}
+	}
+}
+
+func TestRunAccess_ExplainParenthesesInsideAreLiteral(t *testing.T) {
+	base := explainFixture(t)
+	code, out, _ := explain(t, base, "Bash(echo (hi))")
+	if code != 0 || !strings.Contains(out, "echo (hi)") {
+		t.Errorf("exit %d: parentheses inside the specifier are literal:\n%s", code, out)
+	}
+}
+
+func TestParseExplain(t *testing.T) {
+	cases := []struct {
+		in    string
+		tool  string
+		field string
+		want  string
+	}{
+		{"Bash(git push origin main)", "Bash", "command", "git push origin main"},
+		{"Bash( ls )", "Bash", "command", " ls "}, // the content is verbatim: a rule's whitespace matters
+		{"Read(./.env)", "Read", "file_path", "./.env"},
+		{"Edit(/etc/hosts)", "Edit", "file_path", "/etc/hosts"},
+		{"NotebookEdit(a.ipynb)", "NotebookEdit", "notebook_path", "a.ipynb"},
+		{"Grep(src)", "Grep", "path", "src"},
+		{"WebFetch(https://example.com/a)", "WebFetch", "url", "https://example.com/a"},
+		{"WebFetch(domain:example.com)", "WebFetch", "url", "https://example.com/"},
+		{"Agent(Explore)", "Agent", "subagent_type", "Explore"},
+		{"Skill(grilling)", "Skill", "skill", "grilling"},
+		{"Bash(echo (hi))", "Bash", "command", "echo (hi)"},
+		{"  Bash(ls)  ", "Bash", "command", "ls"},
+	}
+	for _, c := range cases {
+		got, err := access.ParseExplain(c.in)
+		if err != nil {
+			t.Errorf("%q: %v", c.in, err)
+			continue
+		}
+		if got.Tool != c.tool || got.Input[c.field] != c.want {
+			t.Errorf("%q = %+v, want tool %s %s=%q", c.in, got, c.tool, c.field, c.want)
+		}
+	}
+	// a bare tool name has no input
+	for _, tool := range []string{"Bash", "mcp__srv__tool", "Read"} {
+		got, err := access.ParseExplain(tool)
+		if err != nil || got.Tool != tool || len(got.Input) != 0 || got.Input == nil {
+			t.Errorf("%q = %+v, %v; want the tool with an empty, non-nil input", tool, got, err)
+		}
+	}
+}
+
+// A caveat can carry text from the user's own call (a Bash command that is not analysable names
+// its cause), so the NOTE line is cleaned as well as the CALL line.
+func TestResultText_NeverEmitsControlBytesFromCaveatsOrRules(t *testing.T) {
+	r := access.Result{
+		Verdict:     access.VerdictPartial,
+		Caveats:     []string{"note \x1b]0;pwned\x07 end", "second \x1b[2J"},
+		Rules:       []access.Rule{{Decision: access.Allow, Raw: "Bash(a\x1b[0m)", Source: access.User, File: "/x\x1by"}},
+		Unevaluated: []access.Rule{{Decision: access.Deny, Raw: "Bash(b\x07)", Source: access.Local, File: "/z\x00"}},
+	}
+	out := r.Text(access.Call{Tool: "Bash", Input: map[string]any{"command": "ls\x1b[2J"}})
+	for i := 0; i < len(out); i++ {
+		if b := out[i]; (b < 0x20 && b != '\n') || b == 0x7f {
+			t.Fatalf("Text() carries control byte %#x: %q", b, out)
+		}
+	}
+	if strings.Contains(out, "pwned") || strings.Contains(out, "[2J") {
+		t.Errorf("an escape payload survived: %q", out)
+	}
+}
+
+func TestParseExplain_RejectsWhatIsNotAToolName(t *testing.T) {
+	for _, bad := range []string{
+		"bad tool(x)", "a/b(x)", "a.b(x)", "Bash;ls(x)", "Bash\n(x)", "ba$h(x)", "Bash\x1b(x)",
+		"bad tool", "a b", strings.Repeat("a", 201) + "(x)",
+	} {
+		if _, err := access.ParseExplain(bad); err == nil {
+			t.Errorf("%q was accepted as a tool name", bad[:min(len(bad), 20)])
+		}
+	}
+	for _, good := range []string{"Bash", "mcp__srv__tool", "my-tool", "T9", "a"} {
+		if _, err := access.ParseExplain(good); err != nil {
+			t.Errorf("%q was rejected: %v", good, err)
+		}
+	}
+}
+
+func TestParseExplain_TheLengthLimitIsExactAndMeasuredInTheWholeInput(t *testing.T) {
+	// "Bash(" + content + ")" is 6 characters of syntax around the content.
+	atLimit := "Bash(" + strings.Repeat("a", 12000-6) + ")"
+	if len(atLimit) != 12000 {
+		t.Fatalf("fixture is %d long", len(atLimit))
+	}
+	if _, err := access.ParseExplain(atLimit); err != nil {
+		t.Errorf("an input exactly at the limit was refused: %v", err)
+	}
+	over := "Bash(" + strings.Repeat("a", 12000-5) + ")"
+	if _, err := access.ParseExplain(over); err == nil || !strings.Contains(err.Error(), "too long") {
+		t.Errorf("err = %v, want a 'too long' refusal", err)
+	}
+}
+
+// A tool this view has no primary argument for must not be turned into a call with an empty
+// input: that would silently ask about "any call", and an MCP tool's arguments are its own.
+func TestParseExplain_AToolWithNoKnownArgumentIsRefusedNotEmptied(t *testing.T) {
+	for _, in := range []string{"mcp__srv__tool(x)", "CronCreate(x)", "TaskStop(1)", "Custom(whatever)"} {
+		c, err := access.ParseExplain(in)
+		if err == nil {
+			t.Errorf("%q = %+v with no error: its argument was dropped without saying so", in, c)
+		} else if !strings.Contains(err.Error(), "which argument") {
+			t.Errorf("%q: err = %v, want it to say it does not know which argument", in, err)
+		}
+		if c.Tool != "" || len(c.Input) != 0 {
+			t.Errorf("%q returned a partial call alongside the error: %+v", in, c)
 		}
 	}
 }
