@@ -40,6 +40,7 @@ func Resolve(in Input) (Policy, error) {
 		}
 	}
 
+	bypassDisabled := false
 	managedOnly := false
 	for _, d := range docs[layerIndex(p.Layers, Managed)] {
 		if d != nil && d.AllowManagedPermissionRulesOnly {
@@ -59,6 +60,9 @@ func Resolve(in Input) (Policy, error) {
 			addRules(&p, l, file, Ask, d.Permissions.Ask, managedOnly)
 			addRules(&p, l, file, Allow, d.Permissions.Allow, managedOnly)
 			addDirs(&p, l.Kind, d.Permissions.AdditionalDirectories)
+			if d.Permissions.DisableBypassPermissionsMode == "disable" {
+				bypassDisabled = true
+			}
 			for ev := range d.Hooks {
 				p.Hooks = append(p.Hooks, Hook{Event: ev, Source: l.Kind})
 			}
@@ -79,14 +83,29 @@ func Resolve(in Input) (Policy, error) {
 		}
 	}
 
-	sort.SliceStable(p.Rules, func(a, b int) bool { return p.Rules[a].Decision < p.Rules[b].Decision })
+	sort.SliceStable(p.Rules, func(a, b int) bool {
+		x, y := p.Rules[a], p.Rules[b]
+		if x.Decision != y.Decision {
+			return x.Decision < y.Decision
+		}
+		if x.Tool != y.Tool {
+			return x.Tool < y.Tool
+		}
+		if x.Pattern != y.Pattern {
+			return x.Pattern < y.Pattern
+		}
+		return x.Source < y.Source
+	})
 	sort.SliceStable(p.Hooks, func(a, b int) bool {
 		if p.Hooks[a].Event != p.Hooks[b].Event {
 			return p.Hooks[a].Event < p.Hooks[b].Event
 		}
 		return p.Hooks[a].Source < p.Hooks[b].Source
 	})
+	p.Hooks = dedupeHooks(p.Hooks)
 	markShadowed(p.Rules)
+	p.Flags = computeFlags(in, p, bypassDisabled)
+	normalize(&p)
 	return p, nil
 }
 
@@ -183,5 +202,41 @@ func markShadowed(rules []Rule) {
 				break
 			}
 		}
+	}
+}
+
+func dedupeHooks(hs []Hook) []Hook {
+	out := hs[:0]
+	for i, h := range hs {
+		if i > 0 && h == hs[i-1] {
+			continue
+		}
+		out = append(out, h)
+	}
+	return out
+}
+
+// normalize turns nil slices into empty ones so JSON carries [] and never
+// null: the output is an interface for scripts.
+func normalize(p *Policy) {
+	for i := range p.Layers {
+		if p.Layers[i].Files == nil {
+			p.Layers[i].Files = []File{}
+		}
+	}
+	if p.Rules == nil {
+		p.Rules = []Rule{}
+	}
+	if p.Dirs == nil {
+		p.Dirs = []Dir{}
+	}
+	if p.Hooks == nil {
+		p.Hooks = []Hook{}
+	}
+	if p.Ignored == nil {
+		p.Ignored = []IgnoredSetting{}
+	}
+	if p.Flags == nil {
+		p.Flags = []RiskFlag{}
 	}
 }

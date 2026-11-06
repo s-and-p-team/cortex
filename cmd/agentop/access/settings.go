@@ -16,6 +16,8 @@ type settingsDoc struct {
 		Deny                  []string `json:"deny"`
 		DefaultMode           string   `json:"defaultMode"`
 		AdditionalDirectories []string `json:"additionalDirectories"`
+		// DisableBypassPermissionsMode is "disable" to lock bypassPermissions out.
+		DisableBypassPermissionsMode string `json:"disableBypassPermissionsMode"`
 	} `json:"permissions"`
 	Sandbox struct {
 		Enabled *bool `json:"enabled"`
