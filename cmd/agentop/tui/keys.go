@@ -124,6 +124,11 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		}
 	}
 
+	// The Access pane re-reads the files on r; everything else falls through to scrolling.
+	if m.pane == paneAccess && !m.searching && msg.String() == "r" {
+		return m.refreshAccess()
+	}
+
 	// The Usage pane owns the keyboard while it is up, except for esc/q which
 	// the shared handling above already routed.
 	if m.pane == paneUsage && !m.searching {
@@ -228,8 +233,7 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 			session = m.selectedSessionID()
 		}
 		if session != "" {
-			m.openAccess(session)
-			return nil
+			return m.openAccess(session)
 		}
 	}
 

@@ -1,9 +1,13 @@
 package tui
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
+	tea "github.com/charmbracelet/bubbletea"
+
+	"github.com/rossoctl/cortex/cmd/agentop/access"
 	"github.com/rossoctl/cortex/cmd/agentop/apiclient"
 	"github.com/rossoctl/cortex/core/session"
 )
@@ -202,5 +206,206 @@ func TestAccessKey_OnSessionsUsesTheHighlightedRow(t *testing.T) {
 	m.handleKey(keyRune('V'))
 	if m.pane != paneAccess || m.access.session != "s1" {
 		t.Errorf("pane %v session %q, want paneAccess on the highlighted s1", m.pane, m.access.session)
+	}
+}
+
+// --- loading ---------------------------------------------------------------------------------
+
+// recordingResolver is an injected resolver that counts its calls and returns canned policies.
+type recordingResolver struct {
+	calls []access.Input
+	pol   access.Policy
+	err   error
+}
+
+func (r *recordingResolver) resolve(in access.Input) (access.Policy, error) {
+	r.calls = append(r.calls, in)
+	return r.pol, r.err
+}
+
+func openedAccessModel(endpoint string, entry SessionMetadata, have bool) (*model, *recordingResolver) {
+	m := accessModel(endpoint, entry, have)
+	r := &recordingResolver{pol: access.Policy{Mode: access.Scalar[string]{Value: "default", Set: true}}}
+	m.accessResolve = r.resolve
+	return m, r
+}
+
+// run executes a tea.Cmd and returns its message, as the runtime would.
+func run(t *testing.T, c tea.Cmd) tea.Msg {
+	t.Helper()
+	if c == nil {
+		t.Fatal("expected a command, got nil")
+	}
+	return c()
+}
+
+func TestOpenAccess_ResolvesOffTheUIGoroutine(t *testing.T) {
+	m, r := openedAccessModel(localURL, okEntry, true)
+	cmd := m.openAccess("s1")
+	if len(r.calls) != 0 {
+		t.Fatalf("the resolver ran %d time(s) inside openAccess: it must run in the returned command", len(r.calls))
+	}
+	if !m.access.loading {
+		t.Error("loading not set while a resolve is in flight")
+	}
+	msg, ok := run(t, cmd).(accessLoadedMsg)
+	if !ok {
+		t.Fatalf("command returned %T, want accessLoadedMsg", msg)
+	}
+	if len(r.calls) != 1 || r.calls[0].Cwd != "/w/proj" {
+		t.Errorf("resolver calls = %+v, want one for /w/proj", r.calls)
+	}
+	m.handleAccessLoaded(msg)
+	if m.access.loading || m.access.policy == nil || m.access.policy.Mode.Value != "default" {
+		t.Errorf("after the reply: loading %v policy %+v", m.access.loading, m.access.policy)
+	}
+}
+
+// The five states that cannot be resolved must not call the resolver at all.
+func TestOpenAccess_NeverResolvesAnUnresolvableTarget(t *testing.T) {
+	codex := okEntry
+	codex.AgentType = "Codex"
+	for name, c := range map[string]struct {
+		endpoint string
+		entry    SessionMetadata
+		have     bool
+	}{
+		"remote":      {remoteURL, okEntry, true},
+		"no entry":    {localURL, SessionMetadata{}, false},
+		"other agent": {localURL, codex, true},
+	} {
+		m, r := openedAccessModel(c.endpoint, c.entry, c.have)
+		cmd := m.openAccess("s1")
+		if cmd != nil {
+			if msg := cmd(); msg != nil {
+				m.Update(msg)
+			}
+		}
+		if len(r.calls) != 0 {
+			t.Errorf("%s: the resolver was called (%+v): a refusal must not read any file", name, r.calls)
+		}
+		if m.access.policy != nil || m.access.loading {
+			t.Errorf("%s: policy %v loading %v, want neither", name, m.access.policy, m.access.loading)
+		}
+	}
+	m, r := openedAccessModel(localURL, okEntry, true)
+	m.client = nil
+	if cmd := m.openAccess("s1"); cmd != nil {
+		cmd()
+	}
+	if len(r.calls) != 0 {
+		t.Error("no client: the resolver was called")
+	}
+}
+
+func TestOpenAccess_ADegradedNoDirectoryTargetStillResolvesUserAndManaged(t *testing.T) {
+	noCwd := okEntry
+	noCwd.Cwd = ""
+	m, r := openedAccessModel(localURL, noCwd, true)
+	msg := run(t, m.openAccess("s1"))
+	if len(r.calls) != 1 || r.calls[0].Cwd != "" {
+		t.Fatalf("calls = %+v, want one resolve with no cwd", r.calls)
+	}
+	m.handleAccessLoaded(msg.(accessLoadedMsg))
+	if m.access.policy == nil {
+		t.Error("the user and managed layers should still be shown")
+	}
+}
+
+func TestHandleAccessLoaded_DropsAStaleReply(t *testing.T) {
+	m, _ := openedAccessModel(localURL, okEntry, true)
+	first := run(t, m.openAccess("s1")).(accessLoadedMsg)
+	second := run(t, m.refreshAccess()).(accessLoadedMsg)
+	if second.req <= first.req {
+		t.Fatalf("req did not advance: %d then %d", first.req, second.req)
+	}
+	newer := access.Policy{Mode: access.Scalar[string]{Value: "plan", Set: true}}
+	second.policy = newer
+	m.handleAccessLoaded(second)
+	first.policy = access.Policy{Mode: access.Scalar[string]{Value: "STALE", Set: true}}
+	m.handleAccessLoaded(first)
+	if m.access.policy == nil || m.access.policy.Mode.Value != "plan" {
+		t.Errorf("policy = %+v: a late reply for an older request overwrote a newer one", m.access.policy)
+	}
+}
+
+func TestHandleAccessLoaded_DropsAReplyForASessionTheReaderLeft(t *testing.T) {
+	m, _ := openedAccessModel(localURL, okEntry, true)
+	msg := run(t, m.openAccess("s1")).(accessLoadedMsg)
+	// The reply carries the CURRENT request number but names another session: the request check
+	// cannot catch it, so only the session check stands between it and the screen.
+	msg.session = "s0-someone-else"
+	msg.policy = access.Policy{Mode: access.Scalar[string]{Value: "WRONG-SESSION", Set: true}}
+	m.handleAccessLoaded(msg)
+	if m.access.policy != nil {
+		t.Errorf("policy %+v: a reply naming another session was shown", m.access.policy)
+	}
+	if !m.access.loading {
+		t.Error("a dropped reply must not end the real load")
+	}
+}
+
+// The ordinary way to leave: open another session. Its reply for the first must be dropped
+// whichever check does it.
+func TestHandleAccessLoaded_AReplyArrivingAfterSwitchingSessionsIsDropped(t *testing.T) {
+	m, _ := openedAccessModel(localURL, okEntry, true)
+	msg := run(t, m.openAccess("s1")).(accessLoadedMsg)
+	m.sessionsData["s2"] = okEntry
+	m.openAccess("s2")
+	m.handleAccessLoaded(msg)
+	if m.access.policy != nil {
+		t.Errorf("policy %+v: s1's policy was shown under s2", m.access.policy)
+	}
+}
+
+func TestOpenAccess_KeepsTheLastPolicyOnScreenWhileRefreshingTheSameSession(t *testing.T) {
+	m, _ := openedAccessModel(localURL, okEntry, true)
+	m.handleAccessLoaded(run(t, m.openAccess("s1")).(accessLoadedMsg))
+	have := m.access.policy
+	m.pane = paneSessions
+	cmd := m.openAccess("s1")
+	if m.access.policy != have || have == nil {
+		t.Error("re-opening the same session blanked the pane while it refreshes")
+	}
+	_ = cmd
+	m.sessionsData["s2"] = okEntry
+	m.openAccess("s2")
+	if m.access.policy != nil {
+		t.Error("opening a different session kept the previous session's policy")
+	}
+}
+
+func TestRefreshAccess_RunsOnR(t *testing.T) {
+	m, r := openedAccessModel(localURL, okEntry, true)
+	m.handleAccessLoaded(run(t, m.openAccess("s1")).(accessLoadedMsg))
+	cmd := m.handleKey(keyRune('r'))
+	if cmd == nil {
+		t.Fatal("r returned no command")
+	}
+	cmd()
+	if len(r.calls) != 2 {
+		t.Errorf("resolver calls = %d, want 2: r must re-read the files, they may have changed", len(r.calls))
+	}
+}
+
+func TestHandleAccessLoaded_AResolverErrorIsKeptAndShown(t *testing.T) {
+	m, r := openedAccessModel(localURL, okEntry, true)
+	r.err = errors.New("boom")
+	m.handleAccessLoaded(run(t, m.openAccess("s1")).(accessLoadedMsg))
+	if m.access.err == nil || m.access.loading {
+		t.Fatalf("err %v loading %v", m.access.err, m.access.loading)
+	}
+	if !strings.Contains(m.accessBody(), "boom") {
+		t.Errorf("the failure is not on screen:\n%s", m.accessBody())
+	}
+}
+
+// The reply arrives through Update, like every other pane's.
+func TestUpdate_RoutesAccessLoadedMsg(t *testing.T) {
+	m, _ := openedAccessModel(localURL, okEntry, true)
+	msg := run(t, m.openAccess("s1"))
+	updated, _ := m.Update(msg)
+	if updated.(*model).access.policy == nil {
+		t.Error("Update did not route accessLoadedMsg to the pane")
 	}
 }

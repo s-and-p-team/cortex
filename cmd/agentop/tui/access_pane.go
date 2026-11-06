@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/bubbles/viewport"
+	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/rossoctl/cortex/cmd/agentop/access"
 )
@@ -120,24 +121,80 @@ func (m *model) accessTargetFor(session string) accessTarget {
 	return accessTarget{Kind: targetOK, Input: in}
 }
 
-// openAccess enters the pane for session, remembering where to return to.
-func (m *model) openAccess(session string) {
+// accessLoadedMsg carries one resolution back to the model. req and session say which request
+// it answers, so a reply that arrives after the reader moved on is recognised and dropped.
+type accessLoadedMsg struct {
+	req     uint64
+	session string
+	policy  access.Policy
+	err     error
+}
+
+// openAccess enters the pane for session, remembering where to return to, and starts the
+// resolution. The resolver reads several files, so it runs in the returned command and never
+// on the UI goroutine.
+//
+// A target that cannot resolve returns no command and reads nothing: its pane shows the reason.
+func (m *model) openAccess(session string) tea.Cmd {
 	m.access.returnPane = m.pane
 	m.pane = paneAccess
 	if m.access.session != session {
+		// A different session's policy must never show under this one while it loads.
 		m.access.policy, m.access.err = nil, nil
 	}
 	m.access.session = session
-	m.access.target = m.accessTargetFor(session)
+	return m.refreshAccess()
 }
 
-// accessBody is the pane's drawn lines in the viewport, searched. Task 4 replaces this with
-// the real rendering.
+// refreshAccess re-resolves the open session. The files may have changed since (a rule saved
+// with "don't ask again" writes the local file), and nothing watches them: there is no timer,
+// by design. The pane says "as of now", and a quiet auto-refresh would blur the difference
+// between a policy that was edited and one that was always so.
+func (m *model) refreshAccess() tea.Cmd {
+	m.access.target = m.accessTargetFor(m.access.session)
+	m.access.reqSeq++
+	if !m.access.target.Kind.resolvable() {
+		m.access.policy, m.access.err, m.access.loading = nil, nil, false
+		return nil
+	}
+	m.access.loading = true
+	resolve := m.accessResolve
+	if resolve == nil {
+		resolve = access.Resolve
+	}
+	req, session, in := m.access.reqSeq, m.access.session, m.access.target.Input
+	return func() tea.Msg {
+		p, err := resolve(in)
+		return accessLoadedMsg{req: req, session: session, policy: p, err: err}
+	}
+}
+
+func (m *model) handleAccessLoaded(msg accessLoadedMsg) {
+	// A newer request exists, or the pane moved to another session: this reply is no longer
+	// the answer to anything on screen.
+	if msg.req != m.access.reqSeq || msg.session != m.access.session {
+		return
+	}
+	m.access.loading = false
+	if msg.err != nil {
+		m.access.err = msg.err
+		return
+	}
+	p := msg.policy
+	m.access.policy, m.access.err = &p, nil
+}
+
+// accessBody is the pane's drawn lines in the viewport, searched. Task 4 replaces the body of
+// this with the real rendering; until then it shows the reasons and errors.
 func (m *model) accessBody() string {
 	var lines []string
-	t := m.access.target
-	if !t.Kind.resolvable() {
+	switch t := m.access.target; {
+	case !t.Kind.resolvable():
 		lines = append(lines, strings.Split(t.Reason, "\n")...)
+	case m.access.err != nil:
+		lines = append(lines, "could not resolve: "+access.Clean(m.access.err.Error()))
+	case m.access.loading && m.access.policy == nil:
+		lines = append(lines, "resolving…")
 	}
 	m.accessViews.doc.setLines(lines, 0)
 	return m.accessViews.doc.render(m.searchQuery(paneAccess))

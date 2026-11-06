@@ -23,6 +23,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 	"gopkg.in/yaml.v3"
 
+	"github.com/rossoctl/cortex/cmd/agentop/access"
 	"github.com/rossoctl/cortex/cmd/agentop/apiclient"
 	"github.com/rossoctl/cortex/cmd/agentop/cluster"
 	"github.com/rossoctl/cortex/cmd/agentop/edit"
@@ -596,6 +597,9 @@ type model struct {
 	// access is the Access pane's state, and accessViews its scrolling, searched text.
 	access      accessState
 	accessViews accessViews
+	// accessResolve is the resolver; nil means access.Resolve. A field so tests do not read the
+	// real home directory.
+	accessResolve func(access.Input) (access.Policy, error)
 
 	// spend backs the always-on spend strip. Separate from usage on purpose —
 	// see spendState, which records why sharing one poll chain would blank the
@@ -1624,6 +1628,10 @@ func (m *model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case timelineLoadedMsg:
 		m.handleTimelineLoaded(msg)
+		return m, nil
+
+	case accessLoadedMsg:
+		m.handleAccessLoaded(msg)
 		return m, nil
 
 	case timelineTickMsg:
