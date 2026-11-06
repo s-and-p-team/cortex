@@ -7,8 +7,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 
@@ -106,14 +104,14 @@ Flags:
 		}
 	}
 
-	in, err := accessInput(*cwd, *configDir, *cliSettings, sess != nil)
+	in, err := access.LocalInput(*cwd, *configDir, *cliSettings, sess != nil)
 	if err != nil {
 		fmt.Fprintf(stderr, "agentop access: %v\n", err)
 		return 1
 	}
 	if sess != nil {
 		in.SessionMode = sess.mode
-		in.Notes = append(in.Notes, sess.describe())
+		in.Notes = append(in.Notes, access.DescribeSession(sess.id, sess.title, sess.cwd))
 		if sess.cwd != "" {
 			if _, err := os.Stat(sess.cwd); err != nil {
 				in.Notes = append(in.Notes, "that directory no longer exists, so its project files are gone or moved")
@@ -137,69 +135,6 @@ Flags:
 	}
 	fmt.Fprint(stdout, policy.Text())
 	return 0
-}
-
-// accessInput turns flags and the environment into the resolver's Input. All
-// environment and filesystem-layout lookups live here so the access package
-// stays a pure function of what it is given.
-//
-// noCwdMeansUnknown is set for a session: there, an empty cwd is a fact (the transcript
-// recorded none) and must leave the project layers unavailable, whereas for a plain run it
-// means "the current directory".
-func accessInput(cwd, configDir, cliSettings string, noCwdMeansUnknown bool) (access.Input, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return access.Input{}, fmt.Errorf("cannot find the home directory: %w", err)
-	}
-	if cwd == "" && !noCwdMeansUnknown {
-		if cwd, err = os.Getwd(); err != nil {
-			return access.Input{}, fmt.Errorf("cannot find the current directory: %w", err)
-		}
-	}
-	if cwd != "" {
-		if cwd, err = filepath.Abs(cwd); err != nil {
-			return access.Input{}, err
-		}
-	}
-	if configDir == "" {
-		configDir = os.Getenv("CLAUDE_CONFIG_DIR")
-	}
-	if configDir != "" {
-		if configDir, err = filepath.Abs(configDir); err != nil {
-			return access.Input{}, err
-		}
-	}
-	root := ""
-	if cwd != "" {
-		root = gitRoot(cwd)
-	}
-	return access.Input{
-		Cwd:         cwd,
-		GitRoot:     root,
-		Home:        home,
-		ConfigDir:   configDir,
-		CLISettings: cliSettings,
-		FS:          os.DirFS("/"),
-		GOOS:        runtime.GOOS,
-	}, nil
-}
-
-// gitRoot walks up from dir looking for a ".git" entry, the same marker Claude
-// Code's repository-root rule keys on, and returns the directory holding it, or
-// "" outside a repository. It does not run git: a settings viewer should not
-// depend on, or be slowed by, a subprocess, and it must not fail where git
-// refuses an unowned repository.
-func gitRoot(dir string) string {
-	for {
-		if _, err := os.Lstat(filepath.Join(dir, ".git")); err == nil {
-			return dir
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			return ""
-		}
-		dir = parent
-	}
 }
 
 // sessionRef is what the metadata file knows about one session, reduced to what the
@@ -261,19 +196,4 @@ func lookupSession(query string) (*sessionRef, error) {
 		return nil, fmt.Errorf("session %s was run by %s; agentop access resolves Claude Code's settings model only", id, m.AgentType)
 	}
 	return &sessionRef{id: id, title: m.Title, cwd: m.Cwd, configDir: m.AgentConfigDir, mode: m.PermissionMode}, nil
-}
-
-// describe is the line saying which session an answer is for and what it was derived from.
-func (s *sessionRef) describe() string {
-	d := "session " + s.id
-	if s.title != "" {
-		d += " (" + s.title + ")"
-	}
-	switch {
-	case s.cwd == "":
-		d += ": no working directory recorded, so the project and local layers are not shown"
-	default:
-		d += " started in " + s.cwd
-	}
-	return d
 }

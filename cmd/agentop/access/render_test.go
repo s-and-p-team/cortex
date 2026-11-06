@@ -303,3 +303,37 @@ func TestNotes_AreCarriedIntoTheOutputAndNeverNull(t *testing.T) {
 		t.Errorf("Text() lacks the note:\n%s", p.Text())
 	}
 }
+
+// A settings file comes from whatever repository was cloned. Its text must not be able to drive
+// the terminal the output is printed to.
+func TestText_NeverEmitsATerminalControlSequenceFromSettingsText(t *testing.T) {
+	const evil = "\x1b]0;pwned\x07\x1b[2J"
+	p := mustResolve(t, input(map[string]string{
+		"/home/.claude/settings.json": `{"permissions":{"allow":["Bash(` + jsonEscape(evil) + `)"],"deny":["Read(` + jsonEscape(evil) + `)"],
+			"defaultMode":"` + jsonEscape(evil) + `","additionalDirectories":["/x` + jsonEscape(evil) + `"]},
+			"hooks":{"` + jsonEscape(evil) + `":[]}}`,
+	}))
+	p.Notes = []string{"note " + evil}
+	p.Layers[0].Err = errString("boom " + evil)
+	p.Flags = append(p.Flags, RiskFlag{Code: "x", Severity: Low, Detail: "d " + evil})
+	out := p.Text()
+	for i := 0; i < len(out); i++ {
+		if b := out[i]; (b < 0x20 && b != '\n') || b == 0x7f {
+			t.Fatalf("Text() contains control byte %#x at %d:\n%q", b, i, out)
+		}
+	}
+	for _, leak := range []string{"pwned", "[2J"} {
+		if strings.Contains(out, leak) {
+			t.Errorf("Text() leaks %q from a settings file:\n%q", leak, out)
+		}
+	}
+}
+
+type errString string
+
+func (e errString) Error() string { return string(e) }
+
+func jsonEscape(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b[1 : len(b)-1])
+}
