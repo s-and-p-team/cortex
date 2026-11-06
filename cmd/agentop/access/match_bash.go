@@ -150,8 +150,13 @@ func bashBoundaryCaveat(rules []Rule, c Call) string {
 			continue
 		}
 		_, pat := matchKey(r.Tool, r.Pattern)
-		prog, _, _ := strings.Cut(strings.TrimSpace(strings.TrimSuffix(strings.TrimSuffix(pat, ":*"), " *")), " ")
+		prog, sub, _ := strings.Cut(strings.TrimSpace(strings.TrimSuffix(strings.TrimSuffix(pat, ":*"), " *")), " ")
 		if prog == "" || strings.ContainsAny(prog, "*?") {
+			continue
+		}
+		// "git push *" is about pushing, not about git: the command must mention the rule's
+		// subcommand as well, or every git command would carry a note about a rule it never met.
+		if w, _, _ := strings.Cut(strings.TrimSpace(sub), " "); w != "" && !strings.ContainsAny(w, "*?") && !mentionsProgram(cmd, w) {
 			continue
 		}
 		if mentionsProgram(cmd, prog) {

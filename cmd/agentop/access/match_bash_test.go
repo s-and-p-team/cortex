@@ -396,3 +396,24 @@ func TestBashBoundaryCaveat_DoesNotFireForAnEmbeddedName(t *testing.T) {
 		}
 	}
 }
+
+// "git push *" is a rule about pushing, not about git. A command that merely uses git must not
+// carry a note that the rule "did not match" something it was never about.
+func TestBashBoundaryCaveat_NeedsTheRulesSubcommandToo(t *testing.T) {
+	p := pol(rl(Ask, "Bash(git push *)"))
+	for _, cmd := range []string{"git status", "git log --oneline", "git diff main", "git -C . status", "git status && git log"} {
+		if got := p.Match(bash(cmd), MatchContext{}); hasCaveat(got, "not a security boundary") {
+			t.Errorf("%q: a boundary note for a command that never mentions push: %q", cmd, got.Caveats)
+		}
+	}
+	// the three routes the docs name still raise it: the rule's program AND subcommand are there
+	for _, cmd := range []string{"git -C . push origin main", "git -c push.default=current push origin main", "git 'push' origin main"} {
+		if got := p.Match(bash(cmd), MatchContext{}); !hasCaveat(got, "not a security boundary") {
+			t.Errorf("%q: the docs' own bypass example lost its note: %q", cmd, got.Caveats)
+		}
+	}
+	// a one-word rule has no subcommand to require
+	if got := pol(rl(Deny, "Bash(rm *)")).Match(bash("/bin/rm -rf x"), MatchContext{}); !hasCaveat(got, "not a security boundary") {
+		t.Errorf("a one-word rule lost its note: %q", got.Caveats)
+	}
+}
