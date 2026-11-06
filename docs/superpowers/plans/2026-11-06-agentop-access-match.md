@@ -153,6 +153,8 @@ Rules (docs, "WebFetch", "MCP", "Agent", "Match by input parameter"):
 
 ### Task 6: The `RULE` column and the detail block
 
+> **Correction found while implementing (2026-11-06).** The plan below assumed the rows carry `Inference.ToolCalls`. They do not: the events list is fetched with `view=summary`, which sets `ToolCalls`, `ToolResults`, `Messages`, `Tools` and `HistoryToolCalls` to nil on every snapshot-loaded event (`core/sessionapi/summary.go`). Only SSE-streamed events are unprojected. The timeline's `Tool.Preview` is not a substitute: it is clipped to 80 characters and 86% of the 1,773 real Bash commands measured are longer, so a deny at the end of a long compound command would be missed. Fetching full *request* events is what the projection exists to avoid. **Response** events are small (median 433 B, p95 3.9 KB over 2,219 real tool-call turns) and `FinishReason` survives projection, so the column fetches the full response, via the existing `GetEvent`, for rows whose finish reason is `tool_use` (Anthropic) or `tool_calls` (chat completions), at most four at a time, only while the column is on. A row is `…` until its response arrives. The cost is one small request per tool call; the detail pane already pays the same per row.
+
 **Files:**
 - Create: `cmd/agentop/tui/access_rule_col.go`
 - Modify: `cmd/agentop/tui/events_columns.go` (`colRule`, **off by default**), `cmd/agentop/tui/app.go` (`Update` wrapper, model fields), `cmd/agentop/tui/detail_pane.go` (the block), `cmd/agentop/tui/help_overlay.go`
