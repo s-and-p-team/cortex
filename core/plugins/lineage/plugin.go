@@ -658,11 +658,18 @@ func (p *LineageTelemetry) OnRequest(ctx context.Context, pctx *pipeline.Context
 	// means something only beside it: a gate later in this chain tells "capture
 	// is off" from "this body could not be captured" by reading it here, from the
 	// config that emitted this exchange's span, which a reload cannot separate.
+	// A body mark (requestBodyMark) is known here, before any verdict, so a gate
+	// with no verdict in time still knows the body could not be judged whole.
+	// self_id, as the span carries it, lets the gate pick its settings by source.
 	if stamped {
+		details := map[string]string{"capture_io": strconv.FormatBool(p.cfg.CaptureIO), "self_id": self}
+		if mark := p.requestBodyMark(pctx, protocol); mark != "" {
+			details[mark] = "true"
+		}
 		pctx.Record(pipeline.Invocation{
 			Action:  pipeline.ActionModify,
 			Reason:  "stamped_tracestate",
-			Details: map[string]string{"capture_io": strconv.FormatBool(p.cfg.CaptureIO)},
+			Details: details,
 		})
 	} else {
 		pctx.Observe("recorded_request")
@@ -1010,6 +1017,23 @@ func (p *LineageTelemetry) appendRequestFacts(attrs []attribute.KeyValue, pctx *
 		}
 	}
 	return attrs
+}
+
+// requestBodyMark is "body_cut" when input.value was cut at max_payload_bytes,
+// "body_not_captured" when the body has bytes and input.value got none of them, and
+// "" otherwise and whenever capture is off (the record's capture_io says so).
+func (p *LineageTelemetry) requestBodyMark(pctx *pipeline.Context, protocol string) string {
+	if !p.cfg.CaptureIO || len(pctx.Body) == 0 {
+		return ""
+	}
+	v := ioInputValue(pctx, protocol)
+	switch {
+	case v == "":
+		return "body_not_captured"
+	case p.cfg.MaxPayloadBytes > 0 && len(v) > p.cfg.MaxPayloadBytes:
+		return "body_cut"
+	}
+	return ""
 }
 
 // truncate bounds a captured payload to max bytes, cutting on a UTF-8

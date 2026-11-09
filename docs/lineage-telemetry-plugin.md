@@ -26,3 +26,12 @@ denial by a plugin ordered before it emits no spans.
 - `namespace` (string) — this workload's Kubernetes namespace (an RFC 1123 DNS label), emitted as `lineage.self.namespace` on every span: the other half of its identity, since `self_id` is the last segment of a SPIFFE ID and the same segment in two namespaces is two workloads. **Required** (or `namespace_file`) — absent, blank, or not a DNS label is refused at start; never derived from the SPIFFE path. The attach kit writes its `NAMESPACE`; a sidecar older than this key rejects a config that carries it, so image and config flip together.
 - `namespace_file` (string) — read once at start when `namespace` is empty; meant for `/var/run/secrets/kubernetes.io/serviceaccount/namespace`, the file the kubelet projects from the pod's own metadata — the one source that is right in every copy of a ConfigMap shared across namespaces (the platform's `authbridge-runtime-config`), where an inline literal would be wrong everywhere but one. Absent, blank, or not a DNS label refuses at start; no default, no poller.
 - `export_delay_ms` (int) — the longest a recorded span waits in the batch exporter before it is sent (the batch span processor's schedule delay). `0` or unset keeps the SDK default, 5000 ms, which suits a reader that consumes the record later; a reader that answers about an exchange while it is still in flight, such as a gate holding an egress request until the record is judged, needs a short one (e.g. `10`). A short delay means more, smaller export calls; the spans are unchanged. Negative is refused at start.
+
+The plugin's invocation record of a request pass whose `lineage-parent` stamp it wrote is
+`modify/stamped_tracestate`, read by `sentry-gate` later in the chain. Its details are
+`self_id` (the workload's identity as `lineage.self.id` carries it, the last segment of a
+SPIFFE ID), `capture_io` (`"true"` or `"false"`, the setting that emitted this exchange's span) and,
+with `capture_io` on, one mark when the request body did not reach `input.value` whole:
+`body_cut: "true"` when it was cut at `max_payload_bytes`, `body_not_captured: "true"`
+when the body has bytes and `input.value` got none of them. With `capture_io` off there
+is no mark: nothing is captured, by design.
