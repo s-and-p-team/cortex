@@ -140,6 +140,10 @@ type spendState struct {
 	// the agents pane, the committed scope elsewhere — so syncSpendScope can tell a restart it
 	// owes from one it does not.
 	bandAgent string
+	// bandProject and drawerProject are the project scopes the same fetches asked for
+	// (spendScopeProject), recorded beside bandAgent and drawerAgent for the same reason.
+	bandProject   string
+	drawerProject string
 }
 
 // spendSpan identifies one of the four budget spans the band reports.
@@ -288,7 +292,7 @@ func (s *spendState) invalidate() {
 		s.chains[i].invalidate()
 	}
 	s.drawer.invalidate()
-	s.drawerAgent = ""
+	s.drawerAgent, s.drawerProject = "", ""
 }
 
 // spendLoadedMsg carries one span's fetched snapshot back to Update.
@@ -730,7 +734,7 @@ func (m *model) spendHourAndDaySummary() spendSummary {
 // cache-write tokens in it, so adding zero is not an approximation, it is the right answer.
 //
 //   - The OpenAI-compatible path NEVER sets it, because OpenAI bills cache writes as ordinary
-//     input (inferenceparser.toNeutral says so). It reports Input = prompt_tokens − cached and
+//     input (core/parse/inference.inferenceUsage.toNeutral says so). It reports Input = prompt_tokens − cached and
 //     CacheRead = cached, so input + cacheRead already IS prompt_tokens exactly.
 //   - The Anthropic path sets it whenever cache_creation_input_tokens is on the wire, so an
 //     absent bit there means the response reported no cache creation.
@@ -936,7 +940,7 @@ func spendTick(span spendSpan, gen uint64) tea.Cmd {
 	// too slowly is a dated figure that says so; a span never polled is a permanent em dash with no
 	// explanation.
 	d := spendSpanDefs[span].pollInterval()
-	return tea.Tick(d, func(time.Time) tea.Msg { return spendTickMsg{span: span, gen: gen} })
+	return tick(d, func(time.Time) tea.Msg { return spendTickMsg{span: span, gen: gen} })
 }
 
 // fetchSpendSpan requests one span's all-sessions total off the render loop. Returns nil
@@ -969,19 +973,21 @@ func (m *model) fetchSpendSpan(span spendSpan) tea.Cmd {
 	// Read on the update goroutine and captured, not read inside the closure: the closure
 	// runs on bubbletea's command goroutine, where touching m is a data race.
 	def := spendSpanDefs[span]
-	agent := m.spendScopeAgent()
-	m.spend.bandAgent = agent
+	agent, project := m.spendScopeAgent(), m.spendScopeProject()
+	m.spend.bandAgent, m.spend.bandProject = agent, project
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), spendFetchTimeout)
 		defer cancel()
-		snap, err := fetchUsageScoped(ctx, client, def.window, def.resolution, agent, usage.GroupNone)
+		snap, err := fetchUsageScopedProject(ctx, client, def.window, def.resolution, agent, project, usage.GroupNone)
 		// A SECOND REQUEST ONLY FOR A MIXED WINDOW. The band needs one number per span, and a
 		// window in one unit — every dollars-only deployment, and any server too old to report
 		// units — is answered by the poll above exactly as before. Two or more units have no
 		// single number, so the per-unit figures are asked for; a server that downgrades the
 		// grouping, or a split that fails, leaves byUnit nil and the cell says money.Mixed.
+		// Not under a project scope: the narrowed reply has no currency series, so the cell
+		// says money.Mixed.
 		var byUnit map[string]int64
-		if err == nil && snap != nil && len(snap.Currencies) > 1 {
+		if err == nil && snap != nil && len(snap.Currencies) > 1 && project == "" {
 			if split, serr := fetchUsageScoped(ctx, client, def.window, def.resolution, agent, usage.GroupCurrency); serr == nil {
 				byUnit = unitCosts(split)
 			}
@@ -1013,7 +1019,7 @@ func (m *model) applySpendDrawerLoaded(msg spendDrawerLoadedMsg) {
 // A keypress refetches immediately — see cycleSpendAxis and cycleSpendWindow — so this only
 // governs how stale an UNTOUCHED open drawer gets.
 func spendDrawerTick(gen uint64, every time.Duration) tea.Cmd {
-	return tea.Tick(every, func(time.Time) tea.Msg {
+	return tick(every, func(time.Time) tea.Msg {
 		return spendDrawerTickMsg{gen: gen}
 	})
 }
@@ -1036,6 +1042,23 @@ func (m *model) spendScopeAgent() string {
 	return m.agentScope
 }
 
+// spendScopeProject is the project scope of the band's and the drawer's next fetches, read the
+// same way as spendScopeAgent: on the agents pane the project sub-row under the cursor ("" on
+// every other row), elsewhere the committed m.projectScope.
+func (m *model) spendScopeProject() string {
+	if m.pane != paneAgents {
+		return m.projectScope
+	}
+	d, _ := m.selectedAgentRow()
+	switch d.kind {
+	case agentRowProject:
+		return d.project
+	case agentRowProjectOther:
+		return otherProjects
+	}
+	return ""
+}
+
 // fetchSpendDrawer requests the breakdown: ONE window, folded by the current axis.
 //
 // The window comes from the drawer's own cycle and the axis from `a`, and both are captured
@@ -1050,15 +1073,16 @@ func (m *model) fetchSpendDrawer() tea.Cmd {
 	// GetUsageWindow, not GetUsage: the drawer's span can now be a symbolic boundary, which a
 	// time.Duration cannot express. One request-building path for every span it can be pointed
 	// at, so the hour cannot drift from the other three.
-	span, axis, agent := m.spendDrawerSpan(), m.spendAxis(), m.spendScopeAgent()
+	span, axis, agent, project := m.spendDrawerSpan(), m.spendAxis(), m.spendScopeAgent(), m.spendScopeProject()
 	window, resolution := spendSpanDefs[span].window, spanResolution(span)
 	// Recorded at issue so syncSpendScope can tell a refetch it owes from one it does not — a
 	// cursor move on the agents pane changes the agent, a clamped one must not refetch.
-	m.spend.drawerAgent, m.spend.drawerSpan = agent, span
+	m.spend.drawerAgent, m.spend.drawerProject, m.spend.drawerSpan = agent, project, span
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), spendFetchTimeout)
 		defer cancel()
-		snap, err := fetchUsageScoped(ctx, client, window, resolution, agent, axis)
+		// Under a project scope the axis is ignored: the reply is narrowed to one series.
+		snap, err := fetchUsageScopedProject(ctx, client, window, resolution, agent, project, axis)
 		return spendDrawerLoadedMsg{snap: snap, req: req, err: err, axis: axis}
 	}
 }

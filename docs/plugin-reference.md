@@ -4,6 +4,9 @@
 contract — field names, invariants, error behaviour, the rules that the
 framework enforces at startup.
 
+Read [`plugin-tutorial.md`](./plugin-tutorial.md) first. For a plugin with no
+Go code, read [`script-plugin.md`](./script-plugin.md).
+
 **See also:**
 - [`plugin-catalog.md`](./plugin-catalog.md) — catalog of implemented plugins.
 - [`plugin-tutorial.md`](./plugin-tutorial.md) — step-by-step tutorial for writing a new plugin.
@@ -57,51 +60,8 @@ pipeline:
   The framework does not interpret it; it's captured as `json.RawMessage`
   and handed to `Configure`.
 
-### `jwt-validation`: `allowed_audiences` (optional, transitional)
-
-The `jwt-validation` plugin accepts an optional JSON array field
-`allowed_audiences` (YAML under `config:`). Each entry is an additional
-**expected** inbound JWT `aud` value. The plugin **union**s these with
-the primary audience from `audience` / `audience_file` (deduplicated,
-order preserved). Inbound verification succeeds if the token's `aud`
-claim (RFC 7519 — string **or** array) contains **any** configured value.
-
-Use this as a **short-term bridge** when legitimate tokens carry
-multiple audiences (for example a public UI client plus `account`) and
-the workload must accept more than the SPIFFE / client ID read from
-`audience_file` alone. Prefer aligning IdP audience policy and
-application token exchange long-term; see team design discussions linked
-from release notes.
-
-When `allowed_audiences` is non-empty, the default
-`/shared/client-id.txt` `audience_file` is **not** auto-added unless you
-still omit `audience`, `audience_file`, and `allowed_audiences` entirely
-— i.e. you can run with **only** `allowed_audiences` for static mode.
-
-**Session / log migration:** jwt-validation deny-path `Details` used a
-single key `expected_audience` (string). It now emits
-`expected_audiences` (comma-joined list of configured inbound audiences).
-Update saved queries and dashboards that filtered on the old
-key.
-
-### `jwt-validation`: `placeholder_mode` / `placeholder_ttl` (optional, off by default)
-
-Two fields enable the **mint** half of [credential placeholder
-swap](token-exchange-plugin.md#credential-placeholder-swap) (read that section for the full
-model — these are the field-level reference).
-
-- **`placeholder_mode`** — bool, default `false`. After validating the
-  inbound token, replace it with an opaque `abph_`-prefixed placeholder
-  before forwarding to the agent. The real token is held in the
-  process-scoped shared store for the outbound path to resolve. Requires
-  `token-exchange` with `resolve_placeholders: true` on the outbound
-  chain to be coherent (see the matched-pair note below).
-- **`placeholder_ttl`** — Go duration string (e.g. `30m`, `1h`), default
-  `1h`. How long the real token is retained for outbound resolution.
-
-Mint requires `pctx.Shared` to be wired by the listener; if it is nil
-when `placeholder_mode` is on, the plugin fails fast at init (a deploy
-error) rather than silently forwarding the real token.
+The `jwt-validation` fields `allowed_audiences`, `placeholder_mode` and
+`placeholder_ttl` are in [`jwt-validation-plugin.md`](jwt-validation-plugin.md).
 
 ## `on_error` policy
 
@@ -543,7 +503,7 @@ specific events through the `Custom` escape-hatch map.
 
 > For a tutorial on emitting Invocations — the `pctx.Record` / `Allow`
 > / `Skip` / `Observe` / `Modify` / `DenyAndRecord` helpers with
-> runnable examples — see [`plugin-tutorial.md` Step 2](./plugin-tutorial.md#step-2--record-what-your-plugin-did).
+> runnable examples — see [`plugin-tutorial.md` Step 3](./plugin-tutorial.md#step-3--record-what-your-plugin-did).
 > This section is the field-level reference for the `Invocation`
 > struct, the 5-value action vocabulary, and the rules around the
 > Custom escape-hatch map.
@@ -686,7 +646,7 @@ slot carries the parsed payload; the Invocation carries the
 attribution.
 
 Adding a new named extension is a core-library change: edit
-`pipeline/extensions.go`, `pipeline/session.go` (wire + JSON round-
+`model/extensions.go`, `model/session.go` (wire + JSON round-
 trip), the listener (snapshot + recorder), and agentop if you want
 bespoke rendering. Most new plugins don't need one — they emit an
 Invocation and publish extra context through the Custom map
@@ -767,12 +727,18 @@ the entry describes (its invocation carries `shadow: true`).
 ```go
 type PluginCapabilities struct {
     ReadsBody          bool // plugin reads pctx.Body / pctx.ResponseBody
+    ReadsResponseBody  bool // plugin reads pctx.ResponseBody of every response
     WritesRequestBody  bool // plugin may call pctx.SetBody and pctx.SetRequestModel
     WritesResponseBody bool // plugin may call pctx.SetResponseBody
 }
 ```
 
 - `ReadsBody`: listener buffers the body; plugin sees bytes.
+- `ReadsResponseBody`: listener buffers the response body, not the request body.
+  On the forward proxy, a response is buffered only when a parser claimed the
+  request (`Extensions.Inference`, `MCP` or `A2A` is set) or a plugin declares
+  this. Any other response — a download, an NDJSON stream — is relayed as it
+  arrives, at any size, with an empty `pctx.ResponseBody`.
 - `WritesRequestBody`: implies `ReadsBody`. Listener propagates `pctx.SetBody`
   rewrites to the upstream. Required by `pctx.SetRequestModel`, which refuses a
   plugin that does not declare it.
@@ -781,9 +747,10 @@ type PluginCapabilities struct {
 
 **Declare the direction you actually write.** The two flags are not
 interchangeable, and getting this wrong is silent: `WritesResponseBody` is the
-SSE streaming predicate. A plugin that declares it forces every response on
-that chain onto the buffered path, so a long completion arrives in one lump
-after a silent wait instead of appearing incrementally. Declaring
+SSE streaming predicate. A plugin that declares it stops SSE responses on that
+chain from streaming — on the forward proxy, those it buffers by the rule above —
+so a long completion arrives in one lump after a silent wait instead of
+appearing incrementally. Declaring
 `WritesRequestBody` costs nothing — requests arrive complete with a
 `Content-Length` and are read end to end before dispatch, so rewriting one says
 nothing about how the response may be relayed.
@@ -792,7 +759,7 @@ nothing about how the response may be relayed.
 |---|---|---|
 | request-only mutator (`tool-prune`, `context-guru`, `inference-router`) | `WritesRequestBody` | yes |
 | response mutator (`sparc`) | `WritesResponseBody` | no — buffered |
-| both (`cpex`) | both | no — buffered |
+| both (`cpex`) | both, plus `ReadsResponseBody` with response hooks | no — buffered |
 | pure reader (parsers) | `ReadsBody` | yes |
 
 **A configured instance may declare less than its ceiling.** What an
@@ -1156,7 +1123,7 @@ Keep each implementation to a pure function over the extension's fields.
 Skip fragments with empty text — consumers never want zero-length entries.
 Stringify non-string values with `json.Marshal` so nested maps/slices
 become flat inspectable text. Reference implementations live alongside
-the types in [`core/pipeline/content.go`](../core/pipeline/content.go).
+the types in [`core/model/content.go`](../core/model/content.go).
 
 ### Consuming content in a guardrail
 
@@ -1265,6 +1232,114 @@ housekeeping — none of those qualify. Adding a method to the action
 set is a security-relevant change because it pulls the method into
 every guardrail's evaluation surface; review accordingly.
 
+## Session facts
+
+A plugin that judges a request against the session's history reads the
+session facts. It does not read `pctx.Session.Events`.
+
+- `pctx.LastIntent()` is the newest user intent: an inbound A2A request
+  (`model.IsIntent`). ibac reads it.
+- `pctx.LastInference()` is the newest outbound inference request
+  (`model.IsInferenceRequest`). sparc reads it in `mcp` mode.
+- `pctx.InferenceHosts()` is the session's `InferenceHosts` table and
+  `HostsKnown`. inference-router reads it. See
+  [The hosts fact](#the-hosts-fact).
+
+`LastIntent` and `LastInference` return a `pipeline.SessionFact`. Its
+`Event` is not nil only when its `State` is `FactPresent`.
+
+| State | Meaning |
+|---|---|
+| `FactNone` (the zero value) | The request has a session, and the store has no event of this kind for it. The store has no entry for the session yet, or it dropped the entry (`max_sessions`, `ttl`, `Delete`, `Clear`, a restart). Or no event of this kind was appended. Or a `session.max_events` trim removed the event. |
+| `FactNoSession` | The request has no session: `pctx.Session` is nil. |
+| `FactPresent` | `Event` is set. It points into `pctx.Session.Events`. |
+
+`LastIntent` and `LastInference` apply these rules, in order:
+
+1. `pctx.Session` is nil: `FactNoSession`, also when the listener set facts.
+2. The listener called `SetSessionFacts`: the fact that it set.
+3. Else, from `pctx.Session.Events`: `FactPresent`, or `FactNone`.
+
+Rule 3 serves a listener that sets only `pctx.Session`, and plugin tests
+that build a `SessionView`.
+
+Keep `FactNoSession` and `FactNone` apart when they are different
+decisions. ibac records `no_session` for the first and `no_intent` for the
+second:
+
+```go
+intent := pctx.LastIntent()
+if intent.State == pipeline.FactNoSession {
+    // the request has no session
+}
+if intent.Event == nil {
+    // FactNone: a session with no intent
+}
+```
+
+**Listeners.** Set `pctx.Session` and the facts from one
+`session.Store.ViewFacts` call, then call `pctx.SetSessionFacts`.
+`ViewFacts` reads the view and the facts under one read lock, so the two
+agree. When it returns a nil view, both facts are `FactNone`. A zero
+`SessionFacts` also reads as `FactNone`.
+
+- The forward proxy then gives plugins an empty view with the session id
+  (`sessionViewFor`), with `FactNone` facts. It keeps the table that
+  `ViewFacts` gave: with no entry, the archive's table.
+- ext_proc sets `pctx.Session` and the facts only with a view. With no view,
+  the facts read `FactNoSession`.
+
+### The hosts fact
+
+`InferenceHosts` has one `InferenceHostSeen` row for each agent and host.
+The store and the archive fold the row from each outbound inference
+request that is not an aside turn (`session.TurnOf`):
+
+- `Agent` is `model.AgentName(e.Client.Label())`.
+- `Host` is `e.Host` as recorded: where the bytes went.
+- `Server` is the server name from the request's `modify/routed` record
+  (`model.RoutedServer`), and `""` when the router did not route it.
+- `Last` is the seq of the newest such request.
+- `LastUnrouted` is the seq of the newest one that `session.CapturePath`
+  takes and that has no `RequestedHost`.
+
+A hot reload can change the servers, so a reader checks each name against
+its own config when it reads. `LastNamedServer(agent, exists, serverAt)`
+gives the newest evidence for `agent`: a `Server` that `exists` names the
+server, else a host with one server in the reader's `serverAt` map names it.
+Use it when servers can share a host. `LastServer(agent, serverAt)` reads
+the host only, so it cannot tell apart the servers on a shared host.
+
+`HostsKnown` false means "do not use the table". The zero `SessionFacts`
+has `HostsKnown` false. So when a listener sets facts with no table,
+inference-router scans the session's history, as it does with no facts.
+
+`InferenceHosts` applies these rules, in order:
+
+1. `pctx.Session` is nil: `(nil, false)`, also when the listener set facts.
+2. The listener called `SetSessionFacts`: the table and `HostsKnown` that
+   it set.
+3. Else `(nil, false)`. A view cannot vouch for a table: it can be a
+   trimmed part of the session.
+
+`ViewFacts` gives a copy of the table. The archive is the store's
+`session.HostsKeeper`, and the store reads it when `ViewFacts` answers:
+
+- An entry numbered after earlier history: the keeper's table, merged with
+  the entry's own. `HostsKnown` is the keeper's.
+- An entry with no earlier history: the entry's own table. `HostsKnown` is
+  true.
+- No entry: the keeper's table over every event it holds under the id.
+- No keeper: the entry's own table, or none. `HostsKnown` is false when a
+  `SeqSeeder` holds history for the id.
+
+A `session.max_events` trim removes no row. The archive's table is
+unknown in these cases:
+
+- A `session.json` from before the table, or of another rule version.
+- A `session.json` with segments and no summary.
+- A rename that the archive cannot split.
+
 ## Registering a plugin
 
 A plugin advertises itself to the pipeline builder through `RegisterPlugin`
@@ -1275,7 +1350,7 @@ lives in this module. The pattern mirrors `database/sql` drivers and
 
 > For a step-by-step walkthrough (in-tree file layout, out-of-tree
 > module + side-effect import, operator YAML wiring), see
-> [`plugin-tutorial.md` Step 6](./plugin-tutorial.md#step-6--out-of-tree-plugins). This
+> [`plugin-tutorial.md` Step 7](./plugin-tutorial.md#step-7--out-of-tree-plugins). This
 > section is the field-level reference: the factory shape and the
 > panic-on-misuse guarantees that define the registry's contract.
 
@@ -1363,10 +1438,10 @@ The IBAC plugin (`core/plugins/ibac/judge.go`) is the in-tree reference; copy it
 - `core/config/config.go` — `PluginEntry` YAML shape and
   parsing.
 - `core/plugins/registry.go` — how Build calls Configure.
-- `core/pipeline/extensions.go` — named categories
+- `core/model/extensions.go` — named categories
   (`MCP`, `A2A`, `Inference`, `Security`, `Delegation`, `Auth`) + `Custom` map + escape-hatch
   convention.
-- `core/pipeline/session.go` — `SessionEvent` wire shape
+- `core/model/session.go` — `SessionEvent` wire shape
   and the `SessionDenied` phase.
 - `core/llmclient/` — chat-completions helper for
   plugins that call an LLM (see "Plugins making outbound LLM calls"

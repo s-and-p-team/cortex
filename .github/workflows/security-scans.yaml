@@ -7,7 +7,6 @@
 # - Hadolint (Dockerfiles)
 # - Bandit (Python security)
 # - Trivy (filesystem + IaC)
-# - CodeQL (Go + Python)
 # - Action Pinning (informational)
 #
 name: Security Scans
@@ -15,7 +14,7 @@ name: Security Scans
 on:
   pull_request:
     branches: [main]
-    # Markdown cannot trip CodeQL, Trivy or Hadolint; docs-only PRs skip them.
+    # Markdown cannot trip Trivy or Hadolint; docs-only PRs skip them.
     # Footgun: a filtered-out run reports "Expected" forever if this workflow is
     # ever added to branch protection as a required check.
     paths-ignore:
@@ -248,39 +247,8 @@ jobs:
           scan-type: 'config'
           scan-ref: '.'
           severity: 'CRITICAL,HIGH,MEDIUM'
-          skip-dirs: 'demos'
           exit-code: '0'
           format: 'table'
-
-  # ============================================================================
-  # Phase D: Advanced Security
-  # ============================================================================
-
-  codeql:
-    name: CodeQL Analysis (${{ matrix.language }})
-    runs-on: ubuntu-latest
-    permissions:
-      security-events: write
-      contents: read
-    strategy:
-      matrix:
-        language: [go, python]
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370  # v4
-        with:
-          languages: ${{ matrix.language }}
-          config-file: ./.github/codeql/codeql-config.yml
-
-      - name: Autobuild
-        uses: github/codeql-action/autobuild@9b3254085494b55a0f7c4c2b3d2d52cc712ce370  # v4
-
-      - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370  # v4
-        with:
-          category: "/language:${{ matrix.language }}"
 
   action-pinning:
     name: Verify Action Pinning

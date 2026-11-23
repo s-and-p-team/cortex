@@ -1216,20 +1216,23 @@ func TestLooksLikePath_AnyUnicodeSpaceSeparates(t *testing.T) {
 // 2.33s — four times the input for sixteen times the work. Reachable because the cwd tier was
 // uncapped, and the renderer redraws on every poll.
 //
-// Asserted as a RATIO rather than a wall-clock bound, so it says what it means on a loaded CI machine:
-// quadratic growth shows up as ~4x per doubling, linear as ~2x, and the ceiling sits between them.
-// Both ends are timed inside one test so the comparison is against the same machine at the same moment.
+// The cost is counted in allocations, so the assertion is about the work done and not about the
+// machine: the skip-ahead tries at most budget candidates whatever the input length, and the
+// one-at-a-time search allocates a candidate per dropped rune.
 func TestTrunc_ScalesLinearly(t *testing.T) {
 	const budget = 40
-	measure := func(f func(string, int) string, runes int) time.Duration {
+	// THE LOWEST OF FIVE MEASUREMENTS. The count is process-wide, and earlier tests in this package
+	// leave goroutines alive (apiclient stream loops that reconnect). One that
+	// wakes during a measurement adds its allocations, which failed this test in a loaded gate run
+	// ("18 allocations, up from 8") with no change to the code. Another goroutine can only add to the
+	// count, so the lowest of several runs drops that noise and cannot hide the function's own work.
+	measure := func(f func(string, int) string, runes int) float64 {
 		s := "/" + strings.Repeat("a", runes-1)
-		// Warm, so the first-call cost of anything lazy is not charged to the small input.
-		f(s, budget)
-		start := time.Now()
-		for i := 0; i < 20; i++ {
-			f(s, budget)
+		lowest := testing.AllocsPerRun(3, func() { f(s, budget) })
+		for range 4 {
+			lowest = min(lowest, testing.AllocsPerRun(3, func() { f(s, budget) }))
 		}
-		return time.Since(start)
+		return lowest
 	}
 	for _, tc := range []struct {
 		name string
@@ -1241,15 +1244,12 @@ func TestTrunc_ScalesLinearly(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			small := measure(tc.f, 4000)
 			large := measure(tc.f, 16000)
-			if small <= 0 {
-				t.Skip("timer resolution too coarse to compare")
-			}
-			// 4x the input. Linear predicts ~4x the time; quadratic predicts ~16x. A ceiling of 8x
-			// separates them with room for scheduling noise.
-			if ratio := float64(large) / float64(small); ratio > 8 {
-				t.Errorf("4x the input took %.1fx the time (%v -> %v) — that is the quadratic shape "+
+			// The allocation count is process-wide, so the ceiling leaves room for a stray
+			// allocation; the quadratic search makes thousands.
+			if large > 2*small {
+				t.Errorf("4x the input made %.0f allocations, up from %.0f — that is the quadratic shape "+
 					"back: the per-rune search must skip to the last/first n runes before measuring",
-					ratio, small, large)
+					large, small)
 			}
 		})
 	}
@@ -1658,6 +1658,81 @@ func TestUntitledSettled_BlankAndUnknownRows(t *testing.T) {
 				t.Errorf("untitledSettled = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestUntitledSettled_NamedRowWhoseTranscriptMoved pins the re-read of a NAMED row.
+//
+// A session started by /clear and left idle is named by its cwd. Before this, a named row was never
+// read again while agentop ran, so the prompt and ai-title that came later never reached the column.
+func TestUntitledSettled_NamedRowWhoseTranscriptMoved(t *testing.T) {
+	settled := time.Now().Add(-2 * untitledSettleDelay)
+	log := filepath.Join(t.TempDir(), "s1.jsonl")
+	if err := os.WriteFile(log, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	harvested := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(log, harvested, harvested); err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name string
+		meta SessionMetadata
+		want bool
+	}{
+		{"unchanged since the harvest", SessionMetadata{Title: "/w/repo", LogFile: log, LogModTime: harvested}, false},
+		{"changed since the harvest", SessionMetadata{Title: "/w/repo", LogFile: log, LogModTime: harvested.Add(-time.Minute)}, true},
+		{"no transcript recorded", SessionMetadata{Title: "/w/repo"}, false},
+		{"transcript gone", SessionMetadata{Title: "/w/repo", LogFile: log + ".gone"}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newTitleModel(t, map[string]SessionMetadata{"s1": tc.meta}, "s1")
+			m.sessions = []session.SessionSummary{{ID: "s1", UpdatedAt: settled}}
+			if got := m.untitledSettled(time.Now()); got != tc.want {
+				t.Errorf("untitledSettled = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSessionsPane_RefreshOfNamedRowCountsAsMiss pins the limit on re-reads of a NAMED row.
+//
+// An active session's transcript moves on every turn. If a re-read that names nothing new did not
+// count as a miss, every pause in that session would start a harvest at the 5s floor.
+func TestSessionsPane_RefreshOfNamedRowCountsAsMiss(t *testing.T) {
+	log := filepath.Join(t.TempDir(), "s1.jsonl")
+	if err := os.WriteFile(log, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	st, err := os.Stat(log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	moved := SessionMetadata{Title: "/w/repo", LogFile: log, LogModTime: st.ModTime().Add(-time.Minute)}
+	m := newTitleModel(t, map[string]SessionMetadata{"s1": moved}, "s1")
+	m.sessions = []session.SessionSummary{{ID: "s1", UpdatedAt: time.Now().Add(-time.Hour)}}
+	m.harvest = func() (map[string]SessionMetadata, error) { return nil, nil }
+
+	m.lastHarvest = time.Now().Add(-untitledBackoffCap)
+	m.Update(refreshTickMsg(time.Now()))
+	if !m.harvesting {
+		t.Fatal("no harvest started for a named row whose transcript moved")
+	}
+	// The re-read gives the same title and the transcript's current mtime.
+	m.Update(harvestedMsg{meta: map[string]SessionMetadata{
+		"s1": {Title: "/w/repo", LogFile: log, LogModTime: st.ModTime()},
+	}})
+	if m.untitledMisses != 1 {
+		t.Errorf("a re-read that named nothing new left untitledMisses = %d, want 1", m.untitledMisses)
+	}
+
+	// The transcript has not moved since that re-read, so no harvest starts.
+	m.lastHarvest = time.Now().Add(-untitledBackoffCap)
+	m.Update(refreshTickMsg(time.Now()))
+	if m.harvesting {
+		t.Error("harvested again although the transcript did not move")
 	}
 }
 
@@ -2478,8 +2553,8 @@ func TestSessionsPane_HarvestBeatsServedTitle(t *testing.T) {
 // route by which the cap could blank a non-blank harvested title ALSO silently inverted the
 // documented precedence: with the cap trimming after its cut, sessionTitleFor(85 spaces + "real",
 // "served-name") returned "served-name". That is worse than the blank cell it replaced. An operator
-// picks a row by its name before acting on it, and CLAUDE.md, cmd/agentop/README.md and
-// core/session/store.go all tell them the harvest is what they are looking at.
+// picks a row by its name before acting on it, and cmd/agentop/README.md and
+// core/session/summary.go both tell them the harvest is what they are looking at.
 //
 // NOT A MUTATION GATE, and saying so is the honest version of this test. Reverting the guard to
 // !titleIsBlank(m.sessionTitle(id)) leaves the whole suite green — verified by running it. It has to:
@@ -3318,5 +3393,36 @@ func TestSessionsPane_ZeroWidthFreeAndBindsToPreviousDisagreeOnPurpose(t *testin
 				t.Errorf("bindsToPrevious(%U) = %v, want %v", tc.r, got, tc.binds)
 			}
 		})
+	}
+}
+
+// The header of a session that another session started names the topmost session above it by
+// its first 8 runes (#1991).
+func TestSessionHeader_Under(t *testing.T) {
+	m := newTitleModel(t, map[string]SessionMetadata{"id-1": {Title: "fix the parser"}})
+	m.width = 200
+	m.sessions = []session.SessionSummary{
+		{ID: "id-1", Title: "fix the parser", ParentSession: "abcdef0123456789"},
+		{ID: "id-2", Title: "top"},
+	}
+	if got := m.sessionHeader("id-1", "event"); !strings.Contains(got, " · event · under abcdef01") {
+		t.Errorf("header = %q, want it to contain %q", got, " · event · under abcdef01")
+	}
+	if got := m.sessionHeader("id-2", "event"); strings.Contains(got, " · under ") {
+		t.Errorf("header of a session with no parent = %q, has %q", got, " · under ")
+	}
+}
+
+// The parent id comes from a client header, so the header shows no control byte of it.
+func TestSessionHeader_UnderSanitises(t *testing.T) {
+	m := newTitleModel(t, nil)
+	m.width = 200
+	m.sessions = []session.SessionSummary{{ID: "id-1", ParentSession: "ab\x1b[31mcd"}}
+	got := m.sessionHeader("id-1", "")
+	if strings.Contains(got, "\x1b") {
+		t.Errorf("header = %q, has an escape byte", got)
+	}
+	if !strings.Contains(got, " · under ") {
+		t.Errorf("header = %q, has no %q", got, " · under ")
 	}
 }

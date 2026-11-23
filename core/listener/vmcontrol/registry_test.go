@@ -64,14 +64,39 @@ func (p *sessionProbe) OnResponse(_ context.Context, _ *pipeline.Context) pipeli
 
 // captureSink collects audit events for assertions.
 type captureSink struct {
-	mu     sync.Mutex
-	events []Event
+	mu      sync.Mutex
+	events  []Event
+	emitted chan struct{} // closed and replaced on each Emit
 }
 
 func (s *captureSink) Emit(e Event) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.events = append(s.events, e)
+	if s.emitted != nil {
+		close(s.emitted)
+	}
+	s.emitted = make(chan struct{})
+}
+
+// awaitEvent blocks until vm has an event with decision, and returns it. An
+// empty decision matches any.
+func (s *captureSink) awaitEvent(vm, decision string) Event {
+	for {
+		s.mu.Lock()
+		for _, e := range s.events {
+			if e.VMID == vm && (decision == "" || e.Decision == decision) {
+				s.mu.Unlock()
+				return e
+			}
+		}
+		if s.emitted == nil {
+			s.emitted = make(chan struct{})
+		}
+		next := s.emitted
+		s.mu.Unlock()
+		<-next
+	}
 }
 
 func (s *captureSink) forVM(vm string) []Event {
@@ -107,7 +132,7 @@ func newVMEgressStack(t *testing.T) (*Registry, *captureSink, *session.Store, *s
 		TrustedSessionID: SessionIDFromRequest,
 	}
 	sink := &captureSink{}
-	return NewRegistry(fp, sink), sink, store, probe
+	return NewRegistry(fp, sink, Limits{}), sink, store, probe
 }
 
 // registerTCPVM binds a listener and hands it to the registry as a VM's
@@ -331,13 +356,7 @@ func TestRegistryTunnelAudit(t *testing.T) {
 	}
 	_ = conn.Close()
 
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if evs := sink.forVM("vm-b"); len(evs) > 0 {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	sink.awaitEvent("vm-b", "")
 	events := sink.forVM("vm-b")
 	if len(events) != 1 {
 		t.Fatalf("audit events = %+v, want exactly one tunnel line", events)
@@ -397,11 +416,7 @@ func TestRegistryUnregisterAbortsInflight(t *testing.T) {
 			_ = resp.Body.Close()
 		}
 	}()
-	select {
-	case <-arrived:
-	case <-time.After(5 * time.Second):
-		t.Fatal("slow request never reached the backend")
-	}
+	<-arrived
 
 	// A live tunnel on vm-b, which must survive vm-a's Unregister.
 	tunnelB := guest(t, vmB)
@@ -558,7 +573,7 @@ func newVMEgressStackWithAllow(t *testing.T, entries ...string) (*Registry, *cap
 		EgressAllow:      allow,
 	}
 	sink := &captureSink{}
-	return NewRegistry(fp, sink), sink, store
+	return NewRegistry(fp, sink, Limits{}), sink, store
 }
 
 // rowsIn is how many session rows a bucket holds.
@@ -567,6 +582,19 @@ func rowsIn(store *session.Store, sid string) int {
 		return len(v.Events)
 	}
 	return 0
+}
+
+// awaitRows blocks until sid holds at least n rows, re-checking on every event
+// the store publishes. Subscribing before the first check means no append slips
+// between the two.
+func awaitRows(store *session.Store, sid string, n int) {
+	sub, cancel := store.Subscribe()
+	defer cancel()
+	for rowsIn(store, sid) < n {
+		if _, ok := <-sub.Events(); !ok {
+			return
+		}
+	}
 }
 
 // TestRegistry_EgressDeniedRowLandsInTheVMSession: a VM request refused by the
@@ -678,14 +706,8 @@ func TestRegistry_OpaqueTunnelRowsLandInTheVMSession(t *testing.T) {
 	}
 	_ = c.Close()
 
-	// The close row is recorded after the tunnel ends; poll for both rows.
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if rowsIn(store, "sid-b") >= 2 {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	// The close row is recorded after the tunnel ends; wait for both rows.
+	awaitRows(store, "sid-b", 2)
 	if got := rowsIn(store, "sid-b"); got != 2 {
 		t.Errorf("the VM's session holds %d tunnel row(s), want the open and the close", got)
 	}
@@ -719,7 +741,7 @@ func TestRegistry_TrustedSessionSurvivesSessionsDisabled(t *testing.T) {
 		Client:           http.DefaultClient,
 		TrustedSessionID: SessionIDFromRequest,
 	}
-	reg := NewRegistry(fp, &captureSink{})
+	reg := NewRegistry(fp, &captureSink{}, Limits{})
 	addr := registerTCPVM(t, reg, "vm-c", "sid-c")
 
 	c := guest(t, addr)
@@ -765,7 +787,7 @@ func TestVMBinding_AbortedWindowAnswers503(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = ln.Close() })
-	b := newVMBinding(fp, sink, "vm-d", "sid-d", ln)
+	b := newVMBinding(fp, sink, "vm-d", "sid-d", ln, 1, &sessionRequests{max: 1})
 
 	// Enter the window: aborted set, connections not yet closed.
 	b.close()

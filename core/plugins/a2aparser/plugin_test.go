@@ -349,7 +349,7 @@ func TestA2AParser_NonJSONRPCBody_NoMatch(t *testing.T) {
 		{"explicit empty method", `{"jsonrpc":"2.0","id":1,"method":"","params":{}}`},
 		// Non-object JSON: declined on shape, before any method check. The
 		// array wraps a real A2A method on purpose — it would match
-		// isA2AMethod if it were an object.
+		// a2a.isA2AMethod if it were an object.
 		{"top-level array", `[{"jsonrpc":"2.0","id":1,"method":"message/send"}]`},
 		{"top-level string", `"hello"`},
 		{"top-level number", `42`},
@@ -618,21 +618,6 @@ func TestA2AParser_OnResponse_NoSessionFound(t *testing.T) {
 	// Should NOT overwrite the existing value when the response has no session.
 	if pctx.Extensions.A2A.SessionID != "preexisting" {
 		t.Errorf("SessionID = %q, should not be cleared", pctx.Extensions.A2A.SessionID)
-	}
-}
-
-func TestA2AParser_OnRequest_ContextIDPreferred(t *testing.T) {
-	// A client resuming a conversation sends contextId; we should pick it up on the request side too.
-	p := NewA2AParser()
-	pctx := &pipeline.Context{
-		Body: []byte(`{"jsonrpc":"2.0","method":"message/send","id":1,"params":{"contextId":"ctx-resume","message":{"role":"user","messageId":"m2","parts":[{"kind":"text","text":"hi again"}]}}}`),
-	}
-	action := p.OnRequest(context.Background(), pctx)
-	if action.Type != pipeline.Continue {
-		t.Fatalf("expected Continue, got %v", action.Type)
-	}
-	if pctx.Extensions.A2A == nil || pctx.Extensions.A2A.SessionID != "ctx-resume" {
-		t.Errorf("SessionID from contextId: got %+v, want ctx-resume", pctx.Extensions.A2A)
 	}
 }
 

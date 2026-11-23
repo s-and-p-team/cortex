@@ -45,9 +45,16 @@ import (
 	"github.com/rossoctl/cortex/core/peerproc"
 	"github.com/rossoctl/cortex/core/pipeline"
 	"github.com/rossoctl/cortex/core/plugins"
+	"github.com/rossoctl/cortex/core/project"
 	"github.com/rossoctl/cortex/core/reloader"
 	"github.com/rossoctl/cortex/core/session"
 	"github.com/rossoctl/cortex/core/session/archive"
+	"github.com/rossoctl/cortex/core/session/importer"
+	bobimport "github.com/rossoctl/cortex/core/session/importer/bob"
+	claudeimport "github.com/rossoctl/cortex/core/session/importer/claude"
+	codeximport "github.com/rossoctl/cortex/core/session/importer/codex"
+	opencodeimport "github.com/rossoctl/cortex/core/session/importer/opencode"
+	piimport "github.com/rossoctl/cortex/core/session/importer/pi"
 	"github.com/rossoctl/cortex/core/sessionapi"
 	"github.com/rossoctl/cortex/core/spiffe"
 	"github.com/rossoctl/cortex/core/tlsbridge"
@@ -579,7 +586,7 @@ func main() {
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("inbound: %w", err)
 		}
-		out, err := plugins.BuildWithDeps(c.Pipeline.Outbound.Plugins, outDeps)
+		out, err := plugins.BuildWithDeps(outboundEntries(c, slog.Default()), outDeps)
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("outbound: %w", err)
 		}
@@ -671,6 +678,13 @@ func main() {
 	// After the first config is applied, so the list is combined with it from the start.
 	if localInstall && cfg.Pricing.BundledEnabled() {
 		go runPriceList(ctx, live)
+	}
+	// Not behind update.auto: agentop update --auto reads it itself.
+	if localInstall {
+		if dir, err := defaultCortexDir(); err == nil {
+			_, every, _ := cfg.Update.Times() // Validate refused a bad value
+			go runUpdateTrigger(ctx, &updateTrigger{file: filepath.Join(dir, updateStatusFile), every: every, now: time.Now, start: startUpdaterUnit})
+		}
 	}
 
 	var sessions *session.Store
@@ -784,7 +798,11 @@ func main() {
 
 		// The session archive is the store's third Recorder: it persists every event so
 		// sessions survive a restart and the store's eviction. See core/session/archive.
-		sessArchive = openSessionArchive(cfg, *configPath, sessions)
+		ledgerDays := 0
+		if costLedger != nil {
+			ledgerDays = costLedger.RetentionDays()
+		}
+		sessArchive = openSessionArchive(cfg, *configPath, sessions, ledgerDays)
 		if sessArchive != nil {
 			history.open(sessArchive)
 			// Started before any listener, finished beside them: see replayUsage.
@@ -838,8 +856,8 @@ func main() {
 		// back on handshake failure", and Istio's PeerAuthentication
 		// permissive is inbound-only). A permissive caller can no
 		// longer reach a strict peer regardless of mode; mixed-mode
-		// deployments need both ends compatible. See CLAUDE.md
-		// "Top-level mtls: configuration".
+		// deployments need both ends compatible. See
+		// docs/framework-architecture.md §8a.
 		if strict {
 			fpMTLS = &forwardproxy.MTLSOptions{Source: src, Metrics: mtlsMetrics}
 		}
@@ -874,6 +892,14 @@ func main() {
 	// TLS so the outbound pipeline sees decrypted HTTPS. Constructed
 	// here and set on fpSrv below (mirroring fpSrv.SkipHosts / fpSrv.Shared).
 	// A nil *Engine leaves today's blind-tunnel behavior intact.
+	// The bridge's re-origination client, and the praxis egress listener's, dial
+	// through the egress guard when one is armed, so a bridged request is checked
+	// exactly like a plaintext one. No option when the guard is off: nil
+	// DialContext is the transport's default dialer.
+	var upOpts []tlsbridge.UpstreamOption
+	if egress != nil {
+		upOpts = append(upOpts, tlsbridge.WithDialContext(egress.DialContext))
+	}
 	var bridge *tlsbridge.Engine
 	if cfg.TLSBridge != nil && cfg.TLSBridge.Mode == "enabled" {
 		// CA is normally the operator-mounted cert-manager Secret (tls.crt/tls.key
@@ -908,8 +934,10 @@ func main() {
 		// the comparison is on certificates, so ours must exist first. Skipped outside
 		// --local, where there is no agentop-managed client to reason about.
 		if localStatePath != "" {
-			if args := staleClientCAWarning(cfg.TLSBridge.CADir, clientCAFromState(localStatePath), src.CACertPEM()); args != nil {
-				slog.Warn("a client is configured against a different bridge CA than the one now in force", args...)
+			for _, ca := range clientCAsFromState(localStatePath) {
+				if args := staleClientCAWarning(cfg.TLSBridge.CADir, ca, src.CACertPEM()); args != nil {
+					slog.Warn("a client is configured against a different bridge CA than the one now in force", args...)
+				}
 			}
 		}
 		// Assemble the CA + platform-roots bundle for tools whose CA setting
@@ -957,14 +985,6 @@ func main() {
 				fatalf("tls-bridge upstream_ca_bundle read failed: %v", err)
 			}
 		}
-		// The bridge's re-origination client dials through the egress guard
-		// when one is armed, so a bridged request is checked exactly like a
-		// plaintext one. No option when the guard is off: nil DialContext is
-		// the transport's default dialer.
-		var upOpts []tlsbridge.UpstreamOption
-		if egress != nil {
-			upOpts = append(upOpts, tlsbridge.WithDialContext(egress.DialContext))
-		}
 		up, uerr := tlsbridge.NewUpstreamClient(extra, cfg.TLSBridge.UpstreamInsecure, upOpts...)
 		if uerr != nil {
 			fatalf("tls-bridge upstream client failed: %v", uerr)
@@ -984,7 +1004,7 @@ func main() {
 		// matching presents as "the bridge broke my tool", with nothing tying the
 		// symptom back to the typo.
 		decision, derr := tlsbridge.NewDecision(tlsbridge.DecisionOpts{
-			Ports: ports, SkipHosts: cfg.TLSBridge.PassthroughHosts,
+			Ports: ports, SkipHosts: cfg.TLSBridge.PassthroughHosts, FailClosed: cfg.TLSBridge.FailClosed,
 		})
 		if derr != nil {
 			fatalf("tls-bridge: %v", derr)
@@ -999,9 +1019,16 @@ func main() {
 			Upstream: up,
 			CAPEM:    src.CACertPEM(),
 			CAFile:   caTrustPath(cfg.TLSBridge.CADir),
+
+			FailClosed: cfg.TLSBridge.FailClosed,
 		}
-		slog.Info("tls-bridge enabled", "ca_dir", cfg.TLSBridge.CADir)
+		slog.Info("tls-bridge enabled", "ca_dir", cfg.TLSBridge.CADir, "fail_closed", cfg.TLSBridge.FailClosed)
 	}
+
+	// Before any server starts, so a process that serves takes SIGTERM through the
+	// shutdown below, which flushes the cost ledger and the session archive.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
 
 	// Proxy-sidecar: reverse proxy (inbound) and/or forward proxy (outbound),
 	// selected by listener.roles (empty => both). sharedStore is created up
@@ -1050,6 +1077,17 @@ func main() {
 	ctrlCfg, ctrlErr := resolveControlConfig(os.Getenv)
 	if ctrlErr != nil {
 		fatalf("vm control: %v", ctrlErr)
+	}
+	// Praxis mode: one read of the gateway token, for the hop, the egress listener and
+	// POST /v1/ingest. hopJoins stays nil when no forward proxy runs.
+	var gatewayToken string
+	var hopJoins sessionapi.HopJoins
+	if cfg.PraxisEnabled() {
+		t, terr := readGatewayToken(os.Getenv, os.ReadFile)
+		if terr != nil {
+			fatalf("praxis: %v", terr)
+		}
+		gatewayToken = t
 	}
 	if roles[config.RoleForward] {
 		fpSrv, ferr := forwardproxy.NewServer(outboundH, sessions, fpMTLS, forwardproxy.WithEgressGuard(egress))
@@ -1113,6 +1151,21 @@ func main() {
 				slog.Warn("process attribution off: this host's process lookup is unavailable", "error", perr)
 			} else {
 				fpSrv.Processes = procs
+				// The kernel gives a resolved cwd (/private/tmp for /tmp), so resolve home too,
+				// or its prefix never matches. No home: no "~" and no home rule (#1815).
+				home, herr := os.UserHomeDir()
+				if herr != nil {
+					home = ""
+				} else if resolved, rerr := filepath.EvalSymlinks(home); rerr == nil {
+					home = resolved
+				}
+				fpSrv.ProjectOf = func(pid int32) string {
+					dir, err := peerproc.Cwd(pid)
+					if err != nil {
+						return ""
+					}
+					return project.Label(project.Root(dir, home), home)
+				}
 				if bridge != nil {
 					// The unread report lists a process's own entry only while that process
 					// runs. A pid alone could be reused, so the start time must match too;
@@ -1147,9 +1200,33 @@ func main() {
 		if ctrlCfg.Socket != "" {
 			vmCtrl = startVMControl(ctrlCfg, fpSrv)
 		}
+		// Praxis mode, also before the forward proxy serves: startPraxis sets fpSrv.Hop
+		// and fpSrv.ResponsesWebSockets. The egress listener uses the bridge's upstream
+		// options (Decision 11).
+		var egressSrv *http.Server
+		if cfg.PraxisEnabled() {
+			var upstream http.RoundTripper
+			if bridge != nil {
+				upstream = bridge.Upstream.Transport
+			} else {
+				up, uerr := tlsbridge.NewUpstreamClient(nil, false, upOpts...)
+				if uerr != nil {
+					fatalf("praxis egress upstream client failed: %v", uerr)
+				}
+				upstream = up.Transport
+			}
+			var hop *forwardproxy.Hop
+			hop, egressSrv = startPraxis(ctx, cfg, fpSrv, gatewayToken, upstream, listeners.take("praxis-egress"))
+			hopJoins = hop
+		}
 
 		httpServers = append(httpServers, bootstrap.ServeHTTPServer("forward-proxy", fpSrv.Handler(),
 			listeners.take("forward-proxy"), bootstrap.WithConnContext(fpSrv.ConnContext)))
+		// After the forward proxy: the drain shuts servers down in slice order, and a
+		// request still on the forward proxy reaches the gateway, which dials this listener.
+		if egressSrv != nil {
+			httpServers = append(httpServers, egressSrv)
+		}
 
 		// Outbound transparent listener (enforce-redirect mode). It shares the
 		// forward proxy's outbound pipeline via HandleTransparentConn, so explicit
@@ -1191,23 +1268,30 @@ func main() {
 
 	var sessionAPISrv *sessionapi.Server
 	if cfg.Listener.SessionAPIAddr != "" && sessions != nil {
+		// POST /v1/ingest, in praxis mode only: nil options in direct mode.
+		ingestOpts := ingestOptions(cfg, pricingRegistry, gatewayToken, hopJoins)
 		sessionAPISrv = sessionapi.New(
 			cfg.Listener.SessionAPIAddr,
 			sessions,
-			sessionapi.WithPipelines(inboundH, outboundH),
-			sessionapi.WithCatalog(sessionapi.PluginsCatalog),
-			sessionapi.WithUsage(usageAgg),
-			// nil when the ledger is off, which handleUsage reads as "serve the ring's
-			// maximum window and say which window that was".
-			sessionapi.WithCostLedger(costLedger),
-			// nil unless the archive runs; pages and ?archived=true then read history from disk.
-			sessionapi.WithArchive(sessArchive),
-			// DELETE /v1/sessions and DELETE /v1/sessions/{id} only where the API is this
-			// machine's alone: a laptop install binds loopback-only, and its one user owns the
-			// history. See sessionapi.clearRefusal.
-			sessionapi.WithClearAllowed(cfg.Listener.BindLoopbackOnly),
-			// Reads hold raw prompts: the same browser defenses as the erase, on every route.
-			sessionapi.WithLoopbackOnly(cfg.Listener.BindLoopbackOnly),
+			append([]sessionapi.Option{
+				sessionapi.WithPipelines(inboundH, outboundH),
+				sessionapi.WithCatalog(sessionapi.PluginsCatalog),
+				sessionapi.WithUsage(usageAgg),
+				// nil when the ledger is off, which handleUsage reads as "serve the ring's
+				// maximum window and say which window that was".
+				sessionapi.WithCostLedger(costLedger),
+				// nil unless the archive runs; pages and ?archived=true then read history from disk.
+				sessionapi.WithArchive(sessArchive),
+				// DELETE /v1/sessions and DELETE /v1/sessions/{id} only where the API is this
+				// machine's alone: a laptop install binds loopback-only, and its one user owns the
+				// history. See sessionapi.clearRefusal.
+				sessionapi.WithClearAllowed(cfg.Listener.BindLoopbackOnly),
+				// Reads hold raw prompts: the same browser defenses as the erase, on every route.
+				sessionapi.WithLoopbackOnly(cfg.Listener.BindLoopbackOnly),
+				// POST /v1/import, only with the archive on and loopback-only; else no route.
+				sessionapi.WithImport(sessionapi.Import{Rates: pricingRegistry,
+					Sources: []importer.Source{claudeimport.New(""), bobimport.New(""), codeximport.New(""), opencodeimport.New(""), piimport.New("")}}),
+			}, ingestOpts...)...,
 		)
 		sessionLn := listeners.take("session-api")
 		go func() {
@@ -1226,8 +1310,6 @@ func main() {
 		fatalf("%v", err)
 	}
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
 	sig := <-sigCh
 	stopping := time.Now()
 	// A pod drains: endpoint removal propagates after SIGTERM, so callers are still routed
@@ -1285,11 +1367,11 @@ func main() {
 			_ = sessionAPISrv.Server().Close()
 		}
 	}
-	outboundPipeline.Stop(shutdownCtx)
-	inboundPipeline.Stop(shutdownCtx)
+	rld.Close(shutdownCtx)
 
-	// Flushed AFTER both pipelines have stopped and before the store closes, so the
-	// final minute includes every event a draining request still produced. Any earlier
+	// Flushed AFTER rld.Close (every pipeline stopped, or the shutdown budget spent)
+	// and before the store closes, so the final minute includes every event a
+	// draining request still produced. Any earlier
 	// and a request finishing during the pipeline drain would land in a minute already
 	// written; any later and the store is gone.
 	//

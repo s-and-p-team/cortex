@@ -9,7 +9,6 @@ import (
 	"runtime"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/rossoctl/cortex/core/auth"
 	"github.com/rossoctl/cortex/core/config"
@@ -110,36 +109,16 @@ func TestStatsEndpointEmptyStats(t *testing.T) {
 		t.Errorf("Content-Type = %q, want application/json", ct)
 	}
 
+	body, _ := io.ReadAll(resp.Body)
 	var got map[string]map[string]int
-	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
-		t.Fatalf("decode: %v", err)
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("stats endpoint returned invalid JSON: %v: %s", err, body)
 	}
 
 	for _, key := range []string{"inbound_approvals", "inbound_denials", "outbound_approvals", "outbound_denials"} {
 		if _, ok := got[key]; !ok {
 			t.Errorf("missing key %q in stats response", key)
 		}
-	}
-}
-
-func TestStatsEndpointValidJSON(t *testing.T) {
-	stats := auth.NewStats()
-	handler := serveMux(newTestConfig(), stats)
-
-	req := httptest.NewRequest(http.MethodGet, "/stats", nil)
-	w := httptest.NewRecorder()
-	handler.ServeHTTP(w, req)
-
-	body, _ := io.ReadAll(w.Result().Body)
-	if !json.Valid(body) {
-		t.Fatalf("stats endpoint returned invalid JSON: %s", body)
-	}
-}
-
-func TestNewStatServerSetsAddr(t *testing.T) {
-	s := NewStatServer(":9093", func() *config.Config { return newTestConfig() }, func() *auth.Stats { return auth.NewStats() })
-	if s.server.Addr != ":9093" {
-		t.Errorf("server.Addr = %q, want :9093", s.server.Addr)
 	}
 }
 
@@ -250,11 +229,13 @@ func TestStatServerPprofEnablesContentionProfiles(t *testing.T) {
 	handler := serveMuxOpts(newTestConfig(), auth.NewStats(), WithPprof(true))
 
 	// Mutex has a getter; block does not, so block is proven by recording one
-	// event: a channel receive that waits is a block, and at rate 0 it would
-	// never reach the profile.
-	ch := make(chan struct{})
-	go func() { time.Sleep(100 * time.Millisecond); close(ch) }()
+	// event: at an unbuffered rendezvous whichever side arrives first waits, and
+	// at rate 0 that wait would never reach the profile. done orders the
+	// sender's record before the read.
+	ch, done := make(chan struct{}), make(chan struct{})
+	go func() { ch <- struct{}{}; close(done) }()
 	<-ch
+	<-done
 
 	req := httptest.NewRequest(http.MethodGet, "/debug/pprof/block?debug=1", nil)
 	req.Host = "localhost:47802" // a loopback Host, as a local client sends
@@ -263,7 +244,7 @@ func TestStatServerPprofEnablesContentionProfiles(t *testing.T) {
 	// The blocked receive's stack names this test; an empty profile carries only
 	// the header lines.
 	if !strings.Contains(w.Body.String(), "TestStatServerPprofEnablesContentionProfiles") {
-		t.Error("a 100ms blocked receive is absent from /debug/pprof/block: the recorder is off")
+		t.Error("a blocked channel operation is absent from /debug/pprof/block: the recorder is off")
 	}
 	if prev := runtime.SetMutexProfileFraction(1); prev == 0 {
 		t.Error("WithPprof left mutex profiling off: /debug/pprof/mutex would stay empty")

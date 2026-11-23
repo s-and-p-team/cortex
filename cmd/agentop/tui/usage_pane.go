@@ -163,7 +163,7 @@ func (m *model) fetchUsage() tea.Cmd {
 	// THE SCOPE IS CAPTURED HERE, with the rest of the request, rather than read off the model
 	// inside the closure: this runs on another goroutine, and a scope changed while the request
 	// was in flight would narrow the reply to an agent the request was not grouped for.
-	scope := m.agentScope
+	scope, project := m.agentScope, m.projectScope
 	if scope != "" {
 		// The agent axis is not the pane's to choose while a scope is active: /v1/usage takes one
 		// group parameter, and the narrowing below needs the per-agent series. m.usage.group is
@@ -172,12 +172,12 @@ func (m *model) fetchUsage() tea.Cmd {
 		group = usage.GroupAgent
 	}
 	return func() tea.Msg {
-		msg := readUsage(client, window, resolution, session, group, scope)
+		msg := readUsage(client, window, resolution, session, group, scope, project)
 		// READ BOTH AGAIN, ONCE, when the minute turned between them; see graftAgentLatency. Kept
 		// only if the window read succeeds again, since the first one already answered every
 		// metric but latency, and a latency problem must not take those down with it.
 		if errors.Is(msg.latencyErr, errUsageWindowMoved) {
-			if again := readUsage(client, window, resolution, session, group, scope); again.err == nil {
+			if again := readUsage(client, window, resolution, session, group, scope, project); again.err == nil {
 				msg = again
 			}
 		}
@@ -190,11 +190,14 @@ func (m *model) fetchUsage() tea.Cmd {
 // latency read's time.
 const usageReadTimeout = 5 * time.Second
 
-// readUsage is one pass of the pane's reads: the window, narrowed to scope when one is set, and
-// that agent's own latency where the server can supply it.
-func readUsage(client *apiclient.Client, window, resolution time.Duration, session string, group usage.Group, scope string) usageLoadedMsg {
+// readUsage is one pass of the pane's reads: the window, narrowed to scope and project when they
+// are set, and that agent's own latency where the server can supply it.
+func readUsage(client *apiclient.Client, window, resolution time.Duration, session string, group usage.Group, scope, project string) usageLoadedMsg {
 	ctx, cancel := context.WithTimeout(context.Background(), usageReadTimeout)
 	defer cancel()
+	if project != "" {
+		return readProjectUsage(ctx, client, window, resolution, session, scope, project)
+	}
 	snap, err := client.GetUsage(ctx, window, resolution, session, group)
 	if err != nil {
 		return usageLoadedMsg{err: err}
@@ -225,6 +228,29 @@ func readUsage(client *apiclient.Client, window, resolution time.Duration, sessi
 		msg.agentLatency, msg.latencyErr = graftAgentLatency(client, msg.snap, window, resolution, scope)
 	}
 	return msg
+}
+
+// readProjectUsage is readUsage under a project scope. The pane's group is not used: the project
+// takes the wire axis. No latency is grafted, because no server keeps latency per project.
+func readProjectUsage(ctx context.Context, client *apiclient.Client, window, resolution time.Duration, session, scope, project string) usageLoadedMsg {
+	if session != "" {
+		// WITHOUT agent=: the server answers agent= within a session from the agent axis, which has
+		// no project series. A session in the scoped list already belongs to the scoped agent.
+		snap, err := client.GetUsage(ctx, window, resolution, session, usage.GroupProject)
+		if err != nil {
+			return usageLoadedMsg{err: err}
+		}
+		scoped, err := narrowToProject(snap, project)
+		if err != nil {
+			return usageLoadedMsg{err: err}
+		}
+		return usageLoadedMsg{snap: scoped, windowUnits: snap.Currencies}
+	}
+	snap, err := fetchUsageScopedProject(ctx, client, window.String(), resolution, scope, project, usage.GroupNone)
+	if err != nil {
+		return usageLoadedMsg{err: err}
+	}
+	return usageLoadedMsg{snap: snap, windowUnits: snap.Currencies}
 }
 
 // errUsageWindowMoved is graftAgentLatency's report that its read and the window read cover
@@ -285,7 +311,7 @@ func sameBucketTimes(a, b []usage.Bucket) bool {
 
 // usageTick schedules the next poll for the given generation.
 func usageTick(gen uint64) tea.Cmd {
-	return tea.Tick(usagePollInterval, func(time.Time) tea.Msg {
+	return tick(usagePollInterval, func(time.Time) tea.Msg {
 		return usageTickMsg{gen: gen}
 	})
 }
@@ -448,17 +474,17 @@ func (m *model) renderUsage(width, height int) string {
 	// breakdown that does not exist. The selection is kept, not cleared, so it is
 	// still there when the operator cycles back to a count metric.
 	//
-	// Likewise under an agent scope: the scope has taken the wire axis, so there is no
-	// second one to break down by.
+	// Likewise under an agent or a project scope: the scope has taken the wire axis, so there
+	// is no second one to break down by.
 	grouping := "ungrouped"
 	switch {
 	case m.usage.metric.isLatency():
 		grouping = "no breakdown for latency"
-	case m.agentScope == "" && m.usage.group != "" && m.usage.group != usage.GroupNone:
+	case m.agentScope == "" && m.projectScope == "" && m.usage.group != "" && m.usage.group != usage.GroupNone:
 		grouping = "by " + string(m.usage.group)
 	}
-	b.WriteString(fmt.Sprintf("  USAGE — %s — %s @ %s — %s — %s\n\n",
-		scope, window, resolution, m.usage.metric, grouping))
+	b.WriteString(styleUsageHeader(fmt.Sprintf("  USAGE — %s — %s @ %s — %s — %s",
+		scope, window, resolution, m.usage.metric, grouping)) + "\n\n")
 
 	switch {
 	case m.usage.err != nil && errors.Is(m.usage.err, errUsageUnsupported):
@@ -473,7 +499,7 @@ func (m *model) renderUsage(width, height int) string {
 		b.WriteString("  Loading…\n")
 	case m.usage.snap == nil:
 		b.WriteString("  (no data)\n")
-	case m.agentScope != "" && m.usage.metric.isLatency() && !m.usage.agentLatency:
+	case (m.agentScope != "" || m.projectScope != "") && m.usage.metric.isLatency() && !m.usage.agentLatency:
 		// SAID HERE RATHER THAN LEFT TO renderWhiskers, which would answer "no latency samples
 		// in this window" — true of the narrowed snapshot and false about the window, and it
 		// would send the reader looking for traffic that is there. usage.ScopeToAgent zeroes the
@@ -490,6 +516,12 @@ func (m *model) renderUsage(width, height int) string {
 		if m.usage.latencyErr != nil {
 			b.WriteString(fmt.Sprintf("  Error reading this agent's latency: %v\n", m.usage.latencyErr))
 			b.WriteString("  The next poll retries it; the summary below is unaffected.\n")
+		} else if m.projectScope != "" {
+			b.WriteString("  (latency is not available per project)\n")
+			b.WriteString("\n")
+			b.WriteString("  Response times are recorded per agent, not per project.\n")
+			b.WriteString("  To plot latency for every agent instead, clear the scope:\n")
+			b.WriteString("  [A], [enter] on All agents, then [u].\n")
 		} else {
 			b.WriteString("  (latency is not available per agent)\n")
 			b.WriteString("\n")
@@ -528,8 +560,8 @@ func (m *model) renderUsage(width, height int) string {
 		b.WriteString(renderUsageSummary(m.usage.snap))
 		b.WriteString("\n")
 		if !m.usage.lastFetch.IsZero() {
-			b.WriteString(fmt.Sprintf("\n  updated %s ago (every %s)\n",
-				time.Since(m.usage.lastFetch).Truncate(time.Second), usagePollInterval))
+			b.WriteString("\n" + styleDim.Render(fmt.Sprintf("  updated %s ago (every %s)",
+				time.Since(m.usage.lastFetch).Truncate(time.Second), usagePollInterval)) + "\n")
 		}
 	}
 
@@ -538,6 +570,16 @@ func (m *model) renderUsage(width, height int) string {
 	// changed. The pane's keys live in helpView and in paneKeys (the [?]
 	// overlay), which the coverage test holds to the real pane list.
 	return b.String()
+}
+
+// styleUsageHeader colors the "  USAGE — … — …" line without changing its text: USAGE accent
+// bold, each " — " dim, the rest default ink.
+func styleUsageHeader(line string) string {
+	rest, ok := strings.CutPrefix(line, "  USAGE")
+	if !colorOn() || !ok {
+		return line
+	}
+	return "  " + styleAccentBold.Render("USAGE") + strings.ReplaceAll(rest, " — ", styleDim.Render(" — "))
 }
 
 // costUngroupedRow is the pane's form of the disclosure `agentop cost` prints at writeCostSummary:

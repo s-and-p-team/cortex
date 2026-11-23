@@ -3,8 +3,14 @@ package config
 import (
 	"fmt"
 	"log/slog"
+	"maps"
+	"net/netip"
+	"os"
+	"path/filepath"
+	"slices"
 
 	"github.com/rossoctl/cortex/core/cost/pricing"
+	"github.com/rossoctl/cortex/core/pipeline"
 )
 
 // Validate checks the top-level runtime config: mode and listener combo.
@@ -36,6 +42,12 @@ func Validate(cfg *Config) error {
 		return err
 	}
 	if err := validateSessionArchive(cfg); err != nil {
+		return err
+	}
+	if err := validatePraxis(cfg); err != nil {
+		return err
+	}
+	if _, _, err := cfg.Update.Times(); err != nil {
 		return err
 	}
 	return validatePricing(cfg)
@@ -71,6 +83,89 @@ func validateCostLedger(cfg *Config) error {
 		"the ledger records through the session store (it is registered as a Recorder on it), so with the " +
 		"store off nothing can reach it and no cost history would be written — set session.enabled: true, " +
 		"or drop cost_ledger.enabled")
+}
+
+// praxisOffSafe names the outbound plugins whose absence changes no allow or deny
+// decision and no credential. In praxis mode cortex-gateway runs no outbound plugin
+// (#1768), so validatePraxis refuses every other name unless its on_error is off.
+// Add a plugin here when #1714 ports it to the gateway.
+var praxisOffSafe = map[string]bool{
+	"inference-parser":  true,
+	"mcp-parser":        true,
+	"a2a-parser":        true,
+	"tool-prune":        true,
+	"context-guru":      true,
+	"lineage-telemetry": true,
+}
+
+// PraxisOffSafe returns the praxisOffSafe names, sorted.
+func PraxisOffSafe() []string { return slices.Sorted(maps.Keys(praxisOffSafe)) }
+
+// validatePraxis refuses praxis mode outside a loopback-only laptop install,
+// beside mtls, and with an outbound plugin that is not in praxisOffSafe and not
+// off. The ingest endpoint and the hop to cortex-gateway are loopback plaintext.
+func validatePraxis(cfg *Config) error {
+	if !cfg.PraxisEnabled() {
+		return nil
+	}
+	if cfg.MTLS != nil {
+		return fmt.Errorf("praxis.enabled: true cannot be used with mtls: drop the mtls block or praxis.enabled")
+	}
+	if !cfg.Listener.BindLoopbackOnly {
+		return fmt.Errorf("praxis.enabled: true requires listener.bind_loopback_only: true")
+	}
+	// The rows reach Cortex only through POST /v1/ingest, which needs the session store.
+	if !cfg.Session.SessionEnabled() {
+		return fmt.Errorf("praxis.enabled: true cannot be used with session.enabled: false: Cortex ingests the gateway's rows into the session store")
+	}
+	for _, e := range cfg.Pipeline.Outbound.Plugins {
+		// An off entry is never dispatched, so its absence cannot fail open.
+		if !praxisOffSafe[e.Name] && e.OnError.Resolved() != pipeline.ErrorPolicyOff {
+			return fmt.Errorf("praxis.enabled: true cannot be used with outbound plugin %q: cortex-gateway does not run it, so it would fail open; remove the plugin or praxis.enabled", e.Name)
+		}
+	}
+	if err := validatePraxisPolicy(cfg.Praxis.Policy); err != nil {
+		return err
+	}
+	if err := validatePraxisAddr("praxis.listen", cfg.Praxis.Listen); err != nil {
+		return err
+	}
+	return validatePraxisAddr("praxis.egress", cfg.Praxis.Egress)
+}
+
+// validatePraxisPolicy refuses a policy block whose config_path is not an
+// absolute path to an existing file. It does not parse the file: cortex-gateway does.
+func validatePraxisPolicy(p *PraxisPolicyConfig) error {
+	if p == nil {
+		return nil
+	}
+	if p.ConfigPath == "" {
+		return fmt.Errorf("praxis.policy.config_path: must be set when praxis.policy is set")
+	}
+	if !filepath.IsAbs(p.ConfigPath) {
+		return fmt.Errorf("praxis.policy.config_path: %q must be an absolute path", p.ConfigPath)
+	}
+	fi, err := os.Stat(p.ConfigPath)
+	if err != nil {
+		return fmt.Errorf("praxis.policy.config_path: %w", err)
+	}
+	if fi.IsDir() {
+		return fmt.Errorf("praxis.policy.config_path: %q is a directory, not a policy file", p.ConfigPath)
+	}
+	return nil
+}
+
+// validatePraxisAddr accepts an empty addr (the default applies) or a literal
+// loopback host:port with a non-zero port.
+func validatePraxisAddr(field, addr string) error {
+	if addr == "" {
+		return nil
+	}
+	ap, err := netip.ParseAddrPort(addr)
+	if err != nil || !ap.Addr().IsLoopback() || ap.Port() == 0 {
+		return fmt.Errorf("%s: %q must be a loopback IP and a non-zero port, such as %q", field, addr, "127.0.0.1:47605")
+	}
+	return nil
 }
 
 // validatePricing builds the rate table and discards it, so a fault in the

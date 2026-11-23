@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"weak"
 
 	"github.com/rossoctl/cortex/core/pipeline"
 	"github.com/rossoctl/cortex/core/session"
@@ -373,18 +374,16 @@ func TestTimelineHeldHistoryIsBounded(t *testing.T) {
 // A history replaced or dropped from the cache is not kept alive by it.
 func TestTimelineDroppedHistoryIsCollectable(t *testing.T) {
 	var c timelineCache
-	collected := make(chan struct{})
 	p := &timelinePrefix{events: make([]pipeline.SessionEvent, 1), readAt: time.Now()}
-	runtime.AddCleanup(p, func(ch chan struct{}) { close(ch) }, collected)
+	w := weak.Make(p)
 	c.putPrefix("a", 0, p)
 	c.putPrefix("a", 0, &timelinePrefix{events: make([]pipeline.SessionEvent, 1), readAt: time.Now()})
 	p = nil
+	// A collection that finds p unreachable clears w before runtime.GC returns.
 	for range 20 {
 		runtime.GC()
-		select {
-		case <-collected:
+		if w.Value() == nil {
 			return
-		case <-time.After(10 * time.Millisecond):
 		}
 	}
 	t.Error("a replaced history is still reachable")
@@ -392,21 +391,27 @@ func TestTimelineDroppedHistoryIsCollectable(t *testing.T) {
 
 // A held history goes timelinePrefixTTL after it was read, though nothing else is stored.
 func TestTimelineIdleHistoryExpires(t *testing.T) {
-	defer func(d time.Duration) { timelinePrefixTTL = d }(timelinePrefixTTL)
-	timelinePrefixTTL = 10 * time.Millisecond
+	defer func(f func(time.Duration, func()) *time.Timer) { prefixAfterFunc = f }(prefixAfterFunc)
+	var expire func()
+	prefixAfterFunc = func(d time.Duration, f func()) *time.Timer {
+		if d != timelinePrefixTTL {
+			t.Errorf("expiry scheduled after %v, want %v", d, timelinePrefixTTL)
+		}
+		expire = f
+		return nil
+	}
 	var c timelineCache
 	c.putPrefix("a", 0, &timelinePrefix{events: make([]pipeline.SessionEvent, 1), readAt: time.Now()})
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		c.mu.Lock()
-		n := len(c.prefixes)
-		c.mu.Unlock()
-		if n == 0 {
-			return
-		}
-		time.Sleep(5 * time.Millisecond)
+	if expire == nil {
+		t.Fatal("no expiry was scheduled")
 	}
-	t.Error("an idle history was kept past its expiry")
+	expire()
+	c.mu.Lock()
+	n := len(c.prefixes)
+	c.mu.Unlock()
+	if n != 0 {
+		t.Error("an idle history was kept past its expiry")
+	}
 }
 
 // A cached timeline outlives the old one-minute bound while its session records nothing, and an
@@ -435,5 +440,44 @@ func TestTimelineCacheAgesUnansweredRequestsOnAHit(t *testing.T) {
 	}
 	if cached.Hosts[0].Lost {
 		t.Error("aging the served copy reached the cached timeline")
+	}
+}
+
+// Live bytes change with no new event, so the endpoint fills them on the served copy each time
+// and the cached timeline keeps none.
+func TestTimeline_LiveTokensOnOpenTurnNotCached(t *testing.T) {
+	base := time.Date(2026, 10, 26, 12, 0, 0, 0, time.UTC)
+	store := session.New(0, 0, 0)
+	srv := New(":0", store, WithClock(func() time.Time { return base.Add(20 * time.Second) }))
+	ts := httptest.NewServer(srv.server.Handler)
+	t.Cleanup(func() { ts.Close(); store.Close() })
+	main := func(msg string) *pipeline.InferenceExtension {
+		return &pipeline.InferenceExtension{AgentRole: pipeline.AgentRoleMain, Tools: []pipeline.InferenceTool{{Name: "Bash"}},
+			Messages: []pipeline.InferenceMessage{{Role: "user", Content: msg}}}
+	}
+	store.Append("s1", pipeline.SessionEvent{At: base, Direction: pipeline.Outbound, Phase: pipeline.SessionRequest, RequestID: "done", Host: "llm.example", Inference: main("one")})
+	resp := main("one")
+	resp.OutputTokens = 1000
+	resp.StreamedResponse = true
+	store.Append("s1", pipeline.SessionEvent{At: base.Add(8 * time.Second), Direction: pipeline.Outbound, Phase: pipeline.SessionResponse, RequestID: "done", Host: "llm.example",
+		StatusCode: 200, Duration: 8 * time.Second, Ttfb: time.Second, BytesDown: 39000, Inference: resp})
+	store.Append("s1", pipeline.SessionEvent{At: base.Add(10 * time.Second), Direction: pipeline.Outbound, Phase: pipeline.SessionRequest, RequestID: "open", Host: "llm.example", Inference: main("two")})
+	var n int64 = 3900
+	defer store.TrackStream("open", &n)()
+
+	for _, want := range []int{100, 200} {
+		tl, code := getTimeline(t, ts.URL, "s1", "")
+		if code != http.StatusOK || len(tl.Turns) != 2 {
+			t.Fatalf("status = %d, timeline = %+v", code, tl)
+		}
+		if got := tl.Turns[1].LiveTokens; tl.Turns[1].End != nil || got != want {
+			t.Errorf("open turn = %+v, want liveTokens %d", tl.Turns[1], want)
+		}
+		atomic.StoreInt64(&n, 7800)
+	}
+	for i, tu := range srv.timelines.entries["s1"].tl.Turns {
+		if tu.LiveTokens != 0 {
+			t.Errorf("cached turn %d LiveTokens = %d, want 0", i, tu.LiveTokens)
+		}
 	}
 }

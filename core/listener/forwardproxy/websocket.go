@@ -22,6 +22,7 @@ import (
 	"github.com/rossoctl/cortex/core/listener/internal/sessionevent"
 	"github.com/rossoctl/cortex/core/listener/internal/wsframe"
 	"github.com/rossoctl/cortex/core/pipeline"
+	"github.com/rossoctl/cortex/core/redact"
 )
 
 // A Responses API WebSocket, carried and parsed.
@@ -149,7 +150,7 @@ func (s *Server) serveResponsesWebSocket(w http.ResponseWriter, r *http.Request,
 	if err != nil {
 		cancel()
 		status, fail := pipeline.ExchangeFailure(r.Context(), err)
-		slog.Warn("forward-proxy: WebSocket handshake with the origin failed", "host", r.Host, "kind", fail.Kind, "error", fail.Message)
+		slog.Warn("forward-proxy: WebSocket handshake with the origin failed", "host", pipeline.SanitizeLogValue(r.Host), "kind", fail.Kind, "error", fail.Message)
 		http.Error(w, `{"error":"bad gateway"}`, http.StatusBadGateway)
 		s.recordWebSocketRefusal(pctx, tl, sid, chain, status, fail)
 		return
@@ -168,7 +169,7 @@ func (s *Server) serveResponsesWebSocket(w http.ResponseWriter, r *http.Request,
 		}
 		w.WriteHeader(resp.StatusCode)
 		n, _ := io.Copy(w, io.LimitReader(resp.Body, maxBodySize))
-		pctx.ResponseBytes = n
+		atomic.StoreInt64(&pctx.ResponseBytes, n)
 		pctx.StatusCode = resp.StatusCode
 		s.recordWebSocketRefusal(pctx, tl, sid, chain, resp.StatusCode, nil)
 		return
@@ -194,7 +195,7 @@ func (s *Server) serveResponsesWebSocket(w http.ResponseWriter, r *http.Request,
 	clientConn, clientBuf, err := hj.Hijack()
 	if err != nil {
 		_ = upConn.Close()
-		slog.Warn("forward-proxy: could not take over the client connection for a WebSocket", "host", r.Host, "error", err)
+		slog.Warn("forward-proxy: could not take over the client connection for a WebSocket", "host", pipeline.SanitizeLogValue(r.Host), "error", err)
 		return
 	}
 	// The bridge's handshake deadline was cleared before serving; nothing sets one
@@ -254,7 +255,7 @@ func (s *Server) recordWebSocketOpen(ws *wsSocket) {
 		return
 	}
 	ws.hs.OutboundSessionID = ws.sid
-	ev := s.tunnelOpenEvent(ws.hs, pipeline.TunnelWebSocket)
+	ev := sessionevent.TunnelOpen(ws.hs, pipeline.TunnelWebSocket)
 	ev.HTTPMethod, ev.HTTPPath = ws.hs.Method, ws.hs.Path
 	s.appendOutbound(ws.tl, ws.sid, ev)
 }
@@ -329,15 +330,15 @@ func (ws *wsSocket) wsEnd(side string) {
 type wsTurn struct {
 	pctx *pipeline.Context
 	// p is the pipeline the turn began on, and every later step of the turn runs on
-	// it. A hot reload swaps OutboundPipeline for new requests and keeps the old one
-	// running for its drain window so requests already in flight finish where they
-	// started; an HTTPS turn does that by lasting seconds. A socket outlives the
-	// window, so a turn looking the pipeline up again at each step would end on one
-	// whose parser never saw it begin — no tokens, no cost.
+	// it, and the turn holds it until its Finishers run. A hot reload swaps
+	// OutboundPipeline for new requests, so a turn looking the pipeline up again at
+	// each step would end on one whose parser never saw it begin — no tokens, no cost.
 	p *pipeline.Pipeline
 	// prewarm is a generate:false response.create: run through the request phase, not
 	// recorded, and its answer not parsed.
 	prewarm bool
+	// untrack drops the turn's live byte count from the store, once its relay ends.
+	untrack func()
 }
 
 func (ws *wsSocket) run() {
@@ -589,10 +590,10 @@ func (ws *wsSocket) logEnd(side string, err error) {
 		return
 	}
 	if errors.Is(err, wsframe.ErrProtocol) {
-		slog.Warn("forward-proxy: ending a WebSocket on a frame the relay cannot read", "host", ws.r.Host, "side", side, "error", err)
+		slog.Warn("forward-proxy: ending a WebSocket on a frame the relay cannot read", "host", pipeline.SanitizeLogValue(ws.r.Host), "side", side, "error", err)
 		return
 	}
-	slog.Debug("forward-proxy: WebSocket ended", "host", ws.r.Host, "side", side, "error", err)
+	slog.Debug("forward-proxy: WebSocket ended", "host", pipeline.SanitizeLogValue(ws.r.Host), "side", side, "error", err)
 }
 
 // wsEnvelope is the one field every message on the socket carries.
@@ -611,17 +612,18 @@ func (ws *wsSocket) clientMessage(payload []byte) (replace []byte, refuse bool) 
 	}
 	body, generate := responseCreateBody(payload)
 
-	p := ws.s.OutboundPipeline.Load()
+	pctx := ws.newTurnContext(body)
+	p := ws.s.OutboundPipeline.Pin(pctx)
 	if why := pipelineCannotCarry(p); why != "" {
 		// A reload since the handshake made this socket one the proxy would have
 		// declined. End it with "try again later": Codex reconnects, and the new
 		// handshake is answered 426 and falls back to HTTPS, where the plugin applies.
-		slog.Info("forward-proxy: ending a carried WebSocket after a reload", "host", ws.r.Host, "reason", why)
+		slog.Info("forward-proxy: ending a carried WebSocket after a reload", "host", pipeline.SanitizeLogValue(ws.r.Host), "reason", why)
+		p.RunFinish(ws.ctx(), pctx, pipeline.Outcome{})
 		ws.closeBoth(wsframe.CloseTryAgainLater, "the proxy's pipeline changed; reconnect")
 		return nil, true
 	}
 
-	pctx := ws.newTurnContext(body)
 	t := &wsTurn{pctx: pctx, p: p, prewarm: !generate}
 	action := p.Run(ws.ctx(), pctx)
 	if action.Type == pipeline.Reject {
@@ -637,18 +639,44 @@ func (ws *wsSocket) clientMessage(payload []byte) (replace []byte, refuse bool) 
 		// or rewrite it. But it is not inference: no row, and its answer is not a
 		// turn's response.
 		p.RunFinish(ws.ctx(), pctx, pipeline.OutcomeFromContext(pctx))
-	} else if ws.s.Sessions != nil {
+	}
+	if pctx.BodyMutated() {
+		replace = withType(pctx.Body, !generate)
+	}
+	if !t.prewarm && ws.s.Sessions != nil {
 		pctx.OutboundSessionID = ws.sid
-		ws.s.Sessions.Append(ws.sid, ws.turnRequestEvent(pctx))
+		var c *pipeline.RequestCapture
+		if ws.s.Sessions.TakesCaptures() {
+			// The turn as the client sent it and as the origin gets it: the WebSocket messages,
+			// not the request bodies the pipeline was shown.
+			c = &pipeline.RequestCapture{Original: payload, Forwarded: replace, Header: redact.Headers(ws.r.Header), Query: redact.Query(ws.r.URL.RawQuery)}
+			pctx.ResponseCapture = &pipeline.ResponseCapture{Status: http.StatusOK}
+		}
+		ws.s.Sessions.AppendCapture(ws.sid, ws.turnRequestEvent(pctx), c)
+		// The Timeline reads the live count to estimate the tokens of an open turn (#1861).
+		if pctx.Extensions.Inference != nil {
+			t.untrack = ws.s.Sessions.TrackStream(pctx.RequestID(), &pctx.ResponseBytes)
+		}
 	}
 	ws.turnMu.Lock()
 	ws.turns = append(ws.turns, t)
 	ws.turnMu.Unlock()
+	return replace, false
+}
 
-	if pctx.BodyMutated() {
-		return withType(pctx.Body, !generate), false
+// captureMessage adds one of the origin's messages to the turn's response capture, one message
+// per line: a turn's answer is a sequence of messages, not one body. Past the cap the capture
+// is marked truncated and keeps what it has.
+func captureMessage(pctx *pipeline.Context, payload []byte) {
+	rc := pctx.ResponseCapture
+	if rc == nil || rc.Truncated {
+		return
 	}
-	return nil, false
+	if len(rc.Body)+len(payload)+1 > pipeline.MaxResponseCapture {
+		rc.Truncated = true
+		return
+	}
+	rc.Body = append(append(rc.Body, payload...), '\n')
 }
 
 // serverMessage feeds one complete text message from the origin to the open turn, and
@@ -683,6 +711,7 @@ func (ws *wsSocket) serverMessage(payload []byte) {
 		return
 	}
 	if env.Type == "error" {
+		captureMessage(t.pctx, payload)
 		// The origin refused the turn (a usage limit, bad input). See errorEventStatus.
 		status := errorEventStatus(env.Status, env.Error.Code, env.Error.Type)
 		message := "the origin answered the turn with an error event"
@@ -702,7 +731,8 @@ func (ws *wsSocket) serverMessage(payload []byte) {
 	// turning a turn the client received into a denial.
 	t.pctx.MarkResponseDelivered()
 	t.p.RunResponseFrame(ws.ctx(), t.pctx, payload, false)
-	t.pctx.ResponseBytes += int64(len(payload))
+	atomic.AddInt64(&t.pctx.ResponseBytes, int64(len(payload)))
+	captureMessage(t.pctx, payload)
 	// The three events inference-parser reads usage and the finish reason from; each
 	// ends a response, as response.completed ends Codex's own read loop.
 	switch env.Type {
@@ -735,6 +765,9 @@ func (ws *wsSocket) popTurn(t *wsTurn) bool {
 // row, and the Finisher dispatch — the three things handleStreamingResponse's deferred
 // block does at the end of an SSE stream, in the same order.
 func (ws *wsSocket) endTurn(t *wsTurn, status int, fail *pipeline.EventError) {
+	if t.untrack != nil {
+		defer t.untrack()
+	}
 	finalCtx, cancelFinal := httpx.TeardownContext(ws.ctx())
 	defer cancelFinal()
 	t.pctx.MarkResponseDelivered()
@@ -742,6 +775,11 @@ func (ws *wsSocket) endTurn(t *wsTurn, status int, fail *pipeline.EventError) {
 		t.pctx.StatusCode = status
 	}
 	t.p.RunResponseFrame(finalCtx, t.pctx, nil, true)
+	if rc := t.pctx.ResponseCapture; rc != nil {
+		// A turn is whole when the origin ended it, error event included; the row's status
+		// is the capture's.
+		rc.Status, rc.Ended = status, fail == nil || fail.Kind == "backend_error"
+	}
 	ws.s.recordOutboundResponseEvent(t.pctx, status, fail)
 	t.p.RunFinish(finalCtx, t.pctx, pipeline.OutcomeFromContext(t.pctx))
 }
@@ -772,8 +810,11 @@ func (ws *wsSocket) newTurnContext(body []byte) *pipeline.Context {
 	// this one. From the handshake's resolved session, as hydrateSession resolves one for
 	// an HTTPS request, so a turn has no view exactly when that request would have none.
 	var view *pipeline.SessionView
+	var facts pipeline.SessionFacts
+	var sid string
 	if hs.Session != nil {
-		view = ws.s.sessionViewFor(hs.Session.ID)
+		sid = hs.Session.ID
+		view, facts = ws.s.sessionViewFor(sid)
 	}
 	pctx := &pipeline.Context{
 		Direction:     pipeline.Outbound,
@@ -786,15 +827,20 @@ func (ws *wsSocket) newTurnContext(body []byte) *pipeline.Context {
 		Shared:        ws.s.Shared,
 		StartedAt:     time.Now(),
 		Session:       view,
+		SessionID:     sid,
 		SessionSource: hs.SessionSource,
 		SessionHeader: hs.SessionHeader,
 		ChainSession:  hs.ChainSession,
 	}
+	pctx.SetSessionFacts(facts) // with no view, LastIntent and LastInference read FactNoSession
 	pctx.ResolveClient()
 	// The handshake's attribution, which hydrateSession pinned on it: a turn is the same
 	// process on the same session, and without it no turn row names the header that named
 	// the session — the rows #1535's fold counts procs and owner from.
 	pctx.SetAttribution(hs.AttributedProc(), hs.AttributedClientProc(), hs.NamingHeader())
+	pctx.SetNamedSession(hs.NamedSession())
+	pctx.SetProject(hs.Project())
+	pctx.SetParent(hs.ParentSession(), hs.ParentProject())
 	return pctx
 }
 
@@ -832,23 +878,9 @@ func (ws *wsSocket) recordClose() {
 	if ws.s.Sessions == nil {
 		return
 	}
-	ev := pipeline.SessionEvent{
-		At:           time.Now(),
-		Direction:    pipeline.Outbound,
-		Phase:        pipeline.SessionResponse,
-		RequestID:    ws.hs.RequestID(),
-		Identity:     pipeline.SnapshotIdentity(ws.hs),
-		Host:         ws.hs.Host,
-		HTTPMethod:   ws.hs.Method,
-		HTTPPath:     ws.hs.Path,
-		StatusCode:   http.StatusSwitchingProtocols,
-		Duration:     time.Since(ws.start),
-		BytesUp:      ws.bytesUp.Load(),
-		BytesDown:    ws.bytesDown.Load(),
-		Tunnel:       true,
-		TunnelReason: pipeline.TunnelWebSocket,
-		Client:       ws.hs.ClientInfo(),
-	}
+	ev := sessionevent.TunnelClose(ws.hs, pipeline.TunnelWebSocket, http.StatusSwitchingProtocols, nil, ws.bytesUp.Load(), ws.bytesDown.Load())
+	// The socket's duration starts at the 101, not at the handshake request.
+	ev.Duration = time.Since(ws.start)
 	ws.s.Sessions.Append(ws.sid, ev)
 	ws.s.touch(ws.sid, ws.chain)
 }

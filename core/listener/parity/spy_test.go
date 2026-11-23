@@ -28,6 +28,11 @@ type spyConfig struct {
 	EmitOnResponse bool      `json:"emit_on_response"`
 	ResponseEvent  *spyEvent `json:"response_event"`
 
+	// DenyOnResponse rejects at OnResponse with DenyStatus, DenyReason and
+	// DenyDetails, and records the deny first, as DenyOnRequest does. The
+	// response-deny fixtures in divergence_test.go use it.
+	DenyOnResponse bool `json:"deny_on_response"`
+
 	// EmitOnRequest publishes RequestEvent at OnRequest, BEFORE any deny.
 	// Without it a deny fixture's Plugins map is empty on every listener,
 	// so the PluginKeys comparison below comes down to empty-vs-empty and
@@ -117,6 +122,10 @@ type spyConfig struct {
 	// would be just as wrong and just as silent.
 	RecordResponseBodyDigest bool `json:"record_response_body_digest"`
 
+	// ParsedResponsesOnly withholds ReadsResponseBody, so the spy reads only the
+	// responses a listener buffers for its body readers.
+	ParsedResponsesOnly bool `json:"parsed_responses_only"`
+
 	// RequestInvocation is recorded via pctx.Record at OnRequest when
 	// non-nil, which is the only way a spy that does NOT deny appears in
 	// SessionEvent.Invocations at all: the deny branch below used to be
@@ -167,8 +176,10 @@ func (s *spyPlugin) Name() string { return s.name }
 
 func (s *spyPlugin) Capabilities() pipeline.PluginCapabilities {
 	return pipeline.PluginCapabilities{
-		RequiresLater:     s.cfg.RequiresLater,
-		ReadsBody:         s.cfg.ReadsBody,
+		RequiresLater: s.cfg.RequiresLater,
+		ReadsBody:     s.cfg.ReadsBody,
+		// A spy reads the response of a request no parser claims, so it says so.
+		ReadsResponseBody: (s.cfg.RecordResponseFrames || s.cfg.RecordResponseBodyDigest) && !s.cfg.ParsedResponsesOnly,
 		WritesRequestBody: s.cfg.MutateRequestBody != nil,
 	}
 }
@@ -246,7 +257,15 @@ func (s *spyPlugin) OnResponse(_ context.Context, pctx *pipeline.Context) pipeli
 	if s.cfg.EmitOnResponse && s.cfg.ResponseEvent != nil {
 		s.publish(pctx, pipeline.PluginEventSuffix, *s.cfg.ResponseEvent)
 	}
-	return pipeline.Action{Type: pipeline.Continue}
+	if !s.cfg.DenyOnResponse {
+		return pipeline.Action{Type: pipeline.Continue}
+	}
+	pctx.Record(pipeline.Invocation{
+		Action:  pipeline.ActionDeny,
+		Reason:  s.cfg.DenyReason,
+		Details: s.cfg.DenyDetails,
+	})
+	return pipeline.DenyStatus(s.cfg.DenyStatus, s.cfg.DenyReason, s.cfg.DenyReason)
 }
 
 // publish writes to pctx.Extensions.Custom under the spy's name plus the

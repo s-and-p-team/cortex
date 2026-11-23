@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -32,6 +33,13 @@ import (
 // comment so clients can detect a dead connection. Tuneable for tests via
 // WithHeartbeatInterval.
 const defaultHeartbeatInterval = 30 * time.Second
+
+// SchemaVersion is the "schemaVersion" of each JSON response that carries events:
+// GET /v1/sessions/{id} and GET /v1/sessions/{id}/events/{seq}. Increase it when a
+// field of the response or of an event changes its meaning or is removed. Do not
+// increase it when a field is added. The SSE stream has no envelope, so its frames
+// do not carry it.
+const SchemaVersion = 1
 
 // Server wraps an http.Server bound to a session store.
 //
@@ -75,6 +83,13 @@ type Server struct {
 	// "today" is cut at one instant and filled from another — which is why a caller pinning
 	// one of them has to pin all three.
 	now func() time.Time
+	// ingestCfg is WithIngest's; ingest is the endpoint's state, nil unless ingestCfg has a
+	// token. See ingest.go.
+	ingestCfg Ingest
+	ingest    *ingester
+	// importCfg is WithImport's; importMu lets one POST /v1/import run at a time. See import.go.
+	importCfg Import
+	importMu  sync.Mutex
 }
 
 // CatalogEntry is the wire shape for one plugin in /v1/plugins. Mirrors
@@ -215,12 +230,24 @@ func New(addr string, store *session.Store, opts ...Option) *Server {
 	mux.HandleFunc("DELETE /v1/sessions/{id}", s.handleDelete)
 	mux.HandleFunc("GET /v1/sessions/{id}/events/{seq}", s.handleGetEvent)
 	mux.HandleFunc("GET /v1/sessions/{id}/timeline", s.handleTimeline)
+	mux.HandleFunc("GET /v1/sessions/{id}/search", s.handleSearch)
 	mux.HandleFunc("GET /v1/events", s.handleStream)
+	mux.HandleFunc("GET /v1/export", s.handleExport)
 	mux.HandleFunc("GET /v1/pipeline", s.handlePipeline)
 	mux.HandleFunc("GET /v1/plugins", s.handlePluginCatalog)
 	mux.HandleFunc("GET /v1/usage", s.handleUsage)
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /{$}", s.handleIndex)
+	if s.archive != nil && s.loopbackOnly && len(s.importCfg.Sources) > 0 {
+		mux.HandleFunc("POST /v1/import", s.handleImport)
+	}
+	if s.ingestCfg.Token != "" {
+		s.ingest = newIngester(s.ingestCfg)
+		store.AddRecorder(s.ingest.marks)
+		// Loopback-only even when WithLoopbackOnly is off: only the local gateway may write rows.
+		mux.Handle("POST /v1/ingest", httpx.LoopbackOnly(http.HandlerFunc(s.handleIngest)))
+		mux.Handle("GET /v1/ingest/stats", httpx.LoopbackOnly(http.HandlerFunc(s.handleIngestStats)))
+	}
 
 	var handler http.Handler = mux
 	if s.loopbackOnly {
@@ -230,6 +257,9 @@ func New(addr string, store *session.Store, opts ...Option) *Server {
 		Addr:              addr,
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
+	}
+	if s.ingest != nil {
+		s.server.RegisterOnShutdown(s.ingest.endStreams)
 	}
 	return s
 }
@@ -257,19 +287,19 @@ func (s *Server) Shutdown(ctx context.Context) error { return s.server.Shutdown(
 // HTML to be consistent with.
 const indexBody = `Cortex / AuthBridge Session API
 
-  GET /v1/sessions        list active sessions (?archived=true adds the session
-                          archive's sessions no longer in memory)
+  GET /v1/sessions        list sessions (?archived=true adds those only on disk)
   DELETE /v1/sessions     clear every session, memory and disk (laptop only)
-  GET /v1/sessions/{id}   recent events (?limit=N max 2000, ?before=<seq>,
-                          ?view=summary drops message bodies, ~163x smaller)
-  GET /v1/sessions/{id}/events/{seq}  one event in full, payloads included
+  GET /v1/sessions/{id}   recent events (?limit, ?before=<seq>, ?view=summary)
+  GET /v1/sessions/{id}/events/{seq}  one event in full (?raw=1: exact bytes)
   GET /v1/sessions/{id}/timeline      agents, tools and hosts as spans
-  DELETE /v1/sessions/{id}
-                          erase one session, memory and disk (laptop only)
+  GET /v1/sessions/{id}/search?q=     seqs of the events whose bodies hold q
+  DELETE /v1/sessions/{id}            erase one session, memory and disk
   GET /v1/events          SSE stream of new events (?session=<id> to filter)
+  GET /v1/export          archive as content-free NDJSON (?session=, ?since=)
   GET /v1/pipeline        active plugin pipeline
   GET /v1/plugins         catalog of registered plugins
   GET /v1/usage           time-bucketed usage aggregates
+  POST /v1/import         import agent transcripts from disk (laptop only)
   GET /healthz            liveness probe
 
 Unauthenticated: payloads may contain request and response bodies.
@@ -503,6 +533,7 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 		// see SessionView.View. Safe to set: ViewPage returns a freshly built view.
 		view.View = summaryView
 	}
+	view.SchemaVersion = SchemaVersion
 	w.Header().Set("Content-Type", "application/json")
 	// Streamed per event rather than Encoded whole: see writeSessionView for the heap
 	// this one response used to cost.
@@ -566,7 +597,18 @@ func (s *Server) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(event); err != nil {
+	out := eventResponse{SessionEvent: event}
+	if r.URL.Query().Get("raw") == "1" && s.archive != nil {
+		// The exact capture is on disk only: the store never holds raw bodies, so even a resident
+		// event's comes from the archive. An event with none — not captured, written before
+		// capture, or not flushed yet — is served without it.
+		if c, ok, err := s.archive.Capture(id, seq); ok {
+			out.Raw = rawOf(c)
+		} else if err != nil {
+			slog.Debug("sessionapi: archive capture read failed", "error", err, "sessionID", id, "seq", seq)
+		}
+	}
+	if err := json.NewEncoder(w).Encode(out); err != nil {
 		slog.Debug("sessionapi: event encode failed", "error", err, "sessionID", id, "seq", seq)
 	}
 }

@@ -119,7 +119,9 @@ rate. Ten rows exceed it on their list rate (`o1-pro` at $600/Mtok, and the
 above-272k output rate, at $112.50/Mtok (`daybreak-red-latest`, `gpt-5.6-cyber`,
 `gpt-daybreak-red-latest`), and those are dropped whole rather than shipped at a list
 rate that would under-price exactly the long requests the tier exists for. All thirteen
-report as *priceable but unpriced* and take a `pricing:` entry of your own. Nothing about
+report as *priceable but unpriced* and take a `pricing:` entry of your own. The
+downloaded price list applies the same rule, so the download does not price them either,
+and it drops a newer model past the bound the same way. Nothing about
 this is vendor-specific: it is written on the rate, so the first Anthropic model past the
 bound goes the same way.
 
@@ -250,10 +252,15 @@ install) is the aggregate behind `agentop cost`. Query parameters:
 | Parameter | Values | Notes |
 |---|---|---|
 | `window` | `today`, `month`, `7d`, or a duration (`1h`, `6h`) | `today`, `month` and `7d` are served from the durable ledger. A duration is served from the in-memory ring. |
-| `group` | `none`, `model`, `endpoint`, `session`, `agent`, `currency`, `status`, `plugin`, `host` (`method` aliases `model`) | See the caveat below. |
+| `group` | `none`, `model`, `endpoint`, `session`, `agent`, `project`, `currency`, `status`, `plugin`, `host` (`method` aliases `model`) | See the caveat below. |
 | `resolution` | a duration | Bucket size on a ring-served window. A ledger-backed window is answered as one bucket spanning the whole window and does not read this at all; `bucketSeconds` reports the span actually served. |
 | `session` | a session id | Combining it with a symbolic window (`today`, `month`, `7d`) is rejected with 400. |
 | `agent` | an agent label, as `group=agent` reports it (`claude-code`, `unknown`) — versionless; a versioned label such as `claude-code/2.1.284` is read as its agent | Narrows the window to that agent's traffic, every version together. Longer than 96 bytes is rejected with 400. |
+
+`group=project` breaks the window down by the `project` label of each request: the git repo
+root of the agent process's cwd ([session-api.md](session-api.md#event-schema)). A request with
+no project is in the series `unknown`. A label longer than 96 bytes keeps its last 96 bytes,
+in the ring and in the ledger alike: the end of the path names the repo.
 
 Response envelope: `window`, `bucketSeconds`, `group`, `buckets[]`, `totals` and `priced` are
 always present. Every other field is `omitempty` and appears only when it applies, so a clean
@@ -274,10 +281,12 @@ order. `unpricedBy` is keyed by `<endpoint> <model>`.
 
 **The response reports the `group` it SERVED, not the one you asked for — and the
 difference is silent.** On a ledger-backed window (`today`, `month`, `7d`) only
-`endpoint`, `agent`, `model` and `currency` are actually grouped; `host`, `session`, `status`
+`endpoint`, `agent`, `project`, `model` and `currency` are actually grouped; `host`, `session`, `status`
 and `plugin` fall back to `group: "none"` with no error and HTTP 200. With `agent=`, a window
 served from the ring — a duration, or any window without a ledger — falls back to `none` for every
-grouping. Always read the `group` field back:
+grouping, unless the agent is a recognised one and no `session=` is given: then the ring keeps
+the group. So `agent=claude-code&group=project` gives per-project series for that agent only, on
+any window. Always read the `group` field back:
 
 ```sh
 curl -s 'localhost:47601/v1/usage?window=today&group=endpoint' | jq .group
@@ -285,6 +294,9 @@ curl -s 'localhost:47601/v1/usage?window=today&group=endpoint' | jq .group
 
 curl -s 'localhost:47601/v1/usage?window=today&group=host' | jq .group
 # "none"        <- silently degraded
+
+curl -s 'localhost:47601/v1/usage?window=1h&agent=claude-code&group=project' | jq .group
+# "project"     <- honoured: per-project series for claude-code only
 ```
 
 Two aggregates answer the same question and may disagree slightly, which is not a bug
@@ -680,7 +692,7 @@ comes out a release after the rename ships.
 
 | field | meaning |
 |---|---|
-| `cost_usd` | what the whole exchange cost — prompt and completion together, unlike the two halves below. `source` says whether the gateway reported it (`gateway-header`) or it was modelled from token counts (`usage-fallback`); `provenance` says how much to trust the rates behind a modelled figure |
+| `cost_usd` | what the whole exchange cost — prompt and completion together, unlike the two halves below. `source` says whether the gateway reported it (`gateway-header`), it was modelled from token counts (`usage-fallback`), or `agentop import` priced it from a transcript (`transcript`); `provenance` says how much to trust the rates behind a modelled figure |
 | `settled` | a figure exists — **including a deliberate zero**, which is the gateway saying the call was free. Without it, "free" and "nobody priced this" were indistinguishable, and a cache hit got re-priced from the rate table |
 | `prompt_usd` | the modelled cost of the prompt alone, tier-weighted. A breakdown, **not** a component of a sum: it is the table's figure even when `cost_usd` is the gateway's |
 | `output_usd` | the modelled cost of the generated tokens alone, at the output rate, resolved at the **request's** prompt size so a long-context premium reaches the completion too. The other half of the same breakdown, so a per-row UI can show what a response row cost rather than what the exchange cost. Priced from the table, **never** `cost_usd` − `prompt_usd`: that difference mixes a possibly-authoritative total with a modelled half, so it reports a gateway-vs-table delta as the completion's cost and can go negative. (`modelled` − `prompt_usd` would be sound; mixing sources is the problem, not subtraction.) `prompt_usd` + `output_usd` equals the modelled total to the micro |

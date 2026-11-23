@@ -1,7 +1,7 @@
 // Package sessionevent builds the session rows every listener records for a
 // request: Request and Response for one the pipeline let through, Deny and
-// DenyResponse for one it rejected. The tunnel rows stay with the forward
-// proxy, the only listener that has tunnels.
+// DenyResponse for one it rejected. TunnelOpen and TunnelClose build the rows
+// of a tunnel, which only the forward proxy has.
 //
 // It exists because the four recorders that emit a phase:"denied" event — one
 // per direction per listener — grew apart from the same copy-pasted body.
@@ -74,7 +74,12 @@ func Deny(pctx *pipeline.Context, action pipeline.Action, dir pipeline.Direction
 		Client:         pctx.ClientInfo(),
 		Subagent:       pctx.Subagent(),
 		ParentSubagent: pctx.ParentSubagent(),
+		SubagentKind:   pctx.SubagentKind(),
 		Proc:           pctx.AttributedProc(),
+		Project:        pctx.Project(),
+		NoRecord:       pctx.WithholdsSession(),
+		ParentSession:  pctx.ParentSession(),
+		ParentProject:  pctx.ParentProject(),
 		TLS:            TLS(pctx),
 	}
 }
@@ -95,6 +100,13 @@ func Deny(pctx *pipeline.Context, action pipeline.Action, dir pipeline.Direction
 //
 // dir is a parameter for the reason Deny gives. The caller still decides
 // whether to record and in which session bucket.
+//
+// NoRecord (#1923), here and on the Deny and Response rows, needs no check of that bucket
+// against the named session, unlike a tunnel row: WithholdsSession requires a naming header,
+// attribution resolves a request's valid session-id header before anything else
+// (Attributor.resolveLocked), and the bucket a listener files these rows under is that answer
+// (recordingSessionID, attributeForRecording). A trusted session pins attribution empty, so
+// its rows carry no flag.
 func Request(pctx *pipeline.Context, dir pipeline.Direction) pipeline.SessionEvent {
 	return pipeline.SessionEvent{
 		At:              time.Now(),
@@ -116,7 +128,12 @@ func Request(pctx *pipeline.Context, dir pipeline.Direction) pipeline.SessionEve
 		Client:          pctx.ClientInfo(),
 		Subagent:        pctx.Subagent(),
 		ParentSubagent:  pctx.ParentSubagent(),
+		SubagentKind:    pctx.SubagentKind(),
 		Proc:            pctx.AttributedProc(),
+		Project:         pctx.Project(),
+		NoRecord:        pctx.WithholdsSession(),
+		ParentSession:   pctx.ParentSession(),
+		ParentProject:   pctx.ParentProject(),
 		ClientProc:      pctx.AttributedClientProc(),
 		SessionHeader:   pctx.NamingHeader(),
 		TLS:             TLS(pctx),
@@ -155,7 +172,12 @@ func Response(pctx *pipeline.Context, dir pipeline.Direction, status int, fail *
 		Client:         pctx.ClientInfo(),
 		Subagent:       pctx.Subagent(),
 		ParentSubagent: pctx.ParentSubagent(),
+		SubagentKind:   pctx.SubagentKind(),
 		Proc:           pctx.AttributedProc(),
+		Project:        pctx.Project(),
+		NoRecord:       pctx.WithholdsSession(),
+		ParentSession:  pctx.ParentSession(),
+		ParentProject:  pctx.ParentProject(),
 		TLS:            TLS(pctx),
 	}
 }
@@ -166,6 +188,87 @@ func DenyResponse(pctx *pipeline.Context, action pipeline.Action, dir pipeline.D
 	ev := Deny(pctx, action, dir)
 	ev.Invocations = pipeline.SnapshotInvocations(pctx.Extensions.Invocations, pipeline.InvocationPhaseResponse)
 	return ev
+}
+
+// TunnelOpen builds a tunnel's open row. reason says why the bytes stayed
+// opaque. The caller knows it, so it is a parameter and not derived here from
+// the host shape.
+//
+// No NoRecord on either tunnel row (#1923): a bridged tunnel's open row can be
+// filed later under the session its first decrypted request names, which need
+// not be the one the CONNECT named. The rows carry no content, and a withheld
+// session's archive withholds them anyway.
+func TunnelOpen(pctx *pipeline.Context, reason pipeline.TunnelReason) pipeline.SessionEvent {
+	return pipeline.SessionEvent{
+		At:          time.Now(),
+		Direction:   pipeline.Outbound,
+		Phase:       pipeline.SessionRequest,
+		RequestID:   pctx.RequestID(),
+		Invocations: pipeline.SnapshotInvocations(pctx.Extensions.Invocations, pipeline.InvocationPhaseRequest),
+		Plugins:     pipeline.SnapshotPlugins(pctx.Extensions.Custom),
+		Identity:    pipeline.SnapshotIdentity(pctx),
+		Host:        pctx.Host,
+		// Method is CONNECT — real on a proxied CONNECT, synthetic on a
+		// transparently redirected connection — and Path is empty: the bytes
+		// are opaque, so there is no request line to read one from. A blank
+		// path on this row is the accurate answer, not a gap.
+		HTTPMethod: pctx.Method,
+		HTTPPath:   pctx.Path,
+		// Explicit opaque-tunnel marker so agentop can fold this CONNECT into
+		// the decrypted inner request without inferring "tunnel" from shape.
+		Tunnel:       true,
+		TunnelReason: reason,
+		// The address the guard checked and the tunnel dialed — set only when
+		// the egress guard is on, else absent (SessionEvent.DialAddr). On the
+		// open row, which is where a reader pairs it with the Host the client
+		// named. The close row pairs by RequestID and needs no copy.
+		DialAddr:       pctx.DialedAddr,
+		Client:         pctx.ClientInfo(),
+		Subagent:       pctx.Subagent(),
+		ParentSubagent: pctx.ParentSubagent(),
+		SubagentKind:   pctx.SubagentKind(),
+		Proc:           pctx.AttributedProc(),
+		Project:        pctx.Project(),
+		ParentSession:  pctx.ParentSession(),
+		ParentProject:  pctx.ParentProject(),
+	}
+}
+
+// TunnelClose builds the row for a tunnel that ended, or that never opened.
+// It shares the open's RequestID, so agentop pairs the two rows.
+//
+// status is what the proxy answered the tunnel with. fail says why the tunnel
+// failed, nil when it ran until one side closed. up and down are the bytes it
+// carried, zero where nothing was counted.
+//
+// No Invocations and no Plugins: nothing runs on a tunnel's response, so there
+// is nothing to snapshot that the open row does not already carry.
+func TunnelClose(pctx *pipeline.Context, reason pipeline.TunnelReason, status int, fail *pipeline.EventError, up, down int64) pipeline.SessionEvent {
+	return pipeline.SessionEvent{
+		At:             time.Now(),
+		Direction:      pipeline.Outbound,
+		Phase:          pipeline.SessionResponse,
+		RequestID:      pctx.RequestID(),
+		Identity:       pipeline.SnapshotIdentity(pctx),
+		Host:           pctx.Host,
+		HTTPMethod:     pctx.Method,
+		HTTPPath:       pctx.Path,
+		StatusCode:     status,
+		Error:          fail,
+		Duration:       pipeline.DurationSince(pctx.StartedAt),
+		Tunnel:         true,
+		TunnelReason:   reason,
+		BytesUp:        up,
+		BytesDown:      down,
+		Client:         pctx.ClientInfo(),
+		Subagent:       pctx.Subagent(),
+		ParentSubagent: pctx.ParentSubagent(),
+		SubagentKind:   pctx.SubagentKind(),
+		Proc:           pctx.AttributedProc(),
+		Project:        pctx.Project(),
+		ParentSession:  pctx.ParentSession(),
+		ParentProject:  pctx.ParentProject(),
+	}
 }
 
 // TLS summarizes the connection the request arrived on, and is nil whenever

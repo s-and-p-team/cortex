@@ -11,6 +11,7 @@ type detailEventLoadedMsg struct {
 	sessionID string
 	seq       uint64
 	event     *pipeline.SessionEvent
+	raw       *pipeline.RawCapture
 	err       error
 }
 
@@ -26,36 +27,53 @@ type detailEventLoadedMsg struct {
 // THE LAST CONDITION IS TRACKED, NOT INFERRED, and that is not fussiness. The
 // obvious alternative — "does it carry any field the projection drops?" — cannot
 // work for response events. Messages and Tools are populated on the REQUEST
-// extension only (inferenceparser/plugin.go), ToolCalls only when the model called
+// extension only (core/parse/inference), ToolCalls only when the model called
 // a tool, and Completion is KEPT by the projection because the events filter
 // searches it. So a plain text response has none of the dropped fields populated
 // even after a successful fetch, and a presence check would refetch it on every
 // open and permanently tell the operator its bodies had not arrived.
 func (m *model) needsFullEvent(e *pipeline.SessionEvent) bool {
-	if !m.serverProjects || e == nil {
+	if !m.serverProjects || !hasBody(e) {
 		return false
 	}
-	if e.Inference == nil && e.A2A == nil && e.MCP == nil {
-		return false
-	}
-	return !m.fullFetched[eventSession(m.selectedSess, e)][e.Seq]
+	_, done := m.fullFetched[eventSession(m.selectedSess, e)][e.Seq]
+	return !done
 }
 
-// markFullFetched records that this event's bodies have been retrieved.
+// heldRaw is the capture a fetch already brought for e, and whether one was fetched at all.
+func (m *model) heldRaw(e *pipeline.SessionEvent) (*pipeline.RawCapture, bool) {
+	if e == nil {
+		return nil, false
+	}
+	raw, ok := m.fullFetched[eventSession(m.selectedSess, e)][e.Seq]
+	return raw, ok
+}
+
+// hasBody reports that e carried a message body: a protocol extension. A CONNECT tunnel or a
+// bare denial has none, so it has nothing to fetch, projected or exact.
+func hasBody(e *pipeline.SessionEvent) bool {
+	return e != nil && (e.Inference != nil || e.A2A != nil || e.MCP != nil)
+}
+
+// markFullFetched records that this event's bodies have been retrieved, with its capture.
 //
 // Keyed by session and Seq, and reset with m.events, so it cannot outlive the rows
 // it describes.
-func (m *model) markFullFetched(sessionID string, seq uint64) {
+func (m *model) markFullFetched(sessionID string, seq uint64, raw ...*pipeline.RawCapture) {
 	if seq == 0 {
 		return
 	}
 	if m.fullFetched == nil {
-		m.fullFetched = map[string]map[uint64]bool{}
+		m.fullFetched = map[string]map[uint64]*pipeline.RawCapture{}
 	}
 	if m.fullFetched[sessionID] == nil {
-		m.fullFetched[sessionID] = map[uint64]bool{}
+		m.fullFetched[sessionID] = map[uint64]*pipeline.RawCapture{}
 	}
-	m.fullFetched[sessionID][seq] = true
+	var r *pipeline.RawCapture
+	if len(raw) > 0 {
+		r = raw[0]
+	}
+	m.fullFetched[sessionID][seq] = r
 }
 
 // fetchDetailEventCmd fetches one event in full for the detail pane.
@@ -69,12 +87,56 @@ func (m *model) markFullFetched(sessionID string, seq uint64) {
 //
 // Carries the session id and seq so the handler can drop a reply for a row the
 // operator has already navigated away from.
+//
+// It asks for the exact capture too (?raw=1), which only the proxy's archive holds, so it runs
+// once per half, with the capture kept beside the fetched mark. Against a projecting proxy only:
+// one that does not project predates the per-event route, and would answer 404.
 func fetchDetailEventCmd(m *model, sessionID string, seq uint64) tea.Cmd {
 	ctx, client := m.ctx, m.client
 	return func() tea.Msg {
-		ev, err := client.GetEvent(ctx, sessionID, seq)
-		return detailEventLoadedMsg{sessionID: sessionID, seq: seq, event: ev, err: err}
+		ev, raw, err := client.GetEventRaw(ctx, sessionID, seq)
+		return detailEventLoadedMsg{sessionID: sessionID, seq: seq, event: ev, raw: raw, err: err}
 	}
+}
+
+// fetchDetailHalves fetches in full each half of r that the summary left bodies out of
+// (#1681). Nil when there is nothing to fetch.
+func (m *model) fetchDetailHalves(r eventRow) tea.Cmd {
+	if m.client == nil {
+		return nil
+	}
+	var cmds []tea.Cmd
+	for _, e := range []*pipeline.SessionEvent{r.event, r.resp} {
+		if e != nil && m.needsFullEvent(e) {
+			cmds = append(cmds, fetchDetailEventCmd(m, eventSession(m.selectedSess, e), e.Seq))
+		}
+	}
+	return tea.Batch(cmds...)
+}
+
+// fillDetailResponse puts a response that just streamed in into the open detail of the
+// request it answers (#1681), and fetches its bodies. The events table does not rebuild while
+// the detail is open, so without this the page would say "waiting for response…" until the
+// reader left it. showDetail keeps the reader's folds, cursor and scroll. A paused or paged-back
+// stream does not fill it, because handleStreamEvent drops that event from m.events too.
+func (m *model) fillDetailResponse(e *pipeline.SessionEvent) tea.Cmd {
+	r := m.detailRow
+	req, resp, _, _ := detailHalves(r)
+	if m.pane != paneDetail || m.paused || e == nil || req == nil || resp != nil ||
+		m.pagedBack(eventSession(m.selectedSess, req)) ||
+		req.Phase != pipeline.SessionRequest || e.Phase != pipeline.SessionResponse ||
+		e.RequestID == "" || e.RequestID != req.RequestID ||
+		eventSession(m.selectedSess, e) != eventSession(m.selectedSess, req) {
+		return nil
+	}
+	got := *e
+	r.resp = &got
+	r.respRaw, _ = m.heldRaw(r.resp)
+	m.showDetail(r, false)
+	if m.client != nil && m.needsFullEvent(r.resp) {
+		return fetchDetailEventCmd(m, eventSession(m.selectedSess, r.resp), r.resp.Seq)
+	}
+	return nil
 }
 
 // applyDetailEvent installs a fetched full event and re-renders, or reports why it
@@ -87,7 +149,18 @@ func (m *model) applyDetailEvent(msg detailEventLoadedMsg) {
 	if m.pane != paneDetail || m.detailEvent == nil {
 		return
 	}
-	if eventSession(m.selectedSess, m.detailEvent) != msg.sessionID || m.detailEvent.Seq != msg.seq {
+	// The reply is for one half of the exchange on screen, or for a row the reader left.
+	held := func(e *pipeline.SessionEvent) bool {
+		return e != nil && eventSession(m.selectedSess, e) == msg.sessionID && e.Seq == msg.seq
+	}
+	var slot **pipeline.SessionEvent
+	var rawSlot **pipeline.RawCapture
+	switch {
+	case held(m.detailRow.event):
+		slot, rawSlot = &m.detailRow.event, &m.detailRow.raw
+	case held(m.detailRow.resp):
+		slot, rawSlot = &m.detailRow.resp, &m.detailRow.respRaw
+	default:
 		return
 	}
 	if msg.err != nil {
@@ -107,7 +180,7 @@ func (m *model) applyDetailEvent(msg detailEventLoadedMsg) {
 	// snapshots, so an index taken when the fetch was issued may not be the same row
 	// by the time it lands.
 	m.replaceHeldEvent(m.selectedSess, msg.event)
-	m.markFullFetched(msg.sessionID, msg.seq)
+	m.markFullFetched(msg.sessionID, msg.seq, msg.raw)
 
 	// AND THE SESSIONS ROW, because replaceHeldEvent rebased the CTX(1M) gauge and that
 	// table holds BAKED cells — see the snapshot arm in Update for the full reason, and for why
@@ -119,10 +192,12 @@ func (m *model) applyDetailEvent(msg detailEventLoadedMsg) {
 	// spends the round trip on a figure the operator cannot see.
 	m.rebuildSessionsTable()
 
-	// Re-render through showDetail so the tunnel/TLS headers, wrapping and scroll
-	// position are all rebuilt exactly as the first render built them.
-	m.detailRow.event = msg.event
+	// Re-render through showDetail so the headers, wrapping and scroll position are all
+	// rebuilt exactly as the first render built them.
+	*slot, *rawSlot = msg.event, msg.raw
 	m.showDetail(m.detailRow, false)
+	m.openRawMatch()
+	m.revealDetailMatch()
 }
 
 // replaceHeldEvent swaps the stored event with the same Seq for the full one.
@@ -164,7 +239,8 @@ func (m *model) replaceHeldEvent(sessionID string, full *pipeline.SessionEvent) 
 // and `y` told the operator to re-yank an event that was already complete.
 //
 // Used to warn on yank: `y` writes the event's JSON out for debugging, and handing
-// somebody a body-less event that looks complete wastes an afternoon.
+// somebody a body-less event that looks complete wastes an afternoon. It judges the half
+// the cursor is in, because that is the event y writes (#1681).
 func (m *model) detailIsProjected() bool {
-	return m.needsFullEvent(m.detailEvent)
+	return m.needsFullEvent(m.detailHalf())
 }

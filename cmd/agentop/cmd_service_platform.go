@@ -90,8 +90,11 @@ func shQuote(v string) string {
 // KeepAlive stays in the plist for the cases launchd does honour, such as a
 // login-time load; it is no longer what crash recovery depends on.
 //
-// The systemd unit deliberately does NOT use --supervise: Restart=on-failure works
+// In direct mode the systemd unit does NOT use --supervise: Restart=on-failure works
 // there and counts restarts against StartLimit, which a nested supervisor would hide.
+// In praxis mode (praxis.enabled in p.configFile) it uses --supervise, because only
+// the supervisor starts cortex-gateway and writes gateway.token. The unit reads the
+// file itself, so no caller can write a unit that does not agree with it.
 func renderUnitFor(goos string, p servicePaths) string {
 	if goos == "darwin" {
 		// HOME is set explicitly: the config interpolates ${HOME} at load, and an
@@ -148,7 +151,11 @@ func renderUnitFor(goos string, p servicePaths) string {
 	// proxy closes its listeners on SIGTERM rather than draining them (cmd/cortex/main.go)
 	// and is gone in well under a second, so this only ever ends one that hangs — which
 	// systemd's own default would let hold a restart for 90s. There is no supervisor in
-	// between here: KillMode=control-group signals the proxy directly.
+	// between here in direct mode: KillMode=control-group signals the proxy directly.
+	supervise := ""
+	if configPraxisEnabled(p.configFile) {
+		supervise = " --supervise"
+	}
 	return `[Unit]
 Description=Cortex local proxy (cortex)
 Documentation=https://github.com/rossoctl/cortex
@@ -158,7 +165,7 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-ExecStart=` + shQuote(p.binary) + ` --config ` + shQuote(p.configFile) + `
+ExecStart=` + shQuote(p.binary) + supervise + ` --config ` + shQuote(p.configFile) + `
 Restart=on-failure
 RestartSec=10
 TimeoutStopSec=5
@@ -396,6 +403,85 @@ func lingerEnabled(uid string) bool {
 	return !strings.Contains(strings.ToLower(string(out)), "linger=no")
 }
 
+// renderUpdaterUnitFor builds the updater unit for goos. It has no RunAtLoad,
+// KeepAlive, StartInterval, timer or [Install] section: only the proxy starts it,
+// once each update.check_every (cmd/cortex/update_trigger.go).
+func renderUpdaterUnitFor(goos string, p servicePaths) string {
+	agentop := filepath.Join(filepath.Dir(p.binary), "agentop")
+	log := filepath.Join(filepath.Dir(p.logFile), "update.log")
+	if goos == "darwin" {
+		return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>` + updaterLabel + `</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>` + xmlStr(agentop) + `</string>
+    <string>update</string>
+    <string>--yes</string>
+    <string>--auto</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict><key>HOME</key><string>` + xmlStr(p.home) + `</string></dict>
+  <key>AgentopVersion</key><string>` + xmlStr(version) + `</string>
+  <key>StandardOutPath</key><string>` + xmlStr(log) + `</string>
+  <key>StandardErrorPath</key><string>` + xmlStr(log) + `</string>
+</dict>
+</plist>
+`
+	}
+	return `[Unit]
+Description=Cortex updater (agentop update --auto)
+X-AgentopVersion=` + version + `
+
+[Service]
+Type=oneshot
+ExecStart=` + shQuote(agentop) + ` update --yes --auto
+StandardOutput=append:` + log + `
+StandardError=append:` + log + `
+`
+}
+
+// updaterUnitCurrent reports whether the updater file holds what install writes.
+func updaterUnitCurrent(goos string, p servicePaths) bool {
+	b, err := os.ReadFile(p.updaterFile) //nolint:gosec // path we wrote
+	return err == nil && string(b) == renderUpdaterUnitFor(goos, p)
+}
+
+// loadUpdater loads the updater job on darwin when launchd does not have it. On linux
+// loadService's daemon-reload is enough, because the unit is never enabled.
+//
+// It never boots out the updater: the updater job can be the process that runs this
+// install, and a bootout kills it before setup finishes.
+//
+// shortcut: a loaded updater keeps its old definition until uninstall; only AgentopVersion changes between releases, so it runs the same agentop path.
+func loadUpdater(goos string, p servicePaths) error {
+	if goos != "darwin" {
+		return nil
+	}
+	uid := strconv.Itoa(os.Getuid())
+	if exec.Command("launchctl", "print", "gui/"+uid+"/"+updaterLabel).Run() == nil {
+		return nil
+	}
+	if out, err := exec.Command("launchctl", "bootstrap", "gui/"+uid, p.updaterFile).CombinedOutput(); err != nil {
+		return fmt.Errorf("launchctl bootstrap %s: %v: %s", p.updaterFile, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// removeUpdater unloads the updater on darwin and removes its file. An updater that
+// is not loaded or not on disk is not an error.
+func removeUpdater(goos string, p servicePaths) error {
+	if goos == "darwin" {
+		_ = exec.Command("launchctl", "bootout", "gui/"+strconv.Itoa(os.Getuid())+"/"+updaterLabel).Run() //nolint:errcheck
+	}
+	if err := os.Remove(p.updaterFile); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
 func unloadService(goos string, p servicePaths) error {
 	if goos == "darwin" {
 		uid := strconv.Itoa(os.Getuid())
@@ -504,6 +590,10 @@ func stopPID(pid int) error {
 	return fmt.Errorf("still alive after 18s")
 }
 
+// healthPollDivisor divides waitHealthy's poll interval, never its window. It is 1
+// in agentop. Tests set it, so that a stub that answers soon is seen soon.
+var healthPollDivisor time.Duration = 1
+
 func waitHealthy(url string, within time.Duration) bool {
 	c := &http.Client{Timeout: 2 * time.Second}
 	deadline := time.Now().Add(within)
@@ -515,7 +605,7 @@ func waitHealthy(url string, within time.Duration) bool {
 				return true
 			}
 		}
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(500 * time.Millisecond / healthPollDivisor)
 	}
 	return false
 }
@@ -604,6 +694,14 @@ func controlService(goos, action string, p servicePaths, progress io.Writer) err
 	if out, err := exec.Command("systemctl", args...).CombinedOutput(); err != nil {
 		return fmt.Errorf("systemctl %s: %v: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
 	}
+	// A stop of a unit systemd had already given up on is a no-op for systemd, so
+	// the unit stays failed, only now disabled, and status read the deliberate stop
+	// as a crash and advised a restart. Clearing it leaves inactive and disabled,
+	// which status reports as stopped. After the stop, never before: nothing is
+	// left running for the start limit to protect.
+	if action == "stop" {
+		clearStartLimit()
+	}
 	return nil
 }
 
@@ -615,10 +713,11 @@ func controlService(goos, action string, p servicePaths, progress io.Writer) err
 // tells the user to run failed with "start of the service was attempted too often",
 // and so did `service start` and a reinstall.
 //
-// Only before a start someone asked for, never on systemd's own restarts, so the
-// limit still stops a crash loop by itself. reset-failed on a unit that is not
-// failed changes nothing; its error, for a unit systemd has not loaded, is not
-// ours to report.
+// Only around a start or stop someone asked for, never on systemd's own restarts,
+// so the limit still stops a crash loop by itself. controlService also calls it
+// after a stop, for the state that leaves; see there. reset-failed on a unit that
+// is not failed changes nothing; its error, for a unit systemd has not loaded, is
+// not ours to report.
 func clearStartLimit() {
 	_ = exec.Command("systemctl", "--user", "reset-failed", systemdUnit).Run() //nolint:errcheck
 }
@@ -637,8 +736,8 @@ type unitState struct {
 	// activating/auto-restart between a crash and its restart, failed/failed once
 	// the restarts run out.
 	active, sub string
-	// UnitFileState: enabled after `service start`, disabled after `service stop`,
-	// which is what tells our stop from someone else's `systemctl --user stop`.
+	// UnitFileState: enabled after `service start`; disabled after `service stop`,
+	// or for a unit file that was never enabled, which systemd cannot tell apart.
 	enabled string
 	// Result, as systemd words why the unit last stopped: success, exit-code,
 	// signal, start-limit-hit.

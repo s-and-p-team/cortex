@@ -37,6 +37,9 @@ type Client struct {
 	endpoint   string
 	http       *http.Client
 	httpStream *http.Client
+	// reconnectAfter waits out a stream's reconnect backoff. It is time.After, as a field so a
+	// test can reconnect at once.
+	reconnectAfter func(time.Duration) <-chan time.Time
 }
 
 // restDefaultTimeout bounds a REST call whose caller supplied NO deadline, so a dead
@@ -104,6 +107,9 @@ var responseHeaderTimeout = HeaderTimeout
 // A var so a test can shorten it.
 var streamDefaultTimeout = 60 * time.Second
 
+// streamDeadline applies streamDefaultTimeout; tests replace it to end the call at a chosen point.
+var streamDeadline = context.WithTimeout
+
 // New returns a Client pointed at endpoint (e.g. "http://localhost:9094").
 // Trailing slash is tolerated.
 func New(endpoint string) *Client {
@@ -146,6 +152,7 @@ func New(endpoint string) *Client {
 		httpStream: &http.Client{
 			Transport: transport,
 		},
+		reconnectAfter: time.After,
 	}
 }
 
@@ -181,6 +188,44 @@ func (c *Client) ListSessionsArchived(ctx context.Context) (SessionList, error) 
 	return body, nil
 }
 
+// Export streams GET /v1/export: the session archive as content-free records, one NDJSON
+// line per archived event. sessions names the sessions to carry (nil or empty: every one
+// the archive holds); since is the raw query value the server parses ("168h" or "7d") and
+// "" omits the floor.
+//
+// A STREAM, NOT A DOCUMENT: the body is the whole export — a month of traffic, ~12MB — and
+// the caller reads and closes it. getBody's status mapping is the whole error contract
+// here: an unknown session or a malformed since is a 400 the server answers BEFORE its
+// first byte, carrying its own words (the archived session ids, or the accepted since
+// forms). A current proxy renders that refusal under a byte budget sized to fit the 512
+// bytes getBody reads of a 400 body, so the detail survives; an older one caps by id
+// COUNT rather than by bytes, and long ids there can still overrun the read, in which
+// case badRequestDetail finds nothing and the error carries ErrNoDetail beside
+// ErrBadRequest — check that rather than the server's wording to tell "it would not say
+// why" from "it refused something else". A proxy without an archive is a 404.
+//
+// A WALK THAT DIES PAST ITS FIRST RECORD IS AN ERROR ON THE BODY READ, not a short
+// success: the server resets the connection rather than ending the body cleanly, so the
+// caller's read fails instead of returning io.EOF (an older proxy predating that ends
+// the body cleanly, and a truncated export there is indistinguishable from a whole one).
+// Every complete line already read stays valid NDJSON either way.
+func (c *Client) Export(ctx context.Context, sessions []string, since string) (io.ReadCloser, error) {
+	q := url.Values{}
+	for _, id := range sessions {
+		if id != "" {
+			q.Add("session", id)
+		}
+	}
+	if since != "" {
+		q.Set("since", since)
+	}
+	path := "/v1/export"
+	if len(q) > 0 {
+		path += "?" + q.Encode()
+	}
+	return c.getBody(ctx, path)
+}
+
 // SummaryView is the projection every timeline fetch asks for. Must match
 // sessionapi's recognised `view` value.
 const SummaryView = "summary"
@@ -207,7 +252,7 @@ const SummaryView = "summary"
 //
 // A ceiling still exists, and this is it: 2000 is what the server clamps to, so
 // asking for more would be a request the server quietly shrinks. Sessions longer
-// than that still page, which is what [o] and the "N older" footer note are for.
+// than that still page, which is what the ▲ row and the "N older" footer note are for.
 const SnapshotEventLimit = 2000
 
 // GetSession fetches the most recent SnapshotEventLimit events of a session. Returns an
@@ -239,6 +284,30 @@ var ErrNotFound = fmt.Errorf("apiclient: not found")
 // window". The server's own message is carried through — see getBody for why that is
 // safe.
 var ErrBadRequest = fmt.Errorf("apiclient: bad request")
+
+// ErrNoDetail accompanies ErrBadRequest when the server's own words did NOT survive: the
+// 400 body was not the documented shape, or it was longer than the 512 bytes getBody
+// reads and the JSON arrived cut.
+//
+// Wrapped ALONGSIDE ErrBadRequest, never instead of it, so an errors.Is(err,
+// ErrBadRequest) caller is unaffected. It exists because "the refusal explained itself"
+// and "it did not" are different situations for a caller that wants to add a hint: the
+// only other way to tell them apart is to match the formatting getBody itself applies,
+// or to guess from the server's wording — and a message about a different parameter
+// then reads as a missing detail. See cmd_export.go's ErrBadRequest branch.
+var ErrNoDetail = fmt.Errorf("apiclient: no detail")
+
+// noDetail adds ErrNoDetail to an error's chain without adding anything to its text.
+//
+// The wrapped message is what a user sees, and it is already complete ("…: apiclient:
+// bad request"); appending the sentinel's own words would only make it read worse. Is
+// reports both the sentinel and whatever the wrapped error carries, so
+// errors.Is(err, ErrBadRequest) and errors.Is(err, ErrNoDetail) both hold.
+type noDetail struct{ error }
+
+func (n noDetail) Is(target error) bool { return target == ErrNoDetail }
+
+func (n noDetail) Unwrap() error { return n.error }
 
 // PipelineView is the decoded shape of GET /v1/pipeline.
 type PipelineView struct {
@@ -344,7 +413,7 @@ func (c *Client) GetPluginCatalog(ctx context.Context) (*PluginCatalog, error) {
 func (c *Client) getBody(ctx context.Context, path string) (body io.ReadCloser, err error) {
 	cancel := context.CancelFunc(func() {})
 	if _, ok := ctx.Deadline(); !ok {
-		ctx, cancel = context.WithTimeout(ctx, streamDefaultTimeout)
+		ctx, cancel = streamDeadline(ctx, streamDefaultTimeout)
 	}
 	defer func() {
 		if err != nil {
@@ -377,7 +446,11 @@ func (c *Client) getBody(ctx context.Context, path string) (body io.ReadCloser, 
 		if detail := badRequestDetail(msg); detail != "" {
 			return nil, fmt.Errorf("%s: %w: %s", path, ErrBadRequest, detail)
 		}
-		return nil, fmt.Errorf("%s: %w", path, ErrBadRequest)
+		// Both sentinels: the request was refused, AND the refusal did not say why.
+		// noDetail carries the second one WITHOUT adding words, because this message is
+		// printed to a user and "bad request: apiclient: no detail" reads worse than the
+		// bare refusal it replaces.
+		return nil, noDetail{fmt.Errorf("%s: %w", path, ErrBadRequest)}
 	}
 	if resp.StatusCode != http.StatusOK {
 		_ = resp.Body.Close()

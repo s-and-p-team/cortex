@@ -38,7 +38,9 @@ func stageDir(t *testing.T, cortexScript string) string {
 
 // cortexStub is a stand-in cortex for setup's tests: --version, the built-in
 // config writer (with a health_addr the test serves), a long-running
-// --supervise for the unsupervised path, and --fake-start, the line a
+// --supervise for the unsupervised path, the unit-file forms that
+// cmd_service_platform.go writes (launchd: --supervise --config <path>,
+// systemd: --config <path>), and --fake-start, the line a
 // runningCortex load logs. Its config is deliberately unpinned, as
 // an old built-in one would be, so the config step's migrations have work to do.
 func cortexStub(healthAddr string) string {
@@ -62,10 +64,23 @@ EOF
       chmod 600 "$HOME/.cortex/config.yaml"
     fi ;;
   "--local --supervise") exec sleep 300 ;;
+  "--supervise --config "*) exec sleep 300 ;;
+  "--config "*) exec sleep 300 ;;
   --fake-start) echo "cortex stub: listening on 127.0.0.1:47600" ;;
   *) echo "cortex stub: unexpected $*" >&2; exit 2 ;;
 esac
 `
+}
+
+// skipSceneInShort skips a setup, service, doctor or uninstall scene under
+// go test -short. These scenes start many stub processes, and they are most of
+// the suite's time. fakeSupervisor, fakeNoSupervisor and freePorts call it, so
+// every scene built on them skips. CI does not use -short.
+func skipSceneInShort(t *testing.T) {
+	t.Helper()
+	if testing.Short() {
+		t.Skip("scene test: skipped under -short. Run the full suite before you push.")
+	}
 }
 
 // freePorts makes every port read free: these tests run beside a real Cortex.
@@ -73,11 +88,12 @@ esac
 // lsof would name that Cortex. A later installStub of either still wins.
 func freePorts(t *testing.T) {
 	t.Helper()
+	skipSceneInShort(t)
 	saved := portInUse
 	portInUse = func(string) bool { return false }
 	t.Cleanup(func() { portInUse = saved })
-	installStub(t, "lsof", "#!/bin/sh\nexit 1\n")
-	installStub(t, "ss", "#!/bin/sh\nexit 1\n")
+	installFalse(t, "lsof")
+	installFalse(t, "ss")
 }
 
 // serviceEnv is a setupEnv with the stub cortex installed, its config written,

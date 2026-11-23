@@ -77,13 +77,11 @@ __pycache__/
 # can tell "the compiled output" from a source file or a package directory —
 # `cmd/*/*` would ignore the source. One line per binary is the only
 # pattern that is safe, so the list below is exhaustive for `cmd/` and for the
-# two `scripts/` helpers further down. The `demos/*` mains are deliberately not
-# listed. Keep adding to it.
+# two `scripts/` helpers further down. Keep adding to it.
 cmd/agentop/agentop
 cmd/cortex/cortex
 cmd/cortex-envoy/cortex-envoy
 cmd/cortex-cpex/cortex-cpex
-cmd/cortex-praxis/cortex-praxis
 # Built from the repo root rather than from inside the package dir, a binary lands
 # here instead, so ignore those spellings too. Note `go build ./cmd/...` is NOT
 # one of those commands: with more than one main package Go compiles and discards
@@ -102,7 +100,6 @@ cmd/cortex-praxis/cortex-praxis
 /cortex-envoy
 /cortex-cpex
 /authbridge-lite
-/cortex-praxis
 
 # MLflow local tracking store — created by `mlflow` runs in the working tree.
 # Local experiment state, not project source.
@@ -114,8 +111,9 @@ mlruns/
 # private key can never be committed from a demo run inside a checkout.
 cortex-ca/
 
-# Local git worktrees (git worktree add .worktrees/<name>). Committing these
-# gitlinks pins another branch's checkout into this tree, which is never wanted.
+# Local git worktrees: .claude/worktrees/<name>, and the older .worktrees/<name>.
+# Committing these gitlinks pins another branch's checkout into this tree, which is never wanted.
+.claude/worktrees/
 .worktrees/
 
 # `go build ./...` inside either scripts/ helper drops its multi-MB

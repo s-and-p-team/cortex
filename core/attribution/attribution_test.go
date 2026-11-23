@@ -246,6 +246,34 @@ func TestResolve_ChainSessionIsTheTopmostAncestorsClaim(t *testing.T) {
 	}
 }
 
+// ChainProc is the process whose claim gave ChainSession, and "" when there is no
+// ChainSession.
+func TestResolve_ChainProcIsTheProcessThatHoldsTheChainSession(t *testing.T) {
+	a, clk := newTest()
+	a.Resolve(req(claudeUA, "s1"), pchain(100, 50))
+	record(a, clk, "s1")
+	parent := pchain(100)[0].Key()
+	child := pchain(400, 300, 200, 100, 50)
+	got := a.Resolve(req(claudeUA, "c1"), child)
+	record(a, clk, "c1")
+	if got.Session != "c1" || got.ChainSession != "s1" || got.ChainProc != parent {
+		t.Errorf("the child: %+v, want Session c1, ChainSession s1, ChainProc %q", got, parent)
+	}
+	got = a.Resolve(nil, pchain(500, 400, 300, 200, 100, 50))
+	if got.ChainSession != "s1" || got.ChainProc != parent {
+		t.Errorf("a tool under the child: %+v, want ChainSession s1, ChainProc %q", got, parent)
+	}
+	got = a.Resolve(req(claudeUA, "x1"), pchain(700, 70))
+	if got.ChainSession != "" || got.ChainProc != "" {
+		t.Errorf("an agent with no claiming ancestor: %+v, want no ChainSession and no ChainProc", got)
+	}
+	a.Evicted("s1")
+	got = a.Resolve(req(claudeUA, "c1"), child)
+	if got.ChainSession != "" || got.ChainProc != "" {
+		t.Errorf("the child after s1 is evicted: %+v, want no ChainSession and no ChainProc", got)
+	}
+}
+
 // Without a process, client affinity files by User-Agent: the agent's newest session, else
 // its agent-wide pending bucket, and default for an unknown client between two agents.
 func TestResolve_ClientAffinityWithoutAProcess(t *testing.T) {
@@ -412,5 +440,41 @@ func TestRestore_KeepsAClaimAcrossARestart(t *testing.T) {
 	}
 	if !a.IsAgentProcess(plugin[0]) {
 		t.Error("a restored claimer is not an agent process")
+	}
+}
+
+// TestResolve_BobChildrenAndHeaderlessCallFileInTheRoot pins rules 1 and 4 of #1803 on
+// the shape of a Bob IDE run: a root, a subtask, two parallel subagents, and header-less
+// router calls between them. Every child names the root, so client affinity files a
+// header-less call in the root, never in a child.
+func TestResolve_BobChildrenAndHeaderlessCallFileInTheRoot(t *testing.T) {
+	a, clk := newTest()
+	bob := func(task, parent string) http.Header {
+		h := req(bobUA, "")
+		if task != "" {
+			h.Set(session.BobSessionHeader, task)
+		}
+		if parent != "" {
+			h.Set(pipeline.BobParentTaskIDHeader, parent)
+		}
+		return h
+	}
+	steps := []struct {
+		name string
+		h    http.Header
+	}{
+		{"root", bob("r1", "")},
+		{"subtask", bob("c-sub", "r1")},
+		{"subagent A", bob("c-a", "r1")},
+		{"header-less call", bob("", "")},
+		{"subagent B", bob("c-b", "r1")},
+		{"header-less call after B", bob("", "")},
+	}
+	for _, s := range steps {
+		got := a.Resolve(s.h, nil)
+		if got.Session != "r1" {
+			t.Errorf("%s: Session = %q, want r1 (%+v)", s.name, got.Session, got)
+		}
+		record(a, clk, got.RecordID())
 	}
 }

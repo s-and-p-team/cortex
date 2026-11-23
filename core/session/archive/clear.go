@@ -7,6 +7,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 )
@@ -52,16 +53,19 @@ func (a *Archive) Cleared() {
 	a.mu.Lock()
 	p.seqs = maps.Clone(a.lastSeq)
 	a.pending = p
-	a.mu.Unlock()
 	if a.closed.Load() {
+		a.mu.Unlock()
 		p.finish(ClearResult{}, errors.New("the session archive is closed"))
 		return
 	}
 	// Into the reserve, like a rename: Record stops short of it, so only renames and clears can
 	// fill it.
-	select {
-	case a.ops <- op{kind: opClear, clear: p}:
-	default:
+	ok := a.sendLocked(op{kind: opClear, clear: p})
+	if ok {
+		a.marks = a.sent // a clear removes every mark: see optOutLocked
+	}
+	a.mu.Unlock()
+	if !ok {
 		slog.Error("session archive: a clear was lost to a full queue; history on disk is unchanged")
 		p.finish(ClearResult{}, errors.New("the session archive's queue is full; nothing on disk was cleared"))
 	}
@@ -98,6 +102,7 @@ func (a *Archive) clearAll(p *pendingClear) {
 	}
 	a.refreshBytes()
 	res := ClearResult{Sessions: len(a.sessions), Bytes: a.bytes.Load()}
+	a.forget(slices.Collect(maps.Values(a.sessions)))
 
 	// The wall clock, not a.now: this only has to be a name no earlier trash holds.
 	trash := filepath.Join(a.root, fmt.Sprintf("%s%d", trashPrefix, time.Now().UnixNano()))

@@ -360,13 +360,41 @@ func slotChange(e catalog.CatalogEntry, remove bool) edit.ConfigChange {
 	return ch
 }
 
-func slotChanges(e catalog.CatalogEntry) []edit.ConfigChange {
-	out := []edit.ConfigChange{slotChange(e, false)}
+// slotChanges adds e's slot and its settings. A slot that does not rewrite
+// responses goes ahead of the first installed slot that does: the pipeline refuses
+// a response reader after a response writer, and every slot whose scripts have a
+// response hook is one.
+func slotChanges(e catalog.CatalogEntry, cfg *config.Config) []edit.ConfigChange {
+	add := slotChange(e, false)
+	if !e.RewriteResponse {
+		add.Before = firstRewritingSlot(cfg)
+	}
+	out := []edit.ConfigChange{add}
 	if e.Timeout != "" {
 		out = append(out, edit.ConfigChange{Chain: "outbound", Plugin: scriptPlugin, Match: map[string]string{"dir": e.Name},
 			Path: []string{"timeout"}, Value: edit.ScalarValue(e.Timeout)})
 	}
 	return out
+}
+
+// firstRewritingSlot is the Match of the first outbound slot of a catalog entry
+// that rewrites responses, or nil. A slot of the user's own scripts is not judged:
+// agentop cannot know what they declare.
+func firstRewritingSlot(cfg *config.Config) map[string]string {
+	entries, err := catalog.Catalog()
+	if err != nil {
+		return nil
+	}
+	for _, p := range cfg.Pipeline.Outbound.Plugins {
+		if p.Name != scriptPlugin {
+			continue
+		}
+		dir := entryDir(p)
+		if slices.ContainsFunc(entries, func(e catalog.CatalogEntry) bool { return e.Name == dir && e.RewriteResponse }) {
+			return map[string]string{"dir": dir}
+		}
+	}
+	return nil
 }
 
 // priorFiles is what dir held before writeFiles changed it, so a failed update can
@@ -554,10 +582,20 @@ func scriptInstall(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	t, err := loadScriptTarget(cfgPath)
+	if err == nil {
+		err = praxisRefusal(t.cfg, t.path, t.statsURL)
+	}
 	if err != nil {
 		return fail("%v", err)
 	}
 	dir := filepath.Join(t.root, e.Name)
+	hadSlot := hasSlot(t.cfg, e.Name)
+	// Read before the checks below: this GET can take 2s, so keep it out of the
+	// window between the checks and the write. Only the hadSlot poll reads it.
+	var baseline int64
+	if hadSlot {
+		baseline = edit.ReloadBaseline(context.Background(), t.statsURL)
+	}
 	state := stateOf(t, e)
 	switch state {
 	case stateInstalled:
@@ -583,7 +621,6 @@ func scriptInstall(args []string, stdout, stderr io.Writer) int {
 	if extra := unrecorded(dir, old); len(extra) > 0 {
 		return fail("%s holds files install did not write (%s); move them out first", homeTilde(dir), strings.Join(extra, ", "))
 	}
-	hadSlot := hasSlot(t.cfg, e.Name)
 
 	prior := snapshot(dir, old)
 	wrote := time.Now()
@@ -604,7 +641,7 @@ func scriptInstall(args []string, stdout, stderr io.Writer) int {
 
 	addedSlot := false
 	if !hadSlot {
-		res, err := writePluginConfig(context.Background(), edit.ConfigWrite{Path: t.path, StatsURL: t.statsURL, Changes: slotChanges(e)})
+		res, err := writePluginConfig(context.Background(), edit.ConfigWrite{Path: t.path, StatsURL: t.statsURL, Changes: slotChanges(e, t.cfg)})
 		if err != nil {
 			undoFiles()
 			return fail("%v", err)
@@ -628,7 +665,7 @@ func scriptInstall(args []string, stdout, stderr io.Writer) int {
 		// No config write, so nothing has waited for the reload the new files
 		// trigger; until it lands, the counts below are the old build's.
 		pctx, cancel := context.WithTimeout(context.Background(), edit.LocalPollDeadline)
-		res := edit.PollUntilReloaded(pctx, t.statsURL, wrote, "")
+		res := edit.PollUntilReloaded(pctx, t.statsURL, wrote, baseline, "")
 		cancel()
 		if res.Status != edit.PollSuccess {
 			undoFiles()
@@ -689,6 +726,9 @@ func scriptRemove(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	t, err := loadScriptTarget(cfgPath)
+	if err == nil {
+		err = praxisRefusal(t.cfg, t.path, t.statsURL)
+	}
 	if err != nil {
 		return fail("%v", err)
 	}

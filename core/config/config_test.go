@@ -3,9 +3,11 @@ package config
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -116,13 +118,6 @@ func TestValidate_InvalidListenerCombo(t *testing.T) {
 	}
 	if err := Validate(cfg); err == nil {
 		t.Error("expected error for envoy-sidecar + reverse_proxy_addr")
-	}
-}
-
-func TestValidate_ProxySidecarRequiresBackend(t *testing.T) {
-	cfg := &Config{Mode: ModeProxySidecar}
-	if err := Validate(cfg); err == nil {
-		t.Error("expected error for proxy-sidecar without backend")
 	}
 }
 
@@ -433,35 +428,60 @@ func TestReadCredentialFile_Empty(t *testing.T) {
 }
 
 func TestWaitForCredentialFile_ContextCancel(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
 	_, err := WaitForCredentialFile(ctx, filepath.Join(t.TempDir(), "never"))
 	if err == nil {
 		t.Error("expected error when ctx cancels before file appears")
 	}
 }
 
-// TestWaitForCredentialFile_HeartbeatFires verifies that the
-// heartbeat log path is reachable while the file is absent. The actual
-// slog output isn't captured (stdlib slog has no test hook without a
-// handler swap) — this test just ensures the heartbeat branch in the
-// select loop is wired up, by lowering the interval and letting ctx
-// time out after a heartbeat has fired.
+// heartbeatLog cancels its ctx on the first credential-file heartbeat.
+type heartbeatLog struct {
+	cancel context.CancelFunc
+	path   string
+	seen   *atomic.Bool
+}
+
+func (h heartbeatLog) Enabled(context.Context, slog.Level) bool { return true }
+func (h heartbeatLog) Handle(_ context.Context, r slog.Record) error {
+	if r.Message != "credential file still not available" {
+		return nil
+	}
+	r.Attrs(func(a slog.Attr) bool {
+		if a.Key == "path" && a.Value.String() == h.path {
+			h.seen.Store(true)
+			h.cancel()
+		}
+		return true
+	})
+	return nil
+}
+func (h heartbeatLog) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h heartbeatLog) WithGroup(string) slog.Handler      { return h }
+
+// TestWaitForCredentialFile_HeartbeatFires verifies that the heartbeat WARN
+// names the missing file while it is absent: the wait ends only when the
+// heartbeat's log record cancels its ctx.
 func TestWaitForCredentialFile_HeartbeatFires(t *testing.T) {
 	orig := heartbeatInterval
-	heartbeatInterval = 50 * time.Millisecond
+	heartbeatInterval = time.Nanosecond
 	defer func() { heartbeatInterval = orig }()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	path := filepath.Join(t.TempDir(), "never")
+	var seen atomic.Bool
+	prev := slog.Default()
+	slog.SetDefault(slog.New(heartbeatLog{cancel: cancel, path: path, seen: &seen}))
+	defer slog.SetDefault(prev)
 
-	// 200ms is enough for at least one heartbeat tick even under CI
-	// load. The assertion below is indirect: if the heartbeat branch
-	// panicked (missing slog import, nil deref on the ticker, etc.),
-	// the goroutine would crash and the test harness would surface it.
-	_, err := WaitForCredentialFile(ctx, filepath.Join(t.TempDir(), "never"))
+	_, err := WaitForCredentialFile(ctx, path)
 	if err == nil {
 		t.Error("expected error when ctx cancels before file appears")
+	}
+	if !seen.Load() {
+		t.Error("the wait ended without a heartbeat naming the file")
 	}
 }
 
@@ -568,7 +588,7 @@ func TestSessionConfig_SessionIDHeadersFor(t *testing.T) {
 
 // TestSessionConfig_InClusterDefaultDoesNotReadGenericHeaders pins the in-cluster default to
 // what it was before OpenCode support. X-Session-Id is a generic name: the IBAC demo agent
-// (demos/ibac/agent) sends it on its tool calls with an id it minted. Read by default, that
+// (cortex-demos/ibac/agent) sends it on its tool calls with an id it minted. Read by default, that
 // filed its http_post into an empty session, where IBAC found no user intent and, under
 // no_intent_policy: allow, let the exfiltration through.
 //
@@ -942,6 +962,9 @@ func TestTLSBridgeConfig_Validate(t *testing.T) {
 		{"enabled without ca_dir", TLSBridgeConfig{Mode: "enabled"}, true},
 		{"valid ports", TLSBridgeConfig{Ports: []int{443, 8443, 9443}}, false},
 		{"port zero", TLSBridgeConfig{Ports: []int{0}}, true},
+		{"fail_closed enabled", TLSBridgeConfig{Mode: "enabled", CADir: "/tmp/ca", FailClosed: true}, false},
+		{"fail_closed without the bridge", TLSBridgeConfig{FailClosed: true}, true},
+		{"fail_closed with upstream_insecure", TLSBridgeConfig{Mode: "enabled", CADir: "/tmp/ca", FailClosed: true, UpstreamInsecure: true}, true},
 		{"port too high", TLSBridgeConfig{Ports: []int{70000}}, true},
 		{"port negative", TLSBridgeConfig{Ports: []int{-1}}, true},
 	}

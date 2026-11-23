@@ -90,7 +90,7 @@ func newBridgedVMEgressStack(t *testing.T) (*Registry, *captureSink, *session.St
 		TLSBridge:           engine,
 	}
 	sink := &captureSink{}
-	return NewRegistry(fp, sink), sink, store, probe, authority, roots, &originSaw
+	return NewRegistry(fp, sink, Limits{}), sink, store, probe, authority, roots, &originSaw
 }
 
 // bridgedGuestGet opens a CONNECT through a VM socket, completes TLS against
@@ -206,23 +206,10 @@ func TestBridgedRequestKeepsTheVMBinding(t *testing.T) {
 
 	// And the audit line names the VM that owns the socket.
 	//
-	// POLLED, not read once: emit runs in the server's handler goroutine after
+	// Awaited, not read once: emit runs in the server's handler goroutine after
 	// inner.ServeHTTP returns, which is not ordered against the client having
-	// its response — so reading the sink straight after resp.Body.Close() is a
-	// race the client usually wins on a fast machine and loses on a loaded CI
-	// runner (observed as "no audit event for vm-a" in CI while passing 20/20
-	// locally). Same deadline loop as the tunnel-audit test above, for the same
-	// reason (#1569 review).
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if len(sink.forVM("vm-a")) > 0 {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if events := sink.forVM("vm-a"); len(events) == 0 {
-		t.Error("no audit event for vm-a")
-	}
+	// its response.
+	sink.awaitEvent("vm-a", "")
 	for _, e := range sink.forVM("vm-b") {
 		t.Errorf("audit event attributed to vm-b: %+v", e)
 	}

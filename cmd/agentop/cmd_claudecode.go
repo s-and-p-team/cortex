@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 
 	"github.com/rossoctl/cortex/core/clientstate"
@@ -103,6 +105,12 @@ func readState(path string) (*managedState, error) {
 	if st.Prior == nil {
 		return nil, fmt.Errorf("%s has no prior-value record", path)
 	}
+	// One bad entry makes the whole record untrusted, as a bad first entry does.
+	for _, o := range st.OtherFiles {
+		if o.Settings == "" || o.Prior == nil {
+			return nil, fmt.Errorf("%s has an entry with no settings file or prior-value record (%q); fix or delete that entry by hand", path, o.Settings)
+		}
+	}
 	return &st, nil
 }
 
@@ -131,22 +139,217 @@ func writeState(path string, st managedState) error {
 		}
 		st.Prior = existing.Prior
 	}
+	return writeStateFile(path, st)
+}
+
+// writeStateFile writes st as the whole record.
+func writeStateFile(path string, st managedState) error {
 	b, err := json.MarshalIndent(st, "", "  ")
 	if err != nil {
 		return err
 	}
 	// Atomic, never truncate-in-place: this file is the only copy of what the
 	// user had, and a kill mid-write used to leave it torn — after which the
-	// refusal above blocked every later enable while holding the Prior hostage
-	// (#1565).
+	// refusal in writeState blocked every later enable while holding the Prior
+	// hostage (#1565).
 	return writeFileAtomic(path, append(b, '\n'), 0o600)
+}
+
+// recordIndex is where the record keeps settingsPath's entry: 0 for the first
+// file, i+1 for OtherFiles[i], and -1 for none. An entry names settingsPath when
+// its text is the same, or when it is absolute and resolves to the same file.
+func recordIndex(st *managedState, settingsPath string) int {
+	if st == nil {
+		return -1
+	}
+	entries := append([]managedState{*st}, st.OtherFiles...)
+	for _, names := range []func(string) bool{
+		func(recorded string) bool { return recorded == settingsPath },
+		func(recorded string) bool { return filepath.IsAbs(recorded) && samePath(recorded, settingsPath) },
+	} {
+		for i, e := range entries {
+			if names(e.Settings) {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+// adoptRelativeEntry records as abs the entry an older enable recorded as rel,
+// the relative path given again here, and returns a func that puts it back.
+// Cortex's values are the same in every project, so the entry is abs's only when
+// the run succeeds and changes abs; otherwise runClaudeCode puts it back. A file
+// holding no key Cortex manages, or an abs with an entry of its own, leaves the
+// entry as it is.
+func adoptRelativeEntry(statePath, rel, abs string, stdout io.Writer) (func() error, error) {
+	st, err := readState(statePath)
+	if err != nil || recordFor(st, abs) != nil {
+		return nil, nil
+	}
+	e := recordFor(st, rel)
+	if e == nil {
+		return nil, nil
+	}
+	doc, err := readSettings(abs)
+	if err != nil {
+		return nil, nil
+	}
+	if !holdsManagedKey(envStrings(doc)) {
+		fmt.Fprintf(stdout, "The record's entry for %s is from an older agentop and has no directory.\n"+
+			"%s holds no key Cortex manages, so the entry stays;\n"+
+			"if it names this file, delete it from %s.\n\n", rel, abs, statePath)
+		return nil, nil
+	}
+	was := *e
+	e.Settings = abs
+	if err := writeStateFile(statePath, *st); err != nil {
+		return nil, err
+	}
+	fmt.Fprintf(stdout, "The record's entry for %s is from an older agentop and has no directory.\n"+
+		"A run that changes this file records it as %s;\n"+
+		"give --settings as an absolute path to leave it as it is.\n\n", rel, abs)
+	was.Settings, was.OtherFiles = rel, nil
+	// The undo keeps every other entry as the record then holds it. An entry the
+	// run took out comes back while abs still holds a key Cortex manages.
+	return func() error {
+		st, err := readState(statePath)
+		if err != nil {
+			return err
+		}
+		if cur := recordFor(st, abs); cur != nil && cur.Settings == abs {
+			cur.Settings, cur.Written = was.Settings, was.Written
+			return writeStateFile(statePath, *st)
+		}
+		if doc, err := readSettings(abs); err != nil || !holdsManagedKey(envStrings(doc)) {
+			return nil
+		}
+		if st == nil {
+			return writeStateFile(statePath, was)
+		}
+		st.OtherFiles = append(st.OtherFiles, was)
+		return writeStateFile(statePath, *st)
+	}, nil
+}
+
+// holdsManagedKey reports whether env sets a key Cortex manages or once wrote.
+func holdsManagedKey(env map[string]string) bool {
+	for _, k := range managedKeys {
+		if _, set := env[k]; set {
+			return true
+		}
+	}
+	for k := range retiredKeys {
+		if _, set := env[k]; set {
+			return true
+		}
+	}
+	return false
+}
+
+// recordFor is the record's entry for settingsPath, nil when it has none.
+func recordFor(st *managedState, settingsPath string) *managedState {
+	switch i := recordIndex(st, settingsPath); i {
+	case -1:
+		return nil
+	case 0:
+		return st
+	default:
+		return &st.OtherFiles[i-1]
+	}
+}
+
+// writeClaudeCodeState records e as its file's entry, beside every other file's,
+// by writeState's rules. e needs a settings file and a Prior, as readState does.
+func writeClaudeCodeState(path string, e managedState) error {
+	if e.Settings == "" || e.Prior == nil {
+		return fmt.Errorf("refusing to record an entry with no settings file or prior-value record")
+	}
+	existing, err := readState(path)
+	if err != nil {
+		return fmt.Errorf("refusing to overwrite the existing record: %w", err)
+	}
+	cur := recordFor(existing, e.Settings)
+	switch {
+	case existing == nil:
+		existing = &e
+	case cur == nil:
+		existing.OtherFiles = append(existing.OtherFiles, e)
+	case cur.Settings == e.Settings && maps.Equal(cur.Written, e.Written):
+		return nil
+	default:
+		cur.Settings, cur.Written = e.Settings, e.Written
+	}
+	return writeStateFile(path, *existing)
+}
+
+// dropRecord takes settingsPath's entry out of the record, and deletes the record
+// with its last entry. A record that cannot be read is deleted whole, as disable
+// has always done.
+func dropRecord(path, settingsPath string) error {
+	st, err := readState(path)
+	if err != nil {
+		return removeIfExists(path)
+	}
+	switch i := recordIndex(st, settingsPath); {
+	case i == -1:
+		return nil
+	case i == 0 && len(st.OtherFiles) == 0:
+		return removeIfExists(path)
+	case i == 0:
+		next := st.OtherFiles[0]
+		next.OtherFiles = st.OtherFiles[1:]
+		return writeStateFile(path, next)
+	default:
+		st.OtherFiles = slices.Delete(st.OtherFiles, i-1, i)
+		return writeStateFile(path, *st)
+	}
 }
 
 // managedKeys is exactly what enable writes and disable removes. Nothing else in
 // the file is touched — notably not ANTHROPIC_BASE_URL or any auth token, which
 // commonly live in the same env block.
 var managedKeys = []string{
-	envProxy, envCACerts, envSSLCert, envGitCA, envRequestsCA, envCurlCA, envNoTelem,
+	envProxy, envCACerts, envSSLCert, envGitCA, envRequestsCA, envCurlCA,
+}
+
+// retiredKeys are keys an older enable wrote and this one does not. Enable and disable
+// take one out only where the ownership record shows Cortex wrote it and it still holds
+// that value: CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 is byte-identical to a user's
+// own, so without the record the key is left alone.
+//
+// CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC was set because auto-update downloads
+// overran the proxy's body cap (#940). downloads.claude.ai is a passthrough host now,
+// and the variable also stopped auto-updates and feature flags (#1729).
+// Each key maps to the value the older enable wrote.
+var retiredKeys = map[string]string{envNoTelem: "1"}
+
+// ownedRetired is the retired keys in env that the record shows Cortex wrote and nobody
+// changed since, each with its value before enable: nil means it was absent. A key whose
+// value before enable is the one it holds now is left out: putting it back changes
+// nothing, and the record forgets it on the next write of Written.
+//
+// A record from before v0.9.0 has no Written. There the key is Cortex's when Prior holds
+// it and it still has the value the older enable wrote: the rule changedSinceEnable
+// applies to the managed keys. Without it, topUpWritten would write a Written that
+// lacks the key, and no later run could prove the key was Cortex's.
+func ownedRetired(st *managedState, env map[string]string) map[string]*string {
+	out := map[string]*string{}
+	if st == nil {
+		return out
+	}
+	for k, old := range retiredKeys {
+		cur, set := env[k]
+		w, recorded := st.Written[k]
+		if st.Written == nil {
+			_, recorded = st.Prior[k]
+			w = old
+		}
+		if prior := st.Prior[k]; set && recorded && cur == w && (prior == nil || *prior != cur) {
+			out[k] = prior
+		}
+	}
+	return out
 }
 
 // bundleKeys are the managed keys that must point at the CA+roots bundle rather
@@ -168,7 +371,7 @@ var bundleKeys = []string{envSSLCert, envGitCA, envRequestsCA, envCurlCA}
 // Said only when enable is about to change the settings, not on the "Already
 // enabled" re-run that install.sh --claude-code makes on every upgrade: repeated
 // there, a note about a case that needs nothing doing was most of the upgrade's
-// output. Short for the same reason; docs/laptop-service.md ("Go tools on macOS
+// output. Short for the same reason; docs/troubleshooting.md ("Go tools on macOS
 // are passed through unread") carries the why.
 func darwinGoNote(caPath string) string {
 	return "Note: on macOS, Go tools (go, gh, helm) trust only the keychain, so unless\n" +
@@ -187,10 +390,11 @@ Usage:
   agentop configure claude-code disable [--yes] [--settings PATH]
   agentop configure claude-code status  [--settings PATH]
 
-enable writes HTTPS_PROXY, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC and a set of
-CA variables into the "env" block of ~/.claude/settings.json, reading the
-addresses from ~/.cortex/config.yaml so they always match the running proxy.
-Afterwards, plain "claude" goes through Cortex.
+enable writes HTTPS_PROXY and a set of CA variables into the "env" block of
+~/.claude/settings.json, reading the addresses from ~/.cortex/config.yaml so they
+always match the running proxy. Afterwards, plain "claude" goes through Cortex.
+It also removes CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC where an older enable
+set it, because that variable stops Claude Code's auto-updates.
 
 The CA variables cover the tools Claude Code spawns, not just Claude Code
 itself: anything it runs inherits HTTPS_PROXY and so must be able to verify the
@@ -240,15 +444,55 @@ func runClaudeCode(args []string, stdout, stderr io.Writer) int {
 		*cortexCfg = filepath.Join(home, cortexCfgRel)
 	}
 	statePath := filepath.Join(home, stateRel)
+	// Absolute, so the record names the file from any directory. status reads
+	// only the settings file, so it leaves the record as it is. An older entry
+	// that cannot be recorded as abs stops enable, which records there too, and
+	// leaves disable the relative path that finds it.
+	var undo func() error
+	if abs, err := filepath.Abs(*settingsPath); err == nil {
+		if action != "status" && !filepath.IsAbs(*settingsPath) {
+			if undo, err = adoptRelativeEntry(statePath, *settingsPath, abs, stdout); err != nil {
+				if action == "enable" {
+					fmt.Fprintf(stderr, "agentop: could not record the older entry as %s (%v); nothing changed\n", abs, err)
+					return 1
+				}
+				fmt.Fprintf(stderr, "agentop: could not record the older entry as %s (%v); this run uses it as %s\n", abs, err, *settingsPath)
+				abs = *settingsPath
+			}
+		}
+		*settingsPath = abs
+	}
+	var before []byte
+	if undo != nil {
+		before, _ = os.ReadFile(*settingsPath)
+	}
 
 	switch action {
 	case "enable":
-		return claudeCodeEnable2(*settingsPath, *cortexCfg, statePath, yes, stdout, stderr)
+		code = claudeCodeEnable2(*settingsPath, *cortexCfg, statePath, yes, stdout, stderr)
 	case "disable":
-		return claudeCodeDisable2(*settingsPath, statePath, yes, stdout, stderr)
+		code = claudeCodeDisable2(*settingsPath, statePath, yes, stdout, stderr)
 	default:
 		return claudeCodeStatus(*settingsPath, stdout)
 	}
+	if undo != nil {
+		after, _ := os.ReadFile(*settingsPath)
+		if code != 0 || bytes.Equal(before, after) {
+			if err := undo(); err != nil {
+				fmt.Fprintf(stderr, "agentop: could not put back %s (%v)\n", statePath, err)
+				return 1
+			}
+			// After enable the file still routes, so the entry is what lets
+			// uninstall find it.
+			if code == 0 && action == "enable" {
+				fmt.Fprintf(stdout, "The older entry stays. If it names %s,\n"+
+					"run disable and then enable with this --settings to record it there.\n", *settingsPath)
+			} else if code == 0 {
+				fmt.Fprintf(stdout, "The older entry stays. If it names %s, delete it from %s.\n", *settingsPath, statePath)
+			}
+		}
+	}
+	return code
 }
 
 // wanted derives the three values from the Cortex config, so they cannot drift
@@ -332,8 +576,7 @@ func wantedFromLoaded(cfg *config.Config, source string) (map[string]string, err
 	out := map[string]string{
 		// JoinHostPort, not concatenation: an IPv6 literal must keep its brackets
 		// to be a valid URL authority.
-		envProxy:   "http://" + net.JoinHostPort(host, port),
-		envNoTelem: "1",
+		envProxy: "http://" + net.JoinHostPort(host, port),
 	}
 	// Nil-checked: tls_bridge is an omitempty pointer, so a config without the
 	// block at all leaves it nil and dereferencing it segfaulted — `agentop
@@ -366,15 +609,17 @@ func wantedFromLoaded(cfg *config.Config, source string) (map[string]string, err
 // has changed.
 type claudeCodePlan struct {
 	settingsPath string
-	doc          map[string]any    // the settings file as read; apply mutates it
-	env          map[string]string // its env block before the change
-	want         map[string]string // the managed values enable writes
-	changes      []string          // "  KEY=VALUE" per value that differs; none = already enabled
+	doc          map[string]any     // the settings file as read; apply mutates it
+	env          map[string]string  // its env block before the change
+	want         map[string]string  // the managed values enable writes
+	changes      []string           // "  KEY=VALUE" per value that differs, "  -KEY" per retired key; none = already enabled
+	retire       map[string]*string // retired keys apply takes out, each with the value to put back (nil: delete)
 }
 
 // planClaudeCodeEnable runs the checks that can refuse an enable, in the order enable
-// made them. An error is the refusal, worded to follow "agentop: ".
-func planClaudeCodeEnable(settingsPath, cortexCfgPath string) (claudeCodePlan, error) {
+// made them. An error is the refusal, worded to follow "agentop: ". statePath is the
+// ownership record, read only to find retired keys Cortex wrote; "" means none.
+func planClaudeCodeEnable(settingsPath, cortexCfgPath, statePath string) (claudeCodePlan, error) {
 	want, cfg, err := wantedFromConfig(cortexCfgPath)
 	if err != nil {
 		return claudeCodePlan{}, err
@@ -412,6 +657,15 @@ func planClaudeCodeEnable(settingsPath, cortexCfgPath string) (claudeCodePlan, e
 		if env[k] != want[k] {
 			pl.changes = append(pl.changes, fmt.Sprintf("  %s=%s", k, want[k]))
 		}
+	}
+	// An unreadable record is no proof of ownership, so it retires nothing.
+	if st, _ := readState(statePath); statePath != "" {
+		if e := recordFor(st, settingsPath); e != nil {
+			pl.retire = ownedRetired(e, env)
+		}
+	}
+	for _, k := range slices.Sorted(maps.Keys(pl.retire)) {
+		pl.changes = append(pl.changes, "  -"+k)
 	}
 	return pl, nil
 }
@@ -473,21 +727,22 @@ func printTrustFileNotes(want map[string]string, stdout io.Writer) {
 // the right answer; only a record that exists gets its Written filled in. A record
 // that cannot be read is not ours to rewrite either — writeState says why.
 //
-// Writing is left to writeState, which keeps Prior and skips the write entirely when
+// Writing is left to writeClaudeCodeState, which keeps Prior and skips the write entirely when
 // Written already matches, so the usual upgrade re-run still touches no file.
 func topUpWritten(pl claudeCodePlan, statePath string, stderr io.Writer) {
 	if statePath == "" {
 		return
 	}
 	st, err := readState(statePath)
-	if err != nil || st == nil || st.Settings != pl.settingsPath {
+	e := recordFor(st, pl.settingsPath)
+	if err != nil || e == nil {
 		return
 	}
-	st.Written = map[string]string{}
+	written := map[string]string{}
 	for _, k := range managedKeys {
-		st.Written[k] = pl.want[k]
+		written[k] = pl.want[k]
 	}
-	if werr := writeState(statePath, *st); werr != nil {
+	if werr := writeClaudeCodeState(statePath, managedState{Settings: pl.settingsPath, Prior: e.Prior, Written: written}); werr != nil {
 		fmt.Fprintf(stderr, "agentop: could not record the values now set (%v); disable will not be\n"+
 			"  able to tell a later edit of yours from Cortex's own value, and may remove it.\n", werr)
 	}
@@ -497,7 +752,7 @@ func topUpWritten(pl claudeCodePlan, statePath string, stderr io.Writer) {
 // set them to, then writes the plan's values. Failing to record is a warning on
 // stderr, as it always was: the write still happens, and disable then deletes the
 // keys rather than restoring them.
-func applyClaudeCodeEnable(pl claudeCodePlan, statePath string, stderr io.Writer) error {
+func applyClaudeCodeEnable(pl claudeCodePlan, statePath string, stderr io.Writer) (err error) {
 	// Record what was there before, so disable restores rather than deletes, and
 	// what we set, so disable can tell our own value from one changed since.
 	if statePath != "" {
@@ -515,21 +770,41 @@ func applyClaudeCodeEnable(pl claudeCodePlan, statePath string, stderr io.Writer
 			}
 			st.Written[k] = pl.want[k]
 		}
-		if werr := writeState(statePath, st); werr != nil {
+		// The record is the only proof a retired key is Cortex's: keep it until the
+		// settings write below has taken the key out.
+		for k := range pl.retire {
+			st.Written[k] = pl.env[k]
+		}
+		if werr := writeClaudeCodeState(statePath, st); werr != nil {
 			fmt.Fprintf(stderr, "agentop: could not record prior settings (%v); disable will delete\n"+
 				"  these keys rather than restore any you had set yourself\n", werr)
 		}
+		defer func() {
+			if err == nil && len(pl.retire) > 0 {
+				for k := range pl.retire {
+					delete(st.Written, k)
+				}
+				_ = writeClaudeCodeState(statePath, st)
+			}
+		}()
 	}
 
 	raw := envRaw(pl.doc)
 	for _, k := range managedKeys {
 		raw[k] = pl.want[k]
 	}
+	for k, prior := range pl.retire {
+		if prior == nil {
+			delete(raw, k)
+		} else {
+			raw[k] = *prior
+		}
+	}
 	return writeSettings(pl.settingsPath, pl.doc)
 }
 
 func claudeCodeEnable2(settingsPath, cortexCfgPath, statePath string, yes bool, stdout, stderr io.Writer) int {
-	pl, err := planClaudeCodeEnable(settingsPath, cortexCfgPath)
+	pl, err := planClaudeCodeEnable(settingsPath, cortexCfgPath, statePath)
 	if err != nil {
 		fmt.Fprintf(stderr, "agentop: %v\n", err)
 		return 1
@@ -551,8 +826,21 @@ func claudeCodeEnable2(settingsPath, cortexCfgPath, statePath string, yes bool, 
 	// needs to say what changes and that the file is backed up; the rest (how to undo
 	// it, that `claude` needs no env vars afterwards) belongs in the closing summary,
 	// where it was also being printed.
-	fmt.Fprintf(stdout, "Adds to the \"env\" block of %s:\n%s\n",
-		settingsPath, strings.Join(pl.changes, "\n"))
+	var adds, removes []string
+	for _, c := range pl.changes {
+		if k, ok := strings.CutPrefix(c, "  -"); ok {
+			removes = append(removes, k)
+		} else {
+			adds = append(adds, c)
+		}
+	}
+	if len(adds) > 0 {
+		fmt.Fprintf(stdout, "Adds to the \"env\" block of %s:\n%s\n", settingsPath, strings.Join(adds, "\n"))
+	}
+	if len(removes) > 0 {
+		fmt.Fprintf(stdout, "Removes from the \"env\" block of %s, as Cortex no longer sets it:\n  %s\n",
+			settingsPath, strings.Join(removes, "\n  "))
+	}
 	fmt.Fprintf(stdout, "Nothing else in the file changes; a copy is kept as %s.bak\n\n", settingsPath)
 	if !yes && !claudeCodeConfirm(stdout) {
 		fmt.Fprintln(stdout, "Not changed.")
@@ -579,7 +867,7 @@ type claudeCodeDisablePlan struct {
 	settingsPath string
 	doc          map[string]any
 	env          map[string]string // the env block as read, so output can name a left key's value
-	st           *managedState     // the ownership record, nil when none names this settings file
+	st           *managedState     // this settings file's entry in the ownership record, nil when it has none
 	stErr        error             // the record was there and could not be read
 	present      []string          // managed keys disable will change, in managedKeys order
 	left         []string          // managed keys disable will not touch: changed since enable
@@ -598,12 +886,9 @@ func planClaudeCodeDisable(settingsPath, statePath string) (claudeCodeDisablePla
 	if statePath != "" {
 		st, sterr := readState(statePath)
 		pl.stErr = sterr
-		// A record naming a different settings file is another enable's, so it says
-		// nothing about this one — the rule the restore below has always applied,
-		// hoisted here so the ownership check uses it too.
-		if st != nil && st.Settings == settingsPath {
-			pl.st = st
-		}
+		// Another settings file's entry is that file's enable, so it says nothing
+		// about this one — the rule both the restore and the ownership check use.
+		pl.st = recordFor(st, settingsPath)
 	}
 	for _, k := range managedKeys {
 		cur, ok := env[k]
@@ -616,6 +901,8 @@ func planClaudeCodeDisable(settingsPath, statePath string) (claudeCodeDisablePla
 		}
 		pl.present = append(pl.present, k)
 	}
+	// A retired key is ours only by the record, never by the remove-outright fallback.
+	pl.present = append(pl.present, slices.Sorted(maps.Keys(ownedRetired(pl.st, env)))...)
 	return pl, nil
 }
 
@@ -663,9 +950,7 @@ func changedSinceEnable(st *managedState, key, cur string) bool {
 // the edit itself, and the value survives — see claudeCodeNeedsCortexDir for what
 // that then means for --purge.
 //
-// Only a record naming THIS settings file is ours to delete, which planClaudeCodeDisable
-// has already decided: pl.st is nil unless the record names this file, and a disable
-// here must not take another enable's record away. removeDisabledRecord says the rest.
+// Only this settings file's entry is deleted; removeDisabledRecord says why.
 func applyClaudeCodeDisable(pl claudeCodeDisablePlan, statePath string, stderr io.Writer) ([]string, error) {
 	if len(pl.present) == 0 {
 		return nil, nil
@@ -706,15 +991,17 @@ func applyClaudeCodeDisable(pl claudeCodeDisablePlan, statePath string, stderr i
 	if err := writeSettings(pl.settingsPath, pl.doc); err != nil {
 		return nil, err
 	}
-	// A nil st with no read error means the record is some other settings file's (or
-	// there is none), and deleting it would strand that file's Written — the next
+	// A nil st with no read error means the record has no entry for this file (or
+	// there is none), and deleting it would strand another file's Written — the next
 	// disable there would have no ownership to check an edit against, which is the
 	// bug this change fixes, reached by way of a disable on an unrelated file. stErr
 	// keeps today's behaviour for a record that is there and unreadable: left in
 	// place it would outlive every disable, and doctor would report Claude Code as
 	// routed for good.
 	if statePath != "" && (pl.st != nil || pl.stErr != nil) {
-		_ = os.Remove(statePath)
+		if err := dropRecord(statePath, pl.settingsPath); err != nil {
+			warnEntryKept(stderr, statePath, pl.settingsPath, err)
+		}
 	}
 	return restored, nil
 }
@@ -741,26 +1028,32 @@ func printClaudeCodeLeft(pl claudeCodeDisablePlan, stdout io.Writer) {
 		pl.settingsPath)
 }
 
-// removeDisabledRecord deletes the ownership record on the disable paths that
-// never reach applyClaudeCodeDisable, because the file holds none of Cortex's own
-// values: all of its managed keys were changed after enable, or it has none at all.
-// Cortex does not route it either way, and the record is what says it does —
-// claudeCodeRouted answers from the record's existence alone, so leaving it makes
-// `agentop doctor` report a routing that is gone and offer a fix that restores it.
+// removeDisabledRecord deletes this file's entry in the ownership record on the
+// disable paths that never reach applyClaudeCodeDisable, because the file holds
+// none of Cortex's own values: all of its managed keys were changed after enable,
+// or it has none at all. Cortex does not route it either way, and the record is
+// what says it does — claudeCodeRouted answers from the record's existence alone,
+// so leaving it makes `agentop doctor` report a routing that is gone and offer a
+// fix that restores it.
 //
-// Only a record naming THIS settings file is ours to delete: one naming another is
-// a different enable's, and `disable --settings` on a project file must not take it
-// away. planClaudeCodeDisable has already applied that rule — pl.st is nil unless
-// the record names this file — so a nil st means there is nothing here to remove.
-// A record that could not be read is left too, for the reason writeState gives.
+// Only this settings file's entry is deleted: another file's is another enable's,
+// and pl.st is nil unless the record has an entry for this file. A record that
+// could not be read is left too, for the reason writeState gives.
 func removeDisabledRecord(pl claudeCodeDisablePlan, statePath string, stderr io.Writer) {
 	if statePath == "" || pl.st == nil {
 		return
 	}
-	if err := os.Remove(statePath); err != nil && !os.IsNotExist(err) {
-		fmt.Fprintf(stderr, "agentop: could not remove %s (%v); `agentop doctor` will go on\n"+
-			"  reporting Claude Code as routed through Cortex. Delete it by hand.\n", statePath, err)
+	if err := dropRecord(statePath, pl.settingsPath); err != nil {
+		warnEntryKept(stderr, statePath, pl.settingsPath, err)
 	}
+}
+
+// warnEntryKept says a disable restored settingsPath but kept its entry in the
+// record. A disable run again takes the entry out, and keeps every other file's.
+func warnEntryKept(stderr io.Writer, statePath, settingsPath string, err error) {
+	fmt.Fprintf(stderr, "agentop: could not take %s out of %s (%v);\n"+
+		"  `agentop doctor` will go on reporting it as routed through Cortex. Run disable\n"+
+		"  again to retry.\n", settingsPath, statePath, err)
 }
 
 func claudeCodeDisable2(settingsPath, statePath string, yes bool, stdout, stderr io.Writer) int {
@@ -813,13 +1106,13 @@ func claudeCodeDisable2(settingsPath, statePath string, yes bool, stdout, stderr
 	return 0
 }
 
-// claudeCodeStatus prints the seven keys and the verdict, and changes nothing.
+// claudeCodeStatus prints the six keys and the verdict, and changes nothing.
 //
 // The verdict comes from claudeCodeState (configure_status.go), which is the same
 // value `agentop configure status` renders as one table row — so the paragraph here
 // and the row there cannot disagree about whether Claude Code is routed. The per-key
 // lines stay local to this function: they are what makes this command worth running
-// over the table, and the table has no room for seven of them.
+// over the table, and the table has no room for six of them.
 func claudeCodeStatus(settingsPath string, stdout io.Writer) int {
 	doc, err := readSettings(settingsPath)
 	st := claudeCodeStateFrom(settingsPath, doc, err)
@@ -853,8 +1146,6 @@ func claudeCodeStatus(settingsPath string, stdout io.Writer) int {
 // overwrite guard.
 func isCortexValue(key, val string) bool {
 	switch key {
-	case envNoTelem:
-		return val == "1"
 	case envCACerts, envSSLCert, envGitCA, envRequestsCA, envCurlCA:
 		return strings.Contains(val, ".cortex"+string(os.PathSeparator)) || strings.Contains(val, "cortex-ca")
 	case envProxy:

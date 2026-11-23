@@ -1,0 +1,25 @@
+[package]
+name = "cortex-praxis-filters"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+# float_roundtrip: a number parses to the nearest float64, as in Go (gojson::any).
+serde_json = { version = "1", features = ["raw_value", "float_roundtrip"] }
+http = "1"
+flate2 = "1"
+zstd = "0.14"
+praxis-proxy-filter = { version = "=0.8.0", default-features = false }
+# The sink traits; praxis-proxy-filter does not re-export them.
+praxis-policy = { version = "=0.6.0" }
+async-trait = "0.1"
+bytes = "1"
+tokio = { version = "1", features = ["rt", "net", "sync", "time", "io-util", "macros"] }
+base64 = "0.23"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+metrics = "0.24"
+serde_yaml = { package = "yaml_serde", version = "0.10.7" }

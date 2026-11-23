@@ -7,15 +7,13 @@ package session
 
 import (
 	"log/slog"
-	"maps"
+	"slices"
 	"sort"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/rossoctl/cortex/core/cost/event"
-	"github.com/rossoctl/cortex/core/cost/pricing"
-	"github.com/rossoctl/cortex/core/pipeline"
+	"github.com/rossoctl/cortex/core/model"
 )
 
 // DefaultSessionID is used when no explicit A2A SessionID is present and no
@@ -27,7 +25,7 @@ const DefaultSessionID = "default"
 // entry holds the events for one conversation.
 type entry struct {
 	ID        string
-	Events    []pipeline.SessionEvent
+	Events    []model.SessionEvent
 	CreatedAt time.Time
 	UpdatedAt time.Time
 
@@ -50,7 +48,7 @@ type entry struct {
 	// Nothing here can detect that, and nothing here needs to: the store cannot tell a
 	// re-created session from a trimmed one. A paging client compares wall-clock time
 	// rather than Seq for exactly this reason — see agentop's applyOlderPage. See also
-	// pipeline.SessionEvent.Seq.
+	// model.SessionEvent.Seq.
 	nextSeq uint64
 	// after is the seq this entry numbers its events after: the highest a SeqSeeder held for the id
 	// when the entry was created, 0 when none held any. Unlike nextSeq it never moves. Above 0 the
@@ -86,6 +84,11 @@ type entry struct {
 	// Maintained with cost, on append and on trim, and read by SessionSummary.Currencies — a
 	// count rather than a set because a trim has to know when the LAST event in a unit leaves.
 	units map[string]int
+
+	// noRecord is true once an event of this entry asked not to be recorded
+	// (SessionEvent.NoRecord, #1923). Sticky, and read by ListSessions as
+	// SessionSummary.NoRecord. The archive keeps its own sticky mark, which survives a restart.
+	noRecord bool
 
 	// money is each event's decoded contribution, PARALLEL TO Events: same length, same
 	// order, same trim.
@@ -141,10 +144,15 @@ type entry struct {
 	// SessionSummary.Agent and sessionAgent. First-wins and not shed on trim, like Title.
 	agents []sessionAgent
 
+	// projects is SessionSummary.Projects (applyProject). Not shed on trim, like agents.
+	projects []string
+	// parentSession is SessionSummary.ParentSession (applyParent). Not shed on trim, like projects.
+	parentSession string
+
 	// context is the CONTEXT gauge's answer for this session: the main-agent turn that RANKS
 	// HIGHEST under the rule's total order, in prompt tokens — the LATEST such turn where the
 	// client states its role, the one with the MOST MESSAGES where it does not. Maintained by
-	// Append and read by ListSessions; see pipeline.PromptContextFold for the order itself.
+	// Append and read by ListSessions; see model.PromptContextFold for the order itself.
 	//
 	// NOT A MAXIMUM OVER TOKENS, so this can DECREASE: the stated arm leads with the timestamp,
 	// which is the point of the column. A compaction is the ordinary case — 830,000 before it and
@@ -159,12 +167,16 @@ type entry struct {
 	//
 	// So this needs none of the machinery cost needs: no subtraction on trim, and no parallel
 	// per-event slice to make that subtraction decode-free. Fixed size per SESSION.
-	context pipeline.PromptContextFold
+	context model.PromptContextFold
 
 	// inferenceHost is SessionSummary.InferenceHost, folded by Append and read by ListSessions.
 	// A LATEST VALUE, NOT A SUM, so in context's class above: a trim has nothing to subtract, and
 	// the request that set it is the newest of its kind, which is the last a trim would take.
 	inferenceHost string
+	// inferenceServer is SessionSummary.InferenceServer. Append sets it with inferenceHost.
+	inferenceServer string
+	// inferenceKeyOf is SessionSummary.InferenceKeyOf. Append sets it with inferenceHost.
+	inferenceKeyOf string
 
 	// procs is each process that NAMED this session through its own header, with when it first
 	// and last did (applyProcs); owner is the agent whose header named it first (applyOwner).
@@ -172,6 +184,17 @@ type entry struct {
 	procs         map[string]ProcSpan
 	owner         string
 	lastRequestAt time.Time
+
+	// lastIntent and lastInference are the Seq of the newest event that model.IsIntent and
+	// model.IsInferenceRequest accept, 0 for none. ViewFacts reads them. LATEST VALUES, in
+	// inferenceHost's class: a trim does not change them, and ViewFacts gives FactNone when the
+	// event left.
+	lastIntent, lastInference uint64
+
+	// hosts is the InferenceHosts table over this entry's events (applyHost). A LATEST-VALUE
+	// FOLD, in inferenceHost's class: a trim sheds nothing from it. ViewFacts adds the history's
+	// table from the HostsKeeper.
+	hosts model.InferenceHosts
 }
 
 // MaxSessionIDLen is the longest session ID the store keeps intact; longer ids
@@ -188,7 +211,7 @@ const MaxSessionIDLen = 256
 // Implementations are called while the store holds its write lock, so they must
 // not block or call back into the store.
 type Recorder interface {
-	Record(sessionID string, e *pipeline.SessionEvent)
+	Record(sessionID string, e *model.SessionEvent)
 }
 
 // Store is an in-memory, per-pod session store. It is safe for concurrent use.
@@ -212,71 +235,12 @@ type Store struct {
 	// recorders are notified of every appended event. Registered at setup via
 	// AddRecorder, before the store serves traffic.
 	recorders []Recorder
-}
 
-// subscriberChanBuf caps each subscriber's channel depth. 64 absorbs short
-// bursts without unbounded memory; slow consumers drop rather than blocking
-// Append.
-const subscriberChanBuf = 64
-
-// subscriber wires one live consumer of session events. Writes on ch are
-// non-blocking — a full channel increments drops and discards the event.
-type subscriber struct {
-	ch        chan pipeline.SessionEvent
-	drops     uint64 // atomic; reads via LoadDrops
-	closeOnce sync.Once
-}
-
-// closeCh closes ch at most once. Called by the cancel func returned from
-// Subscribe and by Store.Close during shutdown; whichever runs first wins.
-func (s *subscriber) closeCh() {
-	s.closeOnce.Do(func() { close(s.ch) })
-}
-
-// LoadDrops returns the total events dropped for this subscriber since Subscribe.
-func (s *subscriber) LoadDrops() uint64 {
-	return atomic.LoadUint64(&s.drops)
-}
-
-// Subscribe registers a listener for session events written after the call.
-// The returned channel is buffered (64). Events are sent non-blockingly; if
-// the consumer falls behind, events are dropped — the caller can observe the
-// drop count via the returned Subscription's Drops method. Always call the
-// cancel func to remove the subscriber and close the channel.
-func (s *Store) Subscribe() (*Subscription, func()) {
-	sub := &subscriber{ch: make(chan pipeline.SessionEvent, subscriberChanBuf)}
-
-	s.mu.Lock()
-	s.subscribers = append(s.subscribers, sub)
-	s.mu.Unlock()
-
-	cancel := func() {
-		s.mu.Lock()
-		for i, existing := range s.subscribers {
-			if existing == sub {
-				s.subscribers = append(s.subscribers[:i], s.subscribers[i+1:]...)
-				break
-			}
-		}
-		s.mu.Unlock()
-		sub.closeCh()
-	}
-	return &Subscription{sub: sub}, cancel
-}
-
-// Subscription is the consumer-facing handle returned by Store.Subscribe.
-type Subscription struct {
-	sub *subscriber
-}
-
-// Events returns the receive-only channel of session events.
-func (s *Subscription) Events() <-chan pipeline.SessionEvent {
-	return s.sub.ch
-}
-
-// Drops returns the cumulative event drops due to a full channel.
-func (s *Subscription) Drops() uint64 {
-	return s.sub.LoadDrops()
+	// streams holds the live byte counter of each open inference response, by
+	// request ID (see TrackStream). It has its own lock so that the hot path
+	// does not take mu.
+	streamMu sync.Mutex
+	streams  map[string]*int64
 }
 
 // New creates a Store with the given TTL, per-session event limit, and max
@@ -356,11 +320,73 @@ func (s *Store) backgroundCleanup() {
 	}
 }
 
+// MarkNoRecord withholds sessionID from the archive from now on (#1923), for a request whose rows
+// the listener does not build itself: in praxis mode the gateway records a hopped request, and
+// its rows come back through /v1/ingest without the flag, the header having been stripped before
+// the hop. It tells every Withholder (the archive), whose mark is the opt-out's only state, and
+// marks the live entry's summary when there is one. Call it before the request is hopped: the
+// archive's op then precedes every row that comes back.
+//
+// The caller must have checked pipeline.Context.WithholdsSession: the request named sessionID
+// with its own session-id header. Never for a fallback bucket.
+func (s *Store) MarkNoRecord(sessionID string) {
+	if !IsConversation(sessionID) { // see appendLocked
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if sess := s.sessions[sessionID]; sess != nil {
+		sess.noRecord = true
+	}
+	for _, r := range s.recorders {
+		if w, ok := r.(Withholder); ok {
+			w.Withhold(sessionID)
+		}
+	}
+}
+
+// Withholder is optionally implemented by a Recorder that keeps a session's events (the
+// session archive): Withhold tells it, from now on, to keep none of sessionID's (#1923). Called
+// under the store's write lock. It may wait for its own writer, never for the store.
+type Withholder interface {
+	Withhold(sessionID string)
+}
+
 // Append adds an event to the named session. Creates the session if it
 // doesn't exist. Updates activeID to this session. Evicts the oldest event if the
 // session exceeds maxEvents — which by default it cannot, maxEvents being unset.
-func (s *Store) Append(sessionID string, event pipeline.SessionEvent) {
-	s.append(sessionID, nil, event)
+func (s *Store) Append(sessionID string, event model.SessionEvent) {
+	s.append(sessionID, nil, event, nil)
+}
+
+// CaptureRecorder is optionally implemented by a Recorder that takes the request captures
+// AppendCapture hands over (#1494). RecordCapture is called in place of Record, under the
+// store's write lock, with c nil for an event that has none. The store never keeps c: raw
+// bodies are megabytes, and the store keeps every event in memory.
+type CaptureRecorder interface {
+	RecordCapture(sessionID string, e *model.SessionEvent, c *model.RequestCapture)
+}
+
+// TakesCaptures reports whether some recorder is a CaptureRecorder, so a listener can skip copying
+// bodies nobody keeps. False on a nil store.
+func (s *Store) TakesCaptures() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, r := range s.recorders {
+		if _, ok := r.(CaptureRecorder); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// AppendCapture is Append for a request event with its capture c, which only a
+// CaptureRecorder receives.
+func (s *Store) AppendCapture(sessionID string, event model.SessionEvent, c *model.RequestCapture) {
+	s.append(sessionID, nil, event, c)
 }
 
 // Bucket is the session an event was appended to. It follows that session through a
@@ -369,8 +395,8 @@ func (s *Store) Append(sessionID string, event pipeline.SessionEvent) {
 type Bucket struct{ e *entry }
 
 // AppendBucket is Append, returning the bucket the event went into.
-func (s *Store) AppendBucket(sessionID string, event pipeline.SessionEvent) *Bucket {
-	return &Bucket{e: s.append(sessionID, nil, event)}
+func (s *Store) AppendBucket(sessionID string, event model.SessionEvent) *Bucket {
+	return &Bucket{e: s.append(sessionID, nil, event, nil)}
 }
 
 // AppendTrailing appends an event that ends something b's session started earlier — a
@@ -378,11 +404,11 @@ func (s *Store) AppendBucket(sessionID string, event pipeline.SessionEvent) *Buc
 // it neither makes the session active nor refreshes its UpdatedAt. It reports false, and
 // records nothing, when b's session has been evicted or has expired: the event would pair
 // with nothing, and re-creating the session to hold it could evict another.
-func (s *Store) AppendTrailing(b *Bucket, event pipeline.SessionEvent) bool {
+func (s *Store) AppendTrailing(b *Bucket, event model.SessionEvent) bool {
 	if b == nil {
 		return false
 	}
-	return s.append("", b, event) != nil
+	return s.append("", b, event, nil) != nil
 }
 
 // AppendPair appends first and then second to the named session under one lock
@@ -390,8 +416,14 @@ func (s *Store) AppendTrailing(b *Bucket, event pipeline.SessionEvent) bool {
 // both went into. agentop folds a bridged tunnel's open row into the event directly
 // after it in the session, and two separate appends could be split by any traffic in
 // between.
-func (s *Store) AppendPair(sessionID string, first, second pipeline.SessionEvent) *Bucket {
+func (s *Store) AppendPair(sessionID string, first, second model.SessionEvent) *Bucket {
+	return s.AppendPairCapture(sessionID, first, second, nil)
+}
+
+// AppendPairCapture is AppendPair with second's capture c; see AppendCapture.
+func (s *Store) AppendPairCapture(sessionID string, first, second model.SessionEvent, c *model.RequestCapture) *Bucket {
 	p1, p2 := prepareAppend(&first), prepareAppend(&second)
+	p2.capture = c
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	e := s.appendLocked(sessionID, nil, first, p1)
@@ -408,12 +440,17 @@ type appendPrep struct {
 	titleRank int
 	titleText string
 	agentName string
+	// host is the event's evidence for the session's InferenceHosts table; see hostEvidenceOf.
+	host hostEvidence
+	// capture is the event's request capture, for CaptureRecorders only; see AppendCapture.
+	capture *model.RequestCapture
 }
 
 // append is Append when b is nil, and AppendTrailing when it is not. It returns the
 // session the event went into, nil when AppendTrailing refused it.
-func (s *Store) append(sessionID string, b *Bucket, event pipeline.SessionEvent) *entry {
+func (s *Store) append(sessionID string, b *Bucket, event model.SessionEvent, c *model.RequestCapture) *entry {
 	prep := prepareAppend(&event)
+	prep.capture = c
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.appendLocked(sessionID, b, event, prep)
@@ -421,7 +458,7 @@ func (s *Store) append(sessionID string, b *Bucket, event pipeline.SessionEvent)
 
 // prepareAppend computes everything an append needs from the event alone. It runs
 // before the store's lock is taken.
-func prepareAppend(event *pipeline.SessionEvent) appendPrep {
+func prepareAppend(event *model.SessionEvent) appendPrep {
 	// BEFORE THE LOCK. This is a json.Unmarshal of the event's plugin map, the most
 	// expensive thing on this path, and it touches no store state — so it has no business
 	// inside a critical section that blocks every reader and every other appender. Doing it
@@ -453,12 +490,13 @@ func prepareAppend(event *pipeline.SessionEvent) appendPrep {
 	// Only the candidate's EXTRACTION is hoisted, which is the expensive half; the rank comparison
 	// and sanitizeTitle both stay under the lock, for the reason given at the fold site below.
 	titleRank, titleText := titleCandidate(event)
-	return appendPrep{money: money, titleRank: titleRank, titleText: titleText, agentName: event.Client.AffinityName()}
+	return appendPrep{money: money, titleRank: titleRank, titleText: titleText, agentName: event.Client.AffinityName(),
+		host: hostEvidenceOf(event)}
 }
 
 // appendLocked is append's critical section. s.mu must be held; prep is what
 // prepareAppend computed from event before the lock was taken.
-func (s *Store) appendLocked(sessionID string, b *Bucket, event pipeline.SessionEvent, prep appendPrep) *entry {
+func (s *Store) appendLocked(sessionID string, b *Bucket, event model.SessionEvent, prep appendPrep) *entry {
 	if len(sessionID) > MaxSessionIDLen {
 		sessionID = sessionID[:MaxSessionIDLen]
 	}
@@ -496,6 +534,16 @@ func (s *Store) appendLocked(sessionID string, b *Bucket, event pipeline.Session
 	// without needing to know which session it was appended to — critical for
 	// outbound events that have no protocol-native session field.
 	event.SessionID = sessionID
+	// Only one conversation's own session can opt out (#1923). The default bucket and a pending
+	// bucket hold many clients' calls, and a header can name them ("default" passes the
+	// session-id rules): a flag there would withhold everyone filed to it, and a pending mark
+	// would follow an Adopt onto a session that never asked. Such an event records as usual.
+	if event.NoRecord && !IsConversation(sessionID) {
+		event.NoRecord = false
+	}
+	if event.NoRecord {
+		sess.noRecord = true
+	}
 
 	// Stamp the cursor before publishLocked below, so a subscriber streaming events
 	// live sees the same Seq a paging client would get for that event. If this were
@@ -544,7 +592,7 @@ func (s *Store) appendLocked(sessionID string, b *Bucket, event pipeline.Session
 	// NOT HOISTED ABOVE THE LOCK like moneyOf, and that is not an oversight. moneyOf is a
 	// json.Unmarshal and was hoisted because of a measured regression; this is a phase check, a
 	// nil check, len(Tools), two AgentRole comparisons, a messageCount read, TWO int adds and
-	// one comparison (pipeline.PromptTokensOf sums three fields), a Round(0) that clears a
+	// one comparison (model.PromptTokensOf sums three fields), a Round(0) that clears a
 	// monotonic reading, and — once the fold already holds a figure — better()'s time.Time
 	// Equal/After chain: tens of nanoseconds, no allocation, NO DECODE. Splitting it to hoist the
 	// extraction would add an exported type for plumbing alone and save nothing measurable.
@@ -560,14 +608,27 @@ func (s *Store) appendLocked(sessionID string, b *Bucket, event pipeline.Session
 	// shared with SummaryFold so an archived session is titled exactly as a resident one.
 	sess.titleRank, sess.Title = applyTitle(sess.titleRank, sess.Title, titleRank, titleText)
 	sess.agents = applyAgent(sess.agents, sessionID, agentName, event.Client)
+	sess.projects = applyProject(sess.projects, sessionID, event.RollupProject())
+	sess.parentSession = applyParent(sess.parentSession, sessionID, event.ParentSession)
 	// A field compare and a string header copy, so under the lock like context.Add. From &event,
 	// the local parameter, for the reason given there.
 	if h := inferenceHostOf(&event); h != "" {
-		sess.inferenceHost = h
+		sess.inferenceHost, sess.inferenceServer = h, model.RoutedServer(event.Invocations)
+		sess.inferenceKeyOf = model.RoutedKeyOf(event.Invocations)
 	}
+	// An event of neither kind must not change the facts.
+	if model.IsIntent(&event) {
+		sess.lastIntent = event.Seq
+	}
+	if model.IsInferenceRequest(&event) {
+		sess.lastInference = event.Seq
+	}
+	// A loop over the session's 1 to 3 (agent, host) pairs. The message scan was done above the
+	// lock, in prepareAppend.
+	sess.hosts = applyHost(sess.hosts, prep.host, event.Host, event.Seq)
 	sess.procs = applyProcs(sess.procs, sessionID, &event)
 	sess.owner = applyOwner(sess.owner, sessionID, agentName, &event)
-	if event.Phase == pipeline.SessionRequest && event.At.After(sess.lastRequestAt) {
+	if event.Phase == model.SessionRequest && event.At.After(sess.lastRequestAt) {
 		sess.lastRequestAt = event.At
 	}
 	if b == nil {
@@ -583,7 +644,11 @@ func (s *Store) appendLocked(sessionID string, b *Bucket, event pipeline.Session
 	// subscribers this cannot drop: a dropped event silently skews a cumulative
 	// counter, where a dropped stream frame only costs one client one row.
 	for _, r := range s.recorders {
-		r.Record(sessionID, &event)
+		if cr, ok := r.(CaptureRecorder); ok {
+			cr.RecordCapture(sessionID, &event, prep.capture)
+		} else {
+			r.Record(sessionID, &event)
+		}
 	}
 
 	if p, ok := planTrim(sess.Events, s.maxEvents); ok {
@@ -620,12 +685,10 @@ func (s *Store) appendLocked(sessionID string, b *Bucket, event pipeline.Session
 // isIntentEvent matches the SessionView.LastIntent predicate: an
 // inbound A2A request event. IBAC and any future intent-aware
 // guardrail call LastIntent and need the most recent such event to
-// survive FIFO eviction. Defined here so the eviction policy and
-// the consumer view can never drift apart.
-func isIntentEvent(e pipeline.SessionEvent) bool {
-	return e.Direction == pipeline.Inbound &&
-		e.Phase == pipeline.SessionRequest &&
-		e.A2A != nil
+// survive FIFO eviction. It calls model.IsIntent, so the eviction
+// pin and the LastIntent fact of ViewFacts use one rule.
+func isIntentEvent(e model.SessionEvent) bool {
+	return model.IsIntent(&e)
 }
 
 // trimEventsPinIntent reduces events to len <= maxEvents while
@@ -660,7 +723,7 @@ func isIntentEvent(e pipeline.SessionEvent) bool {
 // second implementation of the pin rule below, and the two would drift the day either changed.
 //
 // ok is false when nothing needs trimming, so a caller can skip the work entirely.
-func planTrim(events []pipeline.SessionEvent, maxEvents int) (trimPlan, bool) {
+func planTrim(events []model.SessionEvent, maxEvents int) (trimPlan, bool) {
 	if maxEvents <= 0 || len(events) <= maxEvents {
 		return trimPlan{}, false
 	}
@@ -729,21 +792,82 @@ func (s *Store) AddRecorder(r Recorder) {
 
 // View returns a read-only snapshot of the session's events.
 // Returns nil if the session doesn't exist or is expired.
-func (s *Store) View(sessionID string) *pipeline.SessionView {
+func (s *Store) View(sessionID string) *model.SessionView {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	v, _ := s.viewLocked(sessionID)
+	return v
+}
+
+// viewLocked is View's body, and the entry it copied. Both are nil for no entry or an expired
+// one. The caller holds s.mu.
+func (s *Store) viewLocked(sessionID string) (*model.SessionView, *entry) {
+	sess, ok := s.sessions[sessionID]
+	if !ok {
+		return nil, nil
+	}
+	if s.isExpired(sess, s.clock()) {
+		return nil, nil
+	}
+
+	events := make([]model.SessionEvent, len(sess.Events))
+	copy(events, sess.Events)
+	return &model.SessionView{ID: sessionID, Events: events}, sess
+}
+
+// ViewFacts is View and the session's facts, read under one lock, so the two agree. Each
+// present fact's Event points into the returned view, as SessionView.LastIntent does. When View
+// returns nil (no entry, or an expired one), the view is nil and both facts are FactNone.
+//
+// The InferenceHosts table is a copy:
+//   - With an entry numbered after earlier history: the HostsKeeper's table now, merged with
+//     the entry's own. HostsKnown is the keeper's.
+//   - With an entry and no earlier history: the entry's own table. HostsKnown is true.
+//   - With no entry: the keeper's table over every event it holds under the id.
+//   - With no keeper: the entry's own table, or none. HostsKnown is false when a SeqSeeder
+//     holds history for the id.
+//
+// THE KEEPER IS READ NOW, NOT WHEN THE ENTRY WAS CREATED. The history's last events can still be
+// in the archive's queue when the entry is created (an eviction, then the next request), and a
+// read now has them once the writer writes them. Prior is not used: it answers only after the
+// writer takes the entry's first event.
+func (s *Store) ViewFacts(sessionID string) (*model.SessionView, model.SessionFacts) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	sess, ok := s.sessions[sessionID]
-	if !ok {
-		return nil
+	v, sess := s.viewLocked(sessionID)
+	if v == nil {
+		hosts, known := s.keeperHostsLocked(sessionID)
+		return nil, model.SessionFacts{LastIntent: model.SessionFact{State: model.FactNone}, LastInference: model.SessionFact{State: model.FactNone},
+			InferenceHosts: slices.Clone(hosts), HostsKnown: known}
 	}
-	if s.isExpired(sess, s.clock()) {
-		return nil
+	// The keeper's table also holds the entry's events that it wrote. The merge takes the highest
+	// seq of each pair, and a seq is one event under the id, so nothing counts twice.
+	var hosts model.InferenceHosts
+	known := true
+	if sess.after > 0 {
+		var kept model.InferenceHosts
+		kept, known = s.keeperHostsLocked(sessionID)
+		hosts = slices.Clone(kept)
 	}
+	for _, x := range sess.hosts {
+		hosts = mergeHost(hosts, x)
+	}
+	return v, model.SessionFacts{LastIntent: factAt(v.Events, sess.lastIntent), LastInference: factAt(v.Events, sess.lastInference),
+		InferenceHosts: hosts, HostsKnown: known}
+}
 
-	events := make([]pipeline.SessionEvent, len(sess.Events))
-	copy(events, sess.Events)
-	return &pipeline.SessionView{ID: sessionID, Events: events}
+// factAt finds the event with this seq in events, which rise in seq. A seq of 0, or one that a
+// session.max_events trim removed, gives FactNone.
+func factAt(events []model.SessionEvent, seq uint64) model.SessionFact {
+	if seq == 0 {
+		return model.SessionFact{State: model.FactNone}
+	}
+	i := sort.Search(len(events), func(i int) bool { return events[i].Seq >= seq })
+	if i < len(events) && events[i].Seq == seq {
+		return model.SessionFact{Event: &events[i], State: model.FactPresent}
+	}
+	return model.SessionFact{State: model.FactNone}
 }
 
 // ViewTail returns the most recent limit events of a session, and reports how many
@@ -764,7 +888,7 @@ func (s *Store) View(sessionID string) *pipeline.SessionView {
 // The tail IS the newest page, so this delegates rather than repeating the slicing and
 // the two-field bookkeeping — which were identical in both, and are the part a later
 // change would update in one place and not the other.
-func (s *Store) ViewTail(sessionID string, limit int) *pipeline.SessionView {
+func (s *Store) ViewTail(sessionID string, limit int) *model.SessionView {
 	return s.ViewPage(sessionID, 0, limit)
 }
 
@@ -797,7 +921,7 @@ func (s *Store) ViewTail(sessionID string, limit int) *pipeline.SessionView {
 // TotalEvents and OldestSeq are set on the same terms as ViewTail: only when this page is
 // not the whole session, so a caller can tell "this is the beginning" from "there is more
 // behind me" without a second request.
-func (s *Store) ViewPage(sessionID string, before uint64, limit int) *pipeline.SessionView {
+func (s *Store) ViewPage(sessionID string, before uint64, limit int) *model.SessionView {
 	if limit <= 0 {
 		limit = 1
 	}
@@ -829,392 +953,15 @@ func (s *Store) ViewPage(sessionID string, before uint64, limit int) *pipeline.S
 	}
 
 	page := sess.Events[start:end]
-	events := make([]pipeline.SessionEvent, len(page))
+	events := make([]model.SessionEvent, len(page))
 	copy(events, page)
 
-	view := &pipeline.SessionView{ID: sessionID, Events: events}
+	view := &model.SessionView{ID: sessionID, Events: events}
 	if start > 0 || end < len(sess.Events) {
 		view.TotalEvents = len(sess.Events)
 		view.OldestSeq = sess.Events[0].Seq
 	}
 	return view
-}
-
-// SessionSummary is a per-session view for list endpoints: counters, money figures and
-// timestamps rather than the event backlog.
-//
-// "METADATA-ONLY" WOULD NOW BE WRONG, and the phrase used to be here: Title carries up to
-// maxTitleLen runes of VERBATIM USER PROMPT. This is not a new exposure — /v1/sessions/{id}
-// returns whole request and response bodies on the same unauthenticated listener, which the
-// session API documents as its trust model — but a reader deciding how this endpoint may be
-// exposed should not be told by this comment that no content reaches it. Note in particular
-// core/config/config.go's tls_bridge guard, which forces the session API to loopback on the
-// rationale that it "may carry decrypted request/response bodies": that guard keys off the
-// bridge, not off this field, and nothing here should be read as having considered whether
-// it wants widening.
-type SessionSummary struct {
-	ID         string    `json:"id"`
-	CreatedAt  time.Time `json:"createdAt"`
-	UpdatedAt  time.Time `json:"updatedAt"`
-	EventCount int       `json:"eventCount"`
-	// Title names this session from its own events, absent when nothing in them named it.
-	// Folded by Append; see entry.Title for the rule and titleFrom for the ranks.
-	//
-	// A SUGGESTION, NOT AN IDENTIFIER: derived from the events and nothing addresses a
-	// session by it.
-	//
-	// FIRST-WINS, EXCEPT THAT A /rename ALWAYS OVERRIDES. Two consequences a client may rely
-	// on, both the opposite of what this field promised while it was recomputed per call:
-	// ordinary conversation does NOT re-title the session on every turn, and a /rename is not
-	// lost when the event carrying it is evicted.
-	//
-	// omitempty on the standing rule CostMicros states below: an unknown value must not
-	// render as a real one, so an absent key is what a client should expect for a session the
-	// events never named.
-	//
-	// ABSENT IS A DISPLAYED STATE NOW, not just an unread one. agentop renders this in its TITLE
-	// column as a FALLBACK: it prefers a title harvested from Claude Code's transcripts and
-	// reaches for this one only when that harvest named nothing. So the sessions where this
-	// field decides what an operator sees are exactly those with no transcript on the machine
-	// running agentop — an agent that routes through the proxy without writing Claude Code
-	// transcripts is the case that motivated it. Do not assume a change here is invisible.
-	Title string `json:"title,omitempty"`
-	// Agent is the client this session belongs to, as event.AgentLabel names it, which is the
-	// label agent= matches: the affinity owner's when one claimed the session, else the first
-	// recognised agent's, else — #1214 — the first UNRECOGNISED client's, which is its raw
-	// User-Agent folded by pipeline.AgentName. Absent for the default and pending buckets, which
-	// are no one agent's, for a claimed session its owner has sent nothing into, and for a session
-	// whose every event carried no User-Agent at all, since "unknown" is a reserved bucket rather
-	// than a name (see pipeline.EventClient.Label).
-	//
-	// NOT A STATEMENT THAT THE AGENT IS RECOGNISED, and a consumer that reads it as one is the
-	// one thing this field's widening can surprise. pipeline.IsKnownAgent(agent) still answers
-	// correctly — that is what it exists for, and agentop's AGENTS pane uses it to pool every
-	// label it rejects under one row — but presence alone no longer implies it. The alternative
-	// was a session that nothing in the list could attribute to any program, which is what #1214
-	// was filed about; a spoofable label is the same axis the usage ring and the ledger already
-	// key on, never an identity.
-	Agent       string `json:"agent,omitempty"`
-	TotalTokens int    `json:"totalTokens,omitempty"` // sum of Inference.TotalTokens across response events
-	// CostMicros is what this session's events cost, in millionths of a dollar, summed from
-	// the records the session itself holds — where a session archive runs, including those from
-	// before this entry.
-	//
-	// FROM THE EVENTS, not from the ledger, and that is the only honest source available: the
-	// ledger's row key is (endpoint, model, agent, provenance) with no session dimension by
-	// design, so it cannot answer "what did this session cost" at all. The live ring can, but
-	// only over its rolling window, which would put a partial figure beside the LIFETIME
-	// TotalTokens above and understate the row by whatever fell off the ring.
-	//
-	// SCOPED TO WHAT THE STORE STILL HOLDS, PLUS — WHERE A SESSION ARCHIVE RUNS — THE SESSION'S
-	// HISTORY FROM BEFORE THIS ENTRY (see PriorKeeper). So with an archive it continues across a
-	// restart, and without one it resets; a ledger window always continues. Both are correct:
-	// this is "the cost of the events in this session", the ledger is "the cost of the day". A
-	// client showing them together must not present one as a check on the other.
-	//
-	// Omitted when zero rather than sent as 0, on this codebase's standing rule that an
-	// unknown cost must never render as $0.00: a session whose traffic nothing could price is
-	// indistinguishable here from one that was free, so the field's absence lets a client show
-	// "—" instead of asserting either.
-	CostMicros int64 `json:"costMicros,omitempty"`
-	// AvoidedMicros is cost this session did NOT incur, same unit, APPLIED savings only.
-	//
-	// NOT SPEND, and never to be added to CostMicros — see usage.Counts.AvoidedMicros and the
-	// invariant on event.Event.Avoided. Reported beside it because the two answer
-	// different questions about the same session.
-	AvoidedMicros int64 `json:"avoidedMicros,omitempty"`
-	// Currencies names the units CostMicros and AvoidedMicros are in, sorted, dollars spelled
-	// "USD" — and is ABSENT when every priced event was in dollars, which is every deployment
-	// with no pricing unit configured, so those serve the bytes they always have.
-	//
-	// MORE THAN ONE ENTRY MEANS THE FIGURES ARE A CROSS-UNIT SUM and must not be rendered as a
-	// single amount. They are still summed here rather than split, because the running totals
-	// predate units and a client that ignores this field must keep reading what it always read;
-	// splitting is the job of a surface that can show two figures. Follows the events through a
-	// trim, like the totals themselves; see entry.units.
-	Currencies []string `json:"currencies,omitempty"`
-	// Saturated says the two figures above are FLOORS: an addition into one of them reached
-	// the int64 ceiling and was clamped rather than allowed to wrap.
-	//
-	// It exists because the clamp on its own is not honest. MaxInt64 micros is about
-	// $9.2 trillion, which renders as a perfectly well-formed dollar amount and is
-	// indistinguishable from a measured one — "a clamped figure is a wrong number wearing a
-	// right label", which is why pricing.MicrosFromUSD refuses an out-of-range figure
-	// instead of clamping it. Here the sum cannot be refused (the money was really spent),
-	// so the figure is clamped and this field is what makes that admissible.
-	//
-	// ONE FLAG FOR BOTH, on usage.Counts.Saturated's reasoning: it means "read every money
-	// figure here as a bound", and a second flag for the same fact would let a client
-	// believe one while the other contradicted it.
-	//
-	// Practically unreachable — it takes over a thousand maximal per-request figures in one
-	// session — and carried anyway, because the alternative is a number no consumer can
-	// tell apart from a real one.
-	Saturated bool `json:"saturated,omitempty"`
-	Active    bool `json:"active"` // true if this is the most recently updated session
-	// PromptContext is how full this session's conversation got, by the rule in
-	// pipeline.PromptContextFold: the main-agent turn that RANKS HIGHEST under that rule's total
-	// order, in prompt tokens. Where the client states its role that is the LATEST such turn;
-	// where it does not it is the one with the MOST MESSAGES. See pipeline.PromptContext, which is
-	// this field's type and carries the order.
-	//
-	// NO MONOTONICITY IS PROMISED, and a client must not build on one: this figure can DECREASE
-	// between two polls. A compaction is the ordinary case, not a corner — the stated arm leads
-	// with arrival time, so a session reporting 830,000 before one reports 12,000 on the turn
-	// after it. WHERE THE ROLE IS STATED that is what the column is for: an operator needs how full
-	// the conversation is NOW rather than how full it has ever been. The unstated arm claims no such
-	// thing — it ranks by message count, so it can legitimately hold a pre-compaction turn for the
-	// rest of a session, which is the documented cost of having no role to read rather than a defect
-	// (see pipeline.PromptContextOf). So the figure decreases on one arm and goes stale on the
-	// other, and neither is a guarantee to build on.
-	//
-	// RETENTION-INDEPENDENT ALL THE SAME — unlike TotalTokens and CostMicros above, and the
-	// asymmetry is deliberate rather than an inconsistency. Those are sums over the events the
-	// store still holds (plus, where a session archive runs, the session's history from before
-	// this entry), so a trim sheds exactly what left the slice, which is why CostMicros can
-	// honestly call itself the cost of the events in this session. This is an extremum under a
-	// total order: nothing about it is accumulated, so a trim has nothing to subtract from it and
-	// it outlives the events it was read from. Recomputing it over the survivors would not
-	// understate by a known amount the way that sum does — it would report a small conversation
-	// for a session whose conversation is large and merely aged out of the store. A client showing
-	// the three on one row must not present any of them as a check on another.
-	//
-	// A POINTER SO ABSENT AND ZERO STAY APART, which is the same standing rule CostMicros states
-	// for its omitempty: an unknown figure must never render as a real one. A session with only
-	// one-shot completions has no conversation to measure and is indistinguishable here from one
-	// nobody observed; both must reach a client as an absent field so it can draw an em dash.
-	//
-	// CONTINUES ACROSS A RESTART WHERE A SESSION ARCHIVE RUNS, like CostMicros, and resets where
-	// none does, because the store is in-memory per-pod. A client that has been watching longer
-	// than this proxy has been up may hold a larger figure legitimately — see
-	// pipeline.MergePromptContext, which is how the two combine.
-	PromptContext *pipeline.PromptContext `json:"promptContext,omitempty"`
-
-	// InferenceHost is where this session's inference traffic goes: the host of its most recent
-	// request that carried an inference parse, as the event recorded it. After a redirect that is
-	// the server it was sent to, whether or not that server answered, and not the host the client
-	// named (see SessionEvent.RequestedHost).
-	// Absent for a session with no inference traffic — and for one resumed from an archive written
-	// before this field existed, until its next inference request, where absent means unknown:
-	// that history was folded without it (see foldJSON.InferenceHost).
-	//
-	// LATEST WINS, AND ONLY AN INFERENCE REQUEST MOVES IT. A CONNECT tunnel row, an MCP call, any
-	// response or a denial leaves it where it was: live traffic interleaves those between turns,
-	// and a field they cleared would read "no inference traffic" on a session that has plenty. A
-	// denial carries its request's parse but went nowhere, so its host is not where anything goes.
-	//
-	// GENERIC, NOT THE ROUTER'S: it says where a session's inference goes with or without the
-	// inference-router. agentop names a session's server from it, which is why the router refuses
-	// two servers on one host. A host[:port] as the request carried it.
-	//
-	// CONTINUES ACROSS A RESTART WHERE A SESSION ARCHIVE RUNS, like Title: the archive's fold
-	// persists it, and a resumed session reports it until its own next inference request.
-	InferenceHost string `json:"inferenceHost,omitempty"`
-
-	// InferenceHostFromHistory is true when InferenceHost came from the session's history before
-	// this store entry — the archive's fold — because no request the entry holds has set it: a
-	// session resumed after a restart, or re-created after an eviction, that has sent no inference
-	// request since. Absent otherwise, and on a row only the archive holds (Resident false), all of
-	// whose figures are history.
-	//
-	// WHAT IT TELLS A CLIENT: the host is the archive's word, from before this process, and not a
-	// request this process saw. Whether something still holds the session there is the router's
-	// business: on a local install it keeps its pins in the plugin store, which a restart keeps, and
-	// agentop counts such a session as staying; a process with no plugin store keeps them in memory
-	// and forgets them on restart. InferenceHost itself is unchanged by this: it still says where
-	// the session's inference last went.
-	InferenceHostFromHistory bool `json:"inferenceHostFromHistory,omitempty"`
-
-	// Resident is false on a row the session archive served because the store no longer holds
-	// the session (GET /v1/sessions?archived=true), and absent otherwise. A POINTER because
-	// omitempty on a bool drops exactly the false the wire needs; absent then means "resident",
-	// so a client reading a proxy that predates the archive sees every row as it always did.
-	Resident *bool `json:"resident,omitempty"`
-
-	// Procs are the processes that named this session through their own session header,
-	// "<pid>.<start>", sorted. Absent when none did, and on a summary from before the field.
-	Procs []string `json:"procs,omitempty"`
-	// LastRequestAt is the time of the newest request this session holds, zero when it holds
-	// none. On a pending bucket it is what Link compares with a process's claims.
-	LastRequestAt time.Time `json:"lastRequestAt,omitzero"`
-	// LinkedTo, on a pending bucket, is the sessions its process named that OwnerAt gives a
-	// call of the bucket, each with the span of its naming requests (Link says how close that
-	// is); LinkedAll says every request in the bucket falls before one of them. Set by Link when
-	// the list is read, never stored. agentop folds a fully linked bucket that links to one
-	// session into it and lists any other as its own row.
-	LinkedTo  []PendingLink `json:"linkedTo,omitempty"`
-	LinkedAll bool          `json:"linkedAll,omitempty"`
-
-	// procSpans is Procs with each process's span, for Link; not on the wire.
-	procSpans map[string]ProcSpan
-}
-
-// sessionAgent is one client's first label in a session.
-//
-// name is how the agents slice is KEYED, so each client contributes one entry: a recognised
-// agent's canonical AffinityName, and — since #1214 — an unrecognised client's own label, which
-// is the only name it has. known is what tells the two apart, and it has to be a field rather
-// than a pipeline.IsKnownAgent(name) call at the point of use: name is an AffinityName, which
-// reads an agent's canonical name out of a COMMENT (Claude Code's WebFetch), so the recognised
-// entry's name and its label can disagree, and only the producer knows which rule made it.
-type sessionAgent struct {
-	name, label string
-	known       bool
-}
-
-// agentLabel is the first label the agent named name sent into this session, or "".
-func (e *entry) agentLabel(name string) string {
-	return agentLabelIn(e.agents, name)
-}
-
-// ListSessions returns summaries for every non-expired session. Order is
-// UpdatedAt descending (most recent first). Safe for concurrent use.
-func (s *Store) ListSessions() []SessionSummary {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	now := s.clock()
-	out := make([]SessionSummary, 0, len(s.sessions))
-	for id, sess := range s.sessions {
-		if s.isExpired(sess, now) {
-			continue
-		}
-		sum := SessionSummary{
-			ID:         id,
-			CreatedAt:  sess.CreatedAt,
-			UpdatedAt:  sess.UpdatedAt,
-			EventCount: len(sess.Events),
-			// Read, not computed — like the money figures below and for the same reason,
-			// squared. Append folds this; see entry.Title for the rule (first-wins, except
-			// that a /rename always overrides), for why the name outlives the event that
-			// carried it, and for the measurements that put the fold there rather than here.
-			//
-			// A FIELD READ, so no content shape can reach it: the 190KB nested-reminder fixture
-			// that costs 38.1s to walk reads in 1.6µs. BenchmarkListSessions_Title measures five
-			// shapes that agree at ~165ns, which is the standing evidence against a walk
-			// reappearing here — they would diverge immediately if one did. This obeys the rule
-			// PromptContext states below, which rejects an O(events) walk under the read lock.
-			Title: sess.Title,
-			Agent: pickAgent(id, sess.owner, nil, sess.agents),
-			// Still a walk, and deliberately left as one: it is a pointer deref per event
-			// with no allocation, where the money figures below needed a JSON unmarshal.
-			TotalTokens: sumTokens(sess.Events),
-			// Read, not computed. Append maintains these; see entry.cost.
-			CostMicros:    sess.cost.Micros,
-			AvoidedMicros: sess.avoided.Micros,
-			Currencies:    currenciesOf(sess.units),
-			// Either total having clamped makes BOTH figures on this row bounds rather than
-			// sums, which is why one flag covers them — the same reasoning
-			// usage.Counts.Saturated gives for covering every money field in a Counts.
-			Saturated: sess.cost.Saturated || sess.avoided.Saturated,
-			Active:    id == s.activeID,
-			// Read, not computed — and unlike TotalTokens above this is NOT a walk. Folding the rule
-			// here instead would repeat the mistake entry.cost documents: O(events) per session
-			// under the read lock, on agentop's two-second poll, in front of a lock whose writer side
-			// is Append on the proxy's request path, with maxEvents unset by default.
-			PromptContext: sess.context.Publish(),
-			// Read, not computed, like Title: Append folds it.
-			InferenceHost: sess.inferenceHost,
-			Procs:         procsList(sess.procs),
-			procSpans:     maps.Clone(sess.procs),
-			LastRequestAt: sess.lastRequestAt,
-		}
-		s.withPriorLocked(&sum, id, sess)
-		out = append(out, sum)
-	}
-	// Most recently updated first.
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].UpdatedAt.After(out[j].UpdatedAt)
-	})
-	return out
-}
-
-// sumTokens aggregates Inference.TotalTokens across all response events
-// in a session. Used by ListSessions so the summary endpoint can report a
-// per-session cost without the caller loading every event first.
-func sumTokens(events []pipeline.SessionEvent) int {
-	var total int
-	for i := range events {
-		if events[i].Phase != pipeline.SessionResponse {
-			continue
-		}
-		if events[i].Inference == nil {
-			continue
-		}
-		total += events[i].Inference.TotalTokens
-	}
-	return total
-}
-
-// eventMoney is one event's contribution to a session's running totals.
-//
-// Decoded ONCE, by Append, and never again. See Store.Append for why that matters and
-// entry.cost for what holds the result.
-type eventMoney struct {
-	cost    int64
-	avoided int64
-	// priced says cost is a figure, including a settled zero, and unit is what it is in ("" for
-	// USD). Carried so a trim can shed the unit with the figure; see entry.units.
-	priced bool
-	unit   string
-}
-
-// moneyOf reads one event's settled cost and its avoided cost, in micros.
-//
-// ONE DECODE FOR BOTH, because both come off the same record and event.Record is a JSON
-// unmarshal. Asking for them separately would parse every plugin map twice.
-//
-// Priced dollars only in cost — event.Event.Priced is the one predicate for that, so a
-// refused or unsettled figure contributes nothing here exactly as it contributes nothing to
-// /v1/usage. avoided ignores pricedness on purpose: a request that could not be priced still
-// had prompt tokens removed. See usage.Aggregator.costOf, which this deliberately mirrors,
-// and note the two must never be added together.
-//
-// CALLED OUTSIDE THE STORE'S LOCK. It touches no store state and takes the event by pointer
-// only to avoid copying it, so Append resolves it before acquiring mu — the unmarshal is the
-// most expensive thing on that path and it does not belong inside the critical section.
-func moneyOf(e *pipeline.SessionEvent) eventMoney {
-	// The two phases that carry a settled figure, matching what the aggregator and the
-	// durable ledger both fold. SessionResponse is the ordinary path; a DENIAL can still
-	// carry one, because the proxy charges for a response whose body never arrived — so
-	// restricting this to sumTokens' response-only rule would drop real dollars. It adds no
-	// token skew against TotalTokens: a denial carries no Inference extension, so those
-	// events contribute zero tokens either way.
-	//
-	// CHECKED BEFORE THE DECODE, matching ledger.Writer.Record's own hoisted guard and
-	// for the same reason it gives: a request event's plugin map must not be parsed to
-	// answer a question the phase already settles.
-	if e.Phase != pipeline.SessionResponse && e.Phase != pipeline.SessionDenied {
-		return eventMoney{}
-	}
-	ev, ok := event.Record(e)
-	if !ok {
-		return eventMoney{}
-	}
-	var m eventMoney
-	if ev.Priced() {
-		m.cost = ev.Micros()
-		m.priced = true
-	}
-	m.unit = ev.Currency
-	m.avoided = ev.TotalAvoidedMicros()
-	return m
-}
-
-// sumCost aggregates one session's settled cost and its avoided cost by walking every event.
-//
-// NOT ON ANY SERVING PATH. ListSessions reads the running totals Append maintains; this is
-// the REFERENCE DEFINITION those totals must agree with, kept because an incremental total is
-// only as good as the full recomputation it claims to equal, and
-// TestAppend_RunningTotalsMatchAFullRecomputation asserts exactly that after appends, trims
-// and evictions. Deleting it would leave the increments with nothing to check them against.
-func sumCost(events []pipeline.SessionEvent) (cost, avoided event.CostSum) {
-	for i := range events {
-		m := moneyOf(&events[i])
-		cost.Add(m.cost)
-		avoided.Add(m.avoided)
-	}
-	return cost, avoided
 }
 
 // ActiveSession returns the most recently updated session ID.
@@ -1289,6 +1036,8 @@ func (s *Store) rekeyLocked(oldID, newID string) bool {
 	// reads stay consistent with live-streamed events after a rekey.
 	for i := range sess.Events {
 		sess.Events[i].SessionID = newID
+		sess.projects = applyProject(sess.projects, newID, sess.Events[i].RollupProject())
+		sess.parentSession = applyParent(sess.parentSession, newID, sess.Events[i].ParentSession)
 	}
 	// Every rename tells the recorders that keep per-session state, so that state follows the
 	// session: Adopt's pending bucket → session and Rekey's A2A default → contextId alike. Here
@@ -1380,30 +1129,11 @@ func (s *Store) isExpired(sess *entry, now time.Time) bool {
 	return now.Sub(sess.UpdatedAt) > s.ttl
 }
 
-// publishLocked fans out event to every current subscriber. Must be called
-// with s.mu held. Sends are non-blocking — a full channel increments the
-// subscriber's drop counter and discards the event.
-//
-// Performance note: fan-out runs under s.mu, which serializes Append on the
-// subscriber list length. This is fine for the debug API's expected load
-// (O(1) live consumers: one agentop instance + maybe a curl tail). If the
-// store ever needs to support many concurrent subscribers, refactor this
-// to an unlocked broadcast (snapshot the slice under the lock, send outside).
-func (s *Store) publishLocked(event pipeline.SessionEvent) {
-	for _, sub := range s.subscribers {
-		select {
-		case sub.ch <- event:
-		default:
-			atomic.AddUint64(&sub.drops, 1)
-		}
-	}
-}
-
 // logAppended emits a structured DEBUG line so operators can observe session
 // state evolution. Fields are chosen to cover the data captured by all four
 // record helpers — extension payloads themselves are intentionally omitted
 // since the parsers already log them.
-func logAppended(sessionID string, e *pipeline.SessionEvent) {
+func logAppended(sessionID string, e *model.SessionEvent) {
 	attrs := []any{
 		// A session id is an attribution key the operator needs in the log to
 		// answer "which session was this bucket?" — validated at the source
@@ -1414,7 +1144,7 @@ func logAppended(sessionID string, e *pipeline.SessionEvent) {
 		"phase", e.Phase.String(),
 	}
 	if e.Host != "" {
-		attrs = append(attrs, "host", pipeline.SanitizeLogValue(e.Host))
+		attrs = append(attrs, "host", model.SanitizeLogValue(e.Host))
 	}
 	if e.StatusCode != 0 {
 		attrs = append(attrs, "status", e.StatusCode)
@@ -1451,28 +1181,4 @@ func logAppended(sessionID string, e *pipeline.SessionEvent) {
 	// where attrs is built.
 	// codeql[go/clear-text-logging]
 	slog.Debug("session: event appended", attrs...)
-}
-
-// currenciesOf is SessionSummary.Currencies for one session's unit counts: nil when every priced
-// event was in dollars, else every unit sorted, with dollars spelled out.
-//
-// NIL FOR DOLLARS-ONLY so a deployment with no unit configured serves the bytes it always has; a
-// client finding the field absent may print "$" exactly as before. Once a second unit is present
-// dollars must be NAMED, or a reader would take the one unit it did see for the whole figure.
-func currenciesOf(units map[string]int) []string {
-	if len(units) == 0 {
-		return nil
-	}
-	if _, onlyUSD := units[""]; onlyUSD && len(units) == 1 {
-		return nil
-	}
-	out := make([]string, 0, len(units))
-	for u := range units {
-		if u == "" {
-			u = pricing.CurrencyUSD
-		}
-		out = append(out, u)
-	}
-	sort.Strings(out)
-	return out
 }

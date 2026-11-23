@@ -64,6 +64,24 @@ func installStub(t *testing.T, name, body string) {
 	}
 }
 
+// installFalse puts name on PATH as a link to false(1): exit 1 and no output, like
+// the stub "#!/bin/sh\nexit 1", without the cost of a shell start on each call.
+func installFalse(t *testing.T, name string) {
+	t.Helper()
+	target, err := exec.LookPath("false")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	if err := os.Symlink(target, filepath.Join(dir, name)); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	if got, err := exec.LookPath(name); err != nil || got != filepath.Join(dir, name) {
+		t.Fatalf("stub not reachable: LookPath(%q) = %q, %v", name, got, err)
+	}
+}
+
 // noSystemctlOnPath points PATH at an empty directory, so exec.LookPath("systemctl")
 // fails the same way it would on a box with no systemd at all. Call this instead
 // of, never after, fakeSystemctl/fakeLoginctl/installStub in the same subtest: it
@@ -689,13 +707,16 @@ func TestControlService_Linux(t *testing.T) {
 	// the right action.
 	//
 	// start and restart clear systemd's start limit first, so they can bring back a
-	// unit that crash-looped into start-limit-hit. stop does not: it has no start to
-	// unblock.
+	// unit that crash-looped into start-limit-hit. stop clears it after instead: it
+	// has no start to unblock, but it must not leave a deliberate stop reading as a
+	// crash.
 	for _, tc := range []struct {
 		action string
 		want   []string
 	}{
-		{"stop", []string{"--user disable --now cortex.service"}},
+		// stop clears the failed state AFTER it, so a unit systemd had given up on
+		// ends inactive and disabled, which status reports as stopped, not crashed.
+		{"stop", []string{"--user disable --now cortex.service", "--user reset-failed cortex.service"}},
 		{"start", []string{"--user reset-failed cortex.service", "--user enable --now cortex.service"}},
 		{"restart", []string{"--user reset-failed cortex.service", "--user restart cortex.service"}},
 	} {

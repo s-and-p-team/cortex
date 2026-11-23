@@ -12,8 +12,8 @@ import (
 	"github.com/rossoctl/cortex/core/session"
 )
 
-// THE RULE ITSELF IS TESTED IN core/pipeline/promptcontext_test.go, against
-// pipeline.PromptContextOf, with its OWN copy of the fixtures below — see that package's
+// THE RULE ITSELF IS TESTED IN core/model/promptcontext_test.go, against
+// model.PromptContextOf, with its OWN copy of the fixtures below — see that package's
 // promptcontext_fixtures_test.go for why they are duplicated rather than memstore.
 //
 // What stays here is what still needs a *model: sessions_context_fold_test.go and
@@ -72,7 +72,7 @@ func oneShot(id string, at time.Time, context int) []pipeline.SessionEvent {
 // have to be pinned separately, because the fallback is a PERMANENT path rather than a
 // version-skew relic. An earlier version of this comment said "a proxy older than the field is the
 // case the fallback is for", which reads stated as a proxy capability; it is a CLIENT property.
-// inferenceparser.agentRole returns "" for every client that is not Claude Code — it requires the
+// core/parse/inference.agentRole returns "" for every client that is not Claude Code — it requires the
 // x-anthropic-billing-header: prefix on the first system line — so no proxy version retires the
 // unstated arm. mainAgent and subagent below are their stated counterparts.
 func roled(evs []pipeline.SessionEvent, role pipeline.AgentRole) []pipeline.SessionEvent {

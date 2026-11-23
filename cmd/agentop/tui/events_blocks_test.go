@@ -24,7 +24,8 @@ func dirColumn() eventColumn {
 
 // blockEvents is a session with two subagents running beside the main conversation,
 // interleaved as live traffic is. Each subagent carries a priced response so the
-// header's rollup has figures to sum.
+// header's rollup has figures to sum. The price is the exchange total, cost_usd, which
+// is what a merged row's COST shows (#1681).
 func blockEvents() []pipeline.SessionEvent {
 	sub := func(id string, phase pipeline.SessionPhase, tokens int) pipeline.SessionEvent {
 		return pipeline.SessionEvent{
@@ -32,7 +33,7 @@ func blockEvents() []pipeline.SessionEvent {
 			Subagent:  id,
 			Inference: &pipeline.InferenceExtension{OutputTokens: tokens},
 			Plugins: map[string]json.RawMessage{
-				"cost": json.RawMessage(`{"output_usd":0.1}`),
+				"cost": json.RawMessage(`{"cost_usd":0.1}`),
 			},
 		}
 	}
@@ -81,7 +82,7 @@ func TestBlocks_CollapsedByDefaultWithHeaderAtTheAnchor(t *testing.T) {
 	if b := m.headerRows[3]; b == nil || b.id != "a2" {
 		t.Errorf("header at 3 = %v, want a2", m.headerRows[3])
 	}
-	// The header carries the rollup: a1 holds one exchange (2 rows) whose
+	// The header carries the rollup: a1 holds one exchange (one row) whose
 	// response carries 900 tokens at $0.10.
 	h := m.eventsTbl.Rows()[1][0]
 	if !strings.Contains(h, "▸─") || !strings.Contains(h, "1 msg") || !strings.Contains(h, "900 tok") || !strings.Contains(h, "$0.10") {
@@ -99,8 +100,8 @@ func TestBlocks_EnterToggles(t *testing.T) {
 	if !m.toggleSubagentBlock() {
 		t.Fatal("Enter on the header row did not toggle")
 	}
-	if got := len(m.eventsTbl.Rows()); got != 6 {
-		t.Fatalf("open block: rendered rows = %d, want 6", got)
+	if got := len(m.eventsTbl.Rows()); got != 5 {
+		t.Fatalf("open block: rendered rows = %d, want 5", got)
 	}
 	// The member rows sit inside the block, between the header and m2. Row 0 is
 	// m1, row 1 the header (its visibleRows entry is empty — no event of its own).
@@ -110,16 +111,15 @@ func TestBlocks_EnterToggles(t *testing.T) {
 	if m.visibleRows[1].event != nil {
 		t.Errorf("header row holds an event: %+v", m.visibleRows[1].event)
 	}
-	for _, i := range []int{2, 3} {
-		if m.visibleRows[i].event.Subagent != "a1" {
-			t.Errorf("row %d not a1's: %+v", i, m.visibleRows[i].event)
-		}
+	// a1's one exchange is one row (#1681).
+	if r := m.visibleRows[2]; r.event.Subagent != "a1" || r.resp == nil {
+		t.Errorf("row 2 not a1's merged exchange: %+v", r)
 	}
 	if h := m.eventsTbl.Rows()[1][0]; !strings.Contains(h, "▾─") {
 		t.Errorf("open header = %q, want ▾", h)
 	}
 	// a2 stays collapsed through a1's rebuild.
-	if got := len(m.eventsTbl.Rows()); got != 6 {
+	if got := len(m.eventsTbl.Rows()); got != 5 {
 		t.Fatalf("a2 should still be collapsed: %d rows", got)
 	}
 
@@ -156,11 +156,13 @@ func TestBlocks_ExpandedMembersStayTogether(t *testing.T) {
 		t.Fatal("Enter on the header row did not toggle")
 	}
 
-	// Expanded: header, a1's whole exchange, THEN the main rows — a1's response
-	// must not sit at its chronological slot below m1.
-	want := []string{"a1", "a1", "m1", "m2"}
-	if got := len(m.eventsTbl.Rows()); got != 5 {
-		t.Fatalf("expanded rows = %d, want 5 (header + a1's pair + m1 + m2)", got)
+	// Expanded: header, a1's whole exchange as one row, THEN the main rows.
+	want := []string{"a1", "m1", "m2"}
+	if got := len(m.eventsTbl.Rows()); got != 4 {
+		t.Fatalf("expanded rows = %d, want 4 (header + a1's exchange + m1 + m2)", got)
+	}
+	if m.visibleRows[1].resp == nil {
+		t.Error("a1's row has no response: its exchange is split")
 	}
 	for i, id := range want {
 		// Row 0 is the header, whose visibleRows entry holds no event.
@@ -210,10 +212,10 @@ func TestBlocks_ConcurrentSubagentsEachStayOneSegment(t *testing.T) {
 			order[vr.event.Subagent] = append(order[vr.event.Subagent], vr.event.RequestID)
 		}
 	}
-	if got := order["a1"]; !slices.Equal(got, []string{"a1.1", "a1.1", "a1.2", "a1.2"}) {
+	if got := order["a1"]; !slices.Equal(got, []string{"a1.1", "a1.2"}) {
 		t.Errorf("a1's segment = %v, want its whole exchange run in order", got)
 	}
-	if got := order["a2"]; !slices.Equal(got, []string{"a2.1", "a2.1", "a2.2", "a2.2"}) {
+	if got := order["a2"]; !slices.Equal(got, []string{"a2.1", "a2.2"}) {
 		t.Errorf("a2's segment = %v, want its whole exchange run in order", got)
 	}
 	// A subagent's rendered rows must form ONE contiguous run: their positions
@@ -238,8 +240,8 @@ func TestBlocks_ConcurrentSubagentsEachStayOneSegment(t *testing.T) {
 
 // Member rows number their exchanges from 1 WITHIN the block — the block reads
 // as the subagent's own transcript — while main rows keep the session-wide
-// numbers. A request and its response still share one number, and the block's
-// count agrees with the last number shown inside it.
+// numbers. Each exchange is one row (#1681), and the block's count agrees with the
+// last number shown inside it.
 func TestBlocks_MembersNumberFromOneInsideTheBlock(t *testing.T) {
 	req := func(id, sub string) pipeline.SessionEvent {
 		return pipeline.SessionEvent{Direction: pipeline.Outbound, Phase: pipeline.SessionRequest, Host: "ete", RequestID: id, Subagent: sub}
@@ -254,15 +256,15 @@ func TestBlocks_MembersNumberFromOneInsideTheBlock(t *testing.T) {
 		req("a1.2", "a1"), resp("a1.2", "a1"), // session 4 — block-local 2
 	}
 	m := newBlockModel(t, events)
-	m.eventsTbl.SetCursor(2) // a1's header: m1's pair, then the header
+	m.eventsTbl.SetCursor(1) // a1's header: m1's exchange, then the header
 	if !m.toggleSubagentBlock() {
 		t.Fatal("Enter on the header row did not toggle")
 	}
 
-	// Rendered: m1 req, m1 resp, header, a1's two exchanges, m2's pair. The
-	// first cell of each EVENT row is the # column; the header row is one cell
-	// of its own, standing in for the position.
-	want := []string{"1", "1", "HEADER", "1", "1", "2", "2", "3", "3"}
+	// Rendered: m1, header, a1's two exchanges, m2. The first cell of each EVENT
+	// row is the # column. The header row is one cell of its own, standing in for
+	// the position.
+	want := []string{"1", "HEADER", "1", "2", "3"}
 	rows := m.eventsTbl.Rows()
 	if len(rows) != len(want) {
 		t.Fatalf("expanded rows = %d, want %d", len(rows), len(want))
@@ -276,14 +278,14 @@ func TestBlocks_MembersNumberFromOneInsideTheBlock(t *testing.T) {
 		}
 	}
 	// The header's rollup counts exchanges, in the same unit the rows show.
-	if h := rows[2][0]; !strings.Contains(h, "2 msgs") {
+	if h := rows[1][0]; !strings.Contains(h, "2 msgs") {
 		t.Errorf("header = %q, want the exchange count (2 msgs)", h)
 	}
 }
 
 // Two of one subagent's exchanges that overlap (A starts, B starts, A ends, B
-// ends) keep their pairing: each row carries its own exchange's block-local
-// number, not the count of exchanges seen before it.
+// ends) keep their pairing: each exchange is one row with its own block-local
+// number, in request order.
 func TestBlocks_OverlappingExchangesKeepTheirNumbers(t *testing.T) {
 	ev := func(id string, phase pipeline.SessionPhase) pipeline.SessionEvent {
 		return pipeline.SessionEvent{Direction: pipeline.Outbound, Phase: phase, Host: "ete", RequestID: id, Subagent: "a1"}
@@ -297,14 +299,14 @@ func TestBlocks_OverlappingExchangesKeepTheirNumbers(t *testing.T) {
 	m.rebuildEventsTable()
 
 	rows := m.eventsTbl.Rows()
-	if len(rows) != 5 {
-		t.Fatalf("expanded rows = %d, want 5 (header + 4)", len(rows))
+	if len(rows) != 3 {
+		t.Fatalf("expanded rows = %d, want 3 (header + 2 exchanges)", len(rows))
 	}
 	var got []string
 	for _, r := range rows[1:] {
 		got = append(got, r[0])
 	}
-	if want := []string{"1", "2", "1", "2"}; !slices.Equal(got, want) {
+	if want := []string{"1", "2"}; !slices.Equal(got, want) {
 		t.Errorf("# cells = %v, want %v", got, want)
 	}
 	if h := rows[0][0]; !strings.Contains(h, "2 msgs") {
@@ -328,8 +330,8 @@ func TestBlocks_SearchExpandsCollapsedBlocks(t *testing.T) {
 	m.search = map[paneID]string{paneEvents: "ete"}
 	m.rebuildEventsTable()
 
-	if got := len(m.eventsTbl.Rows()); got != 8 {
-		t.Fatalf("searching: rendered rows = %d, want 8 (all rows + 2 headers)", got)
+	if got := len(m.eventsTbl.Rows()); got != 6 {
+		t.Fatalf("searching: rendered rows = %d, want 6 (all rows + 2 headers)", got)
 	}
 	if len(m.eventsTbl.Matches()) == 0 {
 		t.Error("search matched nothing")
@@ -365,8 +367,8 @@ func TestBlocks_SortDisablesGrouping(t *testing.T) {
 	if m.subagentBlocks != nil {
 		t.Fatal("blocks active under a sort")
 	}
-	if got := len(m.eventsTbl.Rows()); got != 6 {
-		t.Fatalf("sorted: rendered rows = %d, want 6 flat", got)
+	if got := len(m.eventsTbl.Rows()); got != 4 {
+		t.Fatalf("sorted: rendered rows = %d, want 4 flat", got)
 	}
 }
 
@@ -400,17 +402,17 @@ func TestBlocks_DirGutterMarksMemberRows(t *testing.T) {
 // back to the raw id — which is what a teammate or a stale harvest renders.
 func TestBlocks_LabelSources(t *testing.T) {
 	m := newBlockModel(t, blockEvents())
-	if got := m.subagentLabel("a1"); got != "a1" {
+	if got := m.subagentLabel("a1", false, false); got != "a1" {
 		t.Errorf("no harvest: label = %q, want the id", got)
 	}
 	m.sessionsData = map[string]SessionMetadata{"s": {Subagents: map[string]claude.SubagentInfo{
 		"a1": {AgentType: "general-purpose", Description: "PR review (execution-first)"},
 		"a2": {AgentType: "Explore"},
 	}}}
-	if got := m.subagentLabel("a1"); got != "PR review (execution-first)" {
+	if got := m.subagentLabel("a1", false, false); got != "PR review (execution-first)" {
 		t.Errorf("label = %q, want the description", got)
 	}
-	if got := m.subagentLabel("a2"); got != "Explore" {
+	if got := m.subagentLabel("a2", false, false); got != "Explore" {
 		t.Errorf("label = %q, want the agent type", got)
 	}
 }
@@ -426,8 +428,8 @@ func TestBlocks_NoSubagentsNoBlocks(t *testing.T) {
 	if m.subagentBlocks != nil || m.headerRows != nil {
 		t.Fatal("blocks built for a session with no subagent rows")
 	}
-	if got := len(m.eventsTbl.Rows()); got != 2 {
-		t.Fatalf("rendered rows = %d, want 2", got)
+	if got := len(m.eventsTbl.Rows()); got != 1 {
+		t.Fatalf("rendered rows = %d, want 1: one exchange", got)
 	}
 }
 
@@ -522,5 +524,66 @@ func TestBlocks_RevealOpensACollapsedBlock(t *testing.T) {
 	cur := m.eventsTbl.Cursor()
 	if m.visibleRows[cur].event == nil || m.visibleRows[cur].event.Seq != 11 {
 		t.Errorf("cursor on %v, want the event with seq 11", m.visibleRows[cur].event)
+	}
+}
+
+// A Bob session (#1803): a subtask, then two parallel subagents, then a
+// header-less router call, all in the root's session. Each subagent is a
+// collapsed block labeled by its kind. The subtask is the same block, open by
+// default and labeled "subtask", at its place in time. Enter still collapses it.
+func TestEventsBlocks_BobSubagentsAndSubtask(t *testing.T) {
+	ev := func(id, sub, kind string, phase pipeline.SessionPhase) pipeline.SessionEvent {
+		return pipeline.SessionEvent{Direction: pipeline.Outbound, Phase: phase, Host: "ete",
+			RequestID: id, Subagent: sub, SubagentKind: kind}
+	}
+	req, resp := pipeline.SessionRequest, pipeline.SessionResponse
+	m := newBlockModel(t, []pipeline.SessionEvent{
+		ev("r1", "", "", req), ev("r1", "", "", resp),
+		ev("s1", "c-sub", pipeline.SubagentKindSubtask, req), ev("s1", "c-sub", pipeline.SubagentKindSubtask, resp),
+		ev("a1", "c-a", pipeline.SubagentKindSubagent, req),
+		ev("b1", "c-b", pipeline.SubagentKindSubagent, req),
+		ev("a1", "c-a", pipeline.SubagentKindSubagent, resp),
+		ev("b1", "c-b", pipeline.SubagentKindSubagent, resp),
+		ev("x1", "", "", req), ev("x1", "", "", resp),
+		ev("r2", "", "", req), ev("r2", "", "", resp),
+	})
+
+	// Rendered: r1, header(c-sub), s1, header(c-a), header(c-b), x1, r2.
+	rows := m.eventsTbl.Rows()
+	if len(rows) != 7 || len(m.headerRows) != 3 {
+		t.Fatalf("rendered rows = %d, headers = %d; want 7 and 3", len(rows), len(m.headerRows))
+	}
+	for pos, want := range map[int]string{1: "▾─ subtask c-sub", 3: "▸─ subagent c-a", 4: "▸─ subagent c-b"} {
+		if h := rows[pos][0]; !strings.HasPrefix(h, want) {
+			t.Errorf("row %d = %q, want prefix %q", pos, h, want)
+		}
+	}
+	for pos, want := range map[int]string{0: "r1", 2: "s1", 5: "x1", 6: "r2"} {
+		if e := m.visibleRows[pos].event; e == nil || e.RequestID != want {
+			t.Errorf("row %d = %+v, want %s", pos, e, want)
+		}
+	}
+	if e := m.visibleRows[5].event; e != nil && e.Subagent != "" {
+		t.Errorf("header-less row filed in block %q", e.Subagent)
+	}
+
+	m.eventsTbl.SetCursor(1)
+	if !m.toggleSubagentBlock() {
+		t.Fatal("Enter on the subtask header did not toggle")
+	}
+	if got := len(m.eventsTbl.Rows()); got != 6 || !strings.HasPrefix(m.eventsTbl.Rows()[1][0], "▸─ subtask") {
+		t.Fatalf("collapsed subtask: rows = %d, header = %q", got, m.eventsTbl.Rows()[1][0])
+	}
+	// A live tail rebuilds the table. The operator's "closed" must win over the
+	// subtask's open default.
+	m.events["s"] = append(m.events["s"], ev("s2", "c-sub", pipeline.SubagentKindSubtask, req))
+	m.rebuildEventsTable()
+	if got := len(m.eventsTbl.Rows()); got != 6 || !strings.HasPrefix(m.eventsTbl.Rows()[1][0], "▸─ subtask") {
+		t.Fatalf("subtask after a rebuild: rows = %d, header = %q; want it still collapsed", got, m.eventsTbl.Rows()[1][0])
+	}
+	m.eventsTbl.SetCursor(1)
+	m.toggleSubagentBlock()
+	if got := len(m.eventsTbl.Rows()); got != 8 {
+		t.Fatalf("re-opened subtask: rows = %d, want 8", got)
 	}
 }

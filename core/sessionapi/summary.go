@@ -13,12 +13,13 @@ import "github.com/rossoctl/cortex/core/pipeline"
 // 0.98 MiB, which is the difference between waiting seconds to open a session
 // and fetching the whole thing.
 //
-// THE RULE: a field may be dropped only if NEITHER the events table nor its
-// filter reads it. The filter is the half that is easy to forget, and forgetting
-// it is silent — a `/completion text` search simply stops matching. agentop's
-// eventHaystack and matchEventRow (cmd/agentop/tui/events_pane.go) are the source of
-// truth for that half; TestSummarizeEvent_KeepsEverythingTheFilterSearches names
-// each field they read so this cannot drift again.
+// THE RULE: a field may be dropped only if NEITHER the events table nor agentop's details
+// search reads it. The search is the half that is easy to forget, and forgetting it is silent:
+// a search for completion text simply stops matching. agentop checks the summary rows it holds
+// with detailHas (cmd/agentop/tui/search_details.go), and the search route (search.go) checks
+// only what this function drops. A field this function starts to drop must be added to the
+// route, or the search stops seeing it. TestSummarizeEvent_KeepsEverythingTheFilterSearches
+// names each field the local check reads, so this cannot drift again.
 //
 // WHAT STAYS, and why each one is not obvious:
 //   - Invocations. Timeline data, not detail data — agentop renders one row PER
@@ -72,7 +73,12 @@ func summarizeEvent(e *pipeline.SessionEvent) *pipeline.SessionEvent {
 		//
 		// AgentRole is not in this list and needs nothing: the struct copy above carries it, which
 		// is the whole difference between a scalar and the slices below.
+		// ToolCallCount joins them for a third fact that survives with none of the content:
+		// how many calls the response made. A content-free export (core/sessionexport)
+		// carries that figure, and reading len(ToolCalls) alone reported absence for every
+		// row this projection delivered — the same blanking the two counts above fixed.
 		inf.MessageCount, inf.ToolCount = len(inf.Messages), len(inf.Tools)
+		inf.ToolCallCount = len(inf.ToolCalls)
 		inf.Messages = nil
 		inf.Tools = nil
 		inf.ToolCalls = nil

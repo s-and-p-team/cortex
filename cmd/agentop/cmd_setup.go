@@ -21,7 +21,7 @@ const setupUsage = `agentop setup — install or repair Cortex on this machine, 
 
 Usage:
   agentop setup [--from DIR] [--claude-code] [--yes] [--no-service]
-                [--install-only] [--no-modify-path] [--restart]
+                [--install-only] [--no-modify-path] [--restart] [--praxis]
 
 Plans every change first and changes nothing until you agree; a failure or a
 Ctrl-C undoes what it did. Without --from it repairs what is installed.
@@ -34,6 +34,7 @@ Ctrl-C undoes what it did. Without --from it repairs what is installed.
   --install-only     install the binaries and PATH only
   --no-modify-path   never edit a shell profile
   --restart          restart the service even when nothing changed
+  --praxis           turn on praxis mode (needs cortex-gateway)
 
 Exit status: 0 done or already current, 1 failed (and rolled back) or refused
 before any change, 2 usage, 3 declined, interrupted before any change, or no
@@ -109,6 +110,7 @@ func parseSetupFlags(args []string, stderr io.Writer) (setupOptions, error) {
 	fs.BoolVar(&o.installOnly, "install-only", false, "")
 	fs.BoolVar(&o.noModifyPath, "no-modify-path", false, "")
 	fs.BoolVar(&o.restart, "restart", false, "")
+	fs.BoolVar(&o.praxis, "praxis", false, "")
 	fs.Int64Var(&o.handoffBytes, "handoff-bytes", 0, "")
 	fs.IntVar(&o.handoffSeconds, "handoff-seconds", 0, "")
 	_ = fs.Bool("local", false, "") // install.sh passes it; local is the only mode
@@ -336,7 +338,7 @@ func printSetupHeader(env *setupEnv, ui *checklist.UI) {
 
 // stopBackgroundByHand stops the background proxy proxy.pid records.
 func stopBackgroundByHand(env *setupEnv) string {
-	return "kill $(cat " + env.tilde(filepath.Join(env.cortexDir, "proxy.pid")) + ")"
+	return "kill $(cat " + env.tilde(filepath.Join(env.cortexDir, proxyPIDFile)) + ")"
 }
 
 // undoHint names the command that undoes this run: agentop uninstall, which
@@ -382,11 +384,15 @@ func printSetupEnding(env *setupEnv, ui *checklist.UI, took time.Duration) {
 	if !env.freshInstall && env.binOnPath {
 		return
 	}
-	cmd, comment := agentop, "watch your agent traffic live"
-	if !env.opts.claudeCode {
-		cmd, comment = agentop+" exec -- <cmd>", "send an agent through Cortex"
+	steps := []checklist.Step{
+		{Cmd: "claude", Comment: "start (or restart) your agent as you always do"},
+		{Cmd: agentop + " observe", Comment: "in another terminal: watch your agent traffic live"},
 	}
-	ui.Next("Open a new terminal, then:", cmd, comment)
+	if !env.opts.claudeCode {
+		steps = append([]checklist.Step{{Cmd: agentop + " configure claude-code enable",
+			Comment: "connect your agent (or opencode, codex, bob, pi)"}}, steps...)
+	}
+	ui.Next("Open a new terminal, then:", steps...)
 	ui.Blank()
 	if env.startedBackground {
 		ui.Faint("Cortex runs without a supervisor here; stop it with: " + stopBackgroundByHand(env))

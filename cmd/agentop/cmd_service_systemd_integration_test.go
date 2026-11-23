@@ -49,10 +49,10 @@ func isExitCode(err error, code int) bool {
 // don't need the same thing proved in the first place.
 //
 // That macOS test's env-var escape hatch exists because silent skipping is exactly
-// how the bootout-race bug (#880) shipped unexercised. Its own workflow never sets
-// the var, though, so the test has skipped in every CI run since it was written.
-// The one CI job that runs THIS test should set AGENTOP_SYSTEMD_TESTS=required after
-// setting up a real systemd --user session, so it can't fall into the same trap.
+// how the bootout-race bug (#880) shipped unexercised. The macOS CI job sets it
+// (AGENTOP_LAUNCHD_TESTS=required, read by requireRealLaunchd), and the one CI job
+// that runs THIS test sets AGENTOP_SYSTEMD_TESTS=required after setting up a real
+// systemd --user session, so neither platform's tests can pass by skipping.
 func requireRealSystemd(t *testing.T) {
 	t.Helper()
 	skip := t.Skipf
@@ -399,6 +399,10 @@ func TestServiceLifecycle_RealSystemd(t *testing.T) {
 	if exec.Command("systemctl", "--user", "cat", systemdUnit).Run() == nil {
 		t.Skipf("systemd already knows %s; not replacing it", systemdUnit)
 	}
+	realUpdater := filepath.Join(filepath.Dir(realUnit), updaterUnit)
+	if _, err := os.Stat(realUpdater); err == nil || exec.Command("systemctl", "--user", "cat", updaterUnit).Run() == nil {
+		t.Skipf("%s is installed or known to systemd; this test would remove it", updaterUnit)
+	}
 
 	dir := t.TempDir()
 	addr := freeLoopbackAddr(t)
@@ -421,6 +425,7 @@ func TestServiceLifecycle_RealSystemd(t *testing.T) {
 		_ = exec.Command("systemctl", "--user", "disable", "--now", systemdUnit).Run()
 		_ = exec.Command("systemctl", "--user", "reset-failed", systemdUnit).Run()
 		_ = os.Remove(realUnit)
+		_ = os.Remove(filepath.Join(filepath.Dir(realUnit), updaterUnit))
 		_ = exec.Command("systemctl", "--user", "daemon-reload").Run()
 	})
 
@@ -550,6 +555,27 @@ func TestServiceLifecycle_RealSystemd(t *testing.T) {
 	expect("restart after the start limit", code, out, 0)
 	code, out = status()
 	expect("status after recovering", code, out, 0, "Cortex is healthy according to")
+
+	// A stop of a unit systemd has given up on. systemd's own stop is a no-op on a
+	// failed unit, so before stop cleared it the unit stayed failed, only disabled,
+	// and status called the deliberate stop a crash and advised a restart.
+	if code, out := control("stop"); code != 0 {
+		t.Fatalf("stop before second crash loop: exit %d:\n%s", code, out)
+	}
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\nexit 3\n"), 0o700); err != nil { //nolint:gosec
+		t.Fatal(err)
+	}
+	_, _ = control("start")
+	if !waitUntil(limitWait, func() bool { return unit().active == "failed" }) {
+		t.Fatalf("the second crash loop did not hit the start limit within %s; systemd says %+v", limitWait, unit())
+	}
+	code, out = control("stop")
+	expect("stop of a unit systemd gave up on", code, out, 0)
+	if s := unit(); s.active != "inactive" || s.enabled != "disabled" {
+		t.Errorf("after stopping a failed unit systemd says %+v, want inactive and disabled", s)
+	}
+	code, out = status()
+	expect("status after stopping a failed unit", code, out, 0, "Cortex is stopped, and stays stopped")
 
 	code, out = run("uninstall", func(o, e io.Writer) int { return serviceUninstall(p, true, o, e) })
 	expect("uninstall", code, out, 0, "Removed.")

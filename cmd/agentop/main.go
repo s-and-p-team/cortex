@@ -21,12 +21,14 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 
 	"github.com/rossoctl/cortex/cmd/agentop/cluster"
 	"github.com/rossoctl/cortex/cmd/agentop/edit"
 	"github.com/rossoctl/cortex/cmd/agentop/tui"
+	"github.com/rossoctl/cortex/cmd/agentop/updatestatus"
 	"github.com/rossoctl/cortex/core/observe/claude"
 )
 
@@ -39,7 +41,7 @@ var version = "dev"
 // in the tree being built; empty for any other build.
 //
 // Not read from runtime/debug's VCS settings: Go recognises only a .git directory, so a build
-// in a .worktrees/ checkout, whose .git is a file, is stamped with the enclosing checkout's
+// in an in-repo worktree, whose .git is a file, is stamped with the enclosing checkout's
 // HEAD and dirty state.
 var revision string
 
@@ -69,7 +71,7 @@ func displayVersionOf(version, revision string) string {
 // The deprecated "claude-code" alias still dispatches (its case stays in main)
 // but is intentionally omitted here: it is no longer advertised in the usage
 // block or the unknown-subcommand hint. Use "configure claude-code" instead.
-var dispatchableSubcommands = []string{"observe", "setup", "doctor", "uninstall", "service", "configure", "exec", "server", "script", "tools", "pipeline", "pricing", "cost", "experimental"}
+var dispatchableSubcommands = []string{"observe", "setup", "doctor", "uninstall", "update", "service", "configure", "exec", "server", "script", "tools", "pipeline", "pricing", "cost", "export", "import", "experimental"}
 
 // unknownSubcommandMessage is the error for an unrecognised first argument.
 func unknownSubcommandMessage(name string) string {
@@ -89,10 +91,11 @@ Usage:
   agentop setup                install or repair Cortex on this machine (--help)
   agentop doctor               check this machine's Cortex install (--help)
   agentop uninstall            remove Cortex from this machine (--help)
+  agentop update               install the newest Cortex release (--help)
   agentop service <action>     run Cortex as a service: install, uninstall,
                                status, stop, start, restart
   agentop configure <agent>    point a coding agent (claude-code, bob, codex,
-                               opencode) at Cortex: enable, disable, status
+                               opencode, pi) at Cortex: enable, disable, status
   agentop exec -- CMD [ARG...] run CMD with Cortex's proxy and CA in its
                                environment, for tools with no settings file
   agentop server [<action>]    the inference server each agent's new sessions
@@ -103,6 +106,9 @@ Usage:
   agentop pipeline <action>    the plugin pipeline in effect: get
   agentop pricing              show the model rates in effect (--host <gateway>)
   agentop cost                 what your agents have spent (--window today|month|7d|1h)
+  agentop export               the archive as content-free NDJSON (--out, --session,
+                               --since)
+  agentop import               import agent transcripts into Cortex (--help)
   agentop experimental <action>
                                unstable helpers: read-claude-sessions
 
@@ -134,6 +140,10 @@ func main() {
 			os.Exit(runPricing(os.Args[2:], os.Stdout, os.Stderr))
 		case "cost":
 			os.Exit(runCost(os.Args[2:], os.Stdout, os.Stderr))
+		case "export":
+			os.Exit(runExport(os.Args[2:], os.Stdout, os.Stderr))
+		case "import":
+			os.Exit(runImport(os.Args[2:], os.Stdout, os.Stderr))
 		case "configure":
 			os.Exit(runConfigure(os.Args[2:], os.Stdout, os.Stderr))
 		case "claude-code":
@@ -167,6 +177,8 @@ func main() {
 			os.Exit(runDoctor(os.Args[2:], os.Stdout, os.Stderr))
 		case "uninstall":
 			os.Exit(runUninstall(os.Args[2:], os.Stdout, os.Stderr))
+		case "update":
+			os.Exit(runUpdate(os.Args[2:], os.Stdout, os.Stderr))
 		default:
 			fmt.Fprintln(os.Stderr, unknownSubcommandMessage(os.Args[1]))
 			os.Exit(2)
@@ -560,6 +572,7 @@ func runObserve(args []string) int {
 	// that exists for exactly that.
 	opts := tui.RunOptions{Endpoint: *endpoint, Version: displayVersion()}
 	opts.Harvest = observeHarvester(f, os.Stderr)
+	opts.UpdateFile, opts.ServiceInstall = updateNoticeInputs()
 	if prefsPath != "" {
 		opts.Save = func(s tui.UserSettings) error { return saveUserConfig(prefsPath, s) }
 	}
@@ -579,4 +592,22 @@ func runObserve(args []string) int {
 		return 1
 	}
 	return 0
+}
+
+// updateNoticeInputs gives the update status file and whether the service unit
+// exists, for the update notice on the title bar.
+func updateNoticeInputs() (file string, service bool) {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return "", false
+	}
+	file = filepath.Join(home, ".cortex", updatestatus.FileName)
+	_, path, err := localCortexConfig()
+	if err != nil {
+		path = filepath.Join(home, ".cortex", "config.yaml")
+	}
+	if sp, err := resolveServicePaths(path, "", ""); err == nil {
+		service = serviceInstalled(sp)
+	}
+	return file, service
 }

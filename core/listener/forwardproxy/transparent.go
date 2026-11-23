@@ -10,7 +10,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/rossoctl/cortex/core/attribution"
 	"github.com/rossoctl/cortex/core/listener/egressguard"
+	"github.com/rossoctl/cortex/core/listener/internal/sessionevent"
 	"github.com/rossoctl/cortex/core/pipeline"
 	"github.com/rossoctl/cortex/core/session"
 	"github.com/rossoctl/cortex/core/tlsbridge"
@@ -117,9 +119,9 @@ func (s *Server) HandleTransparentConn(clientConn net.Conn, dst string) {
 	// CLIENT-ASSERTED id — not an identity: ActiveSession() at the moment the
 	// connection is gated is the answer, and resolving it again at recording time
 	// would reopen the same flip window the other paths were fixed for, reduced to
-	// ActiveSession@T0 versus ActiveSession@T1. resolvePluginSessionID with nil
+	// ActiveSession@T0 versus ActiveSession@T1. hydrateSession with nil
 	// headers is that same resolver with nothing to read a header from.
-	sessionID := s.hydrateSession(pctx, "", nil, nil)
+	sessionID := s.hydrateSession(pctx, "", nil, nil, nil)
 
 	// Gate on host/identity before opening the tunnel — identical to the
 	// CONNECT path. Parsers see no body and degrade gracefully.
@@ -219,7 +221,41 @@ func (s *Server) HandleTransparentConn(clientConn net.Conn, dst string) {
 		enableKeepalive(upstream)
 	}
 
-	// The transparent path records before its own bridge decision for now, so it
+	// host is the policy authority: "<sniffed-SNI>:port" when a name was
+	// recovered, else dst ("<dial-IP>:port"). key is the SNI name or dial IP.
+	// Fail-closed consults no skip memory, and judges passthrough by the address
+	// the tunnel would dial, which the client cannot rename with an SNI or Host.
+	key, classifyKey := hostOnly(host), hostOnly(host)
+	var first []byte
+	if s.TLSBridge != nil {
+		// The sniff usually buffered these bytes already. A client that stalls
+		// short of five is bounded as the sniff is.
+		if pc, ok := clientConn.(*peekedConn); ok {
+			_ = pc.SetReadDeadline(time.Now().Add(sniffTimeout))
+			first, _ = pc.Peek(5)
+			_ = pc.SetReadDeadline(time.Time{})
+		}
+		if s.failClosed() {
+			classifyKey = hostOnly(dst)
+		}
+	}
+	// Fail-closed bridges or refuses what it intercepts, and records each row with
+	// its reason, as handleConnect does. A short peek is a slow client, as there:
+	// the handshake decides.
+	if s.failClosed() && s.TLSBridge.Decision.Intercepts(classifyKey, portOf(dst)) {
+		if v, _ := s.TLSBridge.Decision.Classify(classifyKey, portOf(dst), first); v != tlsbridge.Terminate && len(first) == 5 {
+			s.refuseFailClosed(clientConn, key, tl, pipeline.TunnelRefusedNonTLS, http.StatusOK, pipeline.ErrorKindNotTLS,
+				errors.New("not a TLS handshake"))
+			return
+		}
+		if upstream != nil {
+			_ = upstream.Close() // bridgeServe dials its own verified upstream
+		}
+		s.bridgeServe(clientConn, host, key, tl, dialFail != nil)
+		return
+	}
+
+	// The transparent path otherwise records before its own bridge decision, so it
 	// reports only that the tunnel opened. Threading the reason through here too
 	// means the same restructuring done for handleConnect; deliberately left for
 	// a follow-up rather than half-done, since this listener is off by default
@@ -228,15 +264,8 @@ func (s *Server) HandleTransparentConn(clientConn net.Conn, dst string) {
 	tl.open("")
 
 	if s.TLSBridge != nil {
-		// host is the policy authority: "<sniffed-SNI>:port" when a name was
-		// recovered, else dst ("<dial-IP>:port"). key is the SNI name or dial IP.
-		key := hostOnly(host)
-		var first []byte
-		if pc, ok := clientConn.(*peekedConn); ok {
-			first, _ = pc.Peek(5)
-		}
-		if !s.TLSBridge.Skip.Contains(key) {
-			v, reason := s.TLSBridge.Decision.Classify(key, portOf(dst), first)
+		if s.failClosed() || !s.TLSBridge.Skip.Contains(key) {
+			v, reason := s.TLSBridge.Decision.Classify(classifyKey, portOf(dst), first)
 			if v == tlsbridge.Terminate {
 				if upstream != nil {
 					_ = upstream.Close() // bridgeServe dials its own verified upstream; drop the pre-dial
@@ -284,7 +313,7 @@ func (s *Server) recordTunnelOpened(pctx *pipeline.Context, reason pipeline.Tunn
 	// Always record the tunnel-open so passthrough/non-bridged tunnels (no
 	// plugin activity) are still visible. For a TLS-bridged call agentop folds
 	// this CONNECT event into the decrypted inner-request row.
-	return s.appendTunnelOpen(pctx, s.tunnelOpenEvent(pctx, reason))
+	return s.appendTunnelOpen(pctx, sessionevent.TunnelOpen(pctx, reason))
 }
 
 // appendTunnelOpen records an already-built open row ev under the session a tunnel's own
@@ -303,54 +332,20 @@ func (s *Server) appendTunnelOpen(pctx *pipeline.Context, ev pipeline.SessionEve
 	// client process's answer, and so does the connection itself: a session resolved from
 	// how the connection arrived is not a knob like affinity, so its pin is honored even
 	// with affinity and process attribution both off (#1569 review).
-	var sid string
+	var pinned string
 	if s.ClientAffinity || s.processesOn() || pctx.SessionSource == pipeline.SessionSourceConnection {
-		sid = pctx.OutboundSessionID
+		pinned = pctx.OutboundSessionID
 	}
-	if sid == "" {
-		sid = s.Sessions.ActiveSession()
-	}
-	if sid == "" {
-		sid = session.DefaultSessionID
+	sid := attribution.FiledSession(pinned, s.Sessions.ActiveSession)
+	// A CONNECT that names its own session and asks not to be recorded withholds that session
+	// (#1923), but only when its row files under the session it named: by these rules the row can
+	// go to the active session instead, and a flag there would stop another session's recording.
+	// The named id is the one pinned before the gate plugins ran (NamedSession), not a re-read
+	// of pctx.Headers, which a plugin can rewrite.
+	if pctx.WithholdsSession() && sid == pctx.NamedSession() {
+		ev.NoRecord = true
 	}
 	return s.Sessions.AppendBucket(sid, ev)
-}
-
-// tunnelOpenEvent is a tunnel's open row, for recordTunnelOpened and for a bridged
-// tunnel's deferred open, which tunnelLog.deferOpen builds before any handler runs.
-func (s *Server) tunnelOpenEvent(pctx *pipeline.Context, reason pipeline.TunnelReason) pipeline.SessionEvent {
-	return pipeline.SessionEvent{
-		At:          time.Now(),
-		Direction:   pipeline.Outbound,
-		Phase:       pipeline.SessionRequest,
-		RequestID:   pctx.RequestID(),
-		Invocations: pipeline.SnapshotInvocations(pctx.Extensions.Invocations, pipeline.InvocationPhaseRequest),
-		Plugins:     pipeline.SnapshotPlugins(pctx.Extensions.Custom),
-		Identity:    pipeline.SnapshotIdentity(pctx),
-		Host:        pctx.Host,
-		// Method is CONNECT — real on a proxied CONNECT, synthetic on a
-		// transparently redirected connection — and Path is empty: the bytes
-		// are opaque, so there is no request line to read one from. A blank
-		// path on this row is the accurate answer, not a gap.
-		HTTPMethod: pctx.Method,
-		HTTPPath:   pctx.Path,
-		// Explicit opaque-tunnel marker so agentop can fold this CONNECT into
-		// the decrypted inner request without inferring "tunnel" from shape.
-		Tunnel: true,
-		// Why the bytes stayed opaque. The caller knows; this function does
-		// not, which is why it is a parameter rather than something derived
-		// here from host shape.
-		TunnelReason: reason,
-		// The address the guard checked and the tunnel dialed — set only when
-		// the egress guard is on, else absent (SessionEvent.DialAddr). On the
-		// open row, which is where a reader pairs it with the Host the client
-		// named; the close row pairs by RequestID and needs no copy.
-		DialAddr:       pctx.DialedAddr,
-		Client:         pctx.ClientInfo(),
-		Subagent:       pctx.Subagent(),
-		ParentSubagent: pctx.ParentSubagent(),
-		Proc:           pctx.AttributedProc(),
-	}
 }
 
 // recordTunnelClosed emits the SessionResponse row for a tunnel that ended, or that
@@ -375,27 +370,7 @@ func (s *Server) recordTunnelClosed(pctx *pipeline.Context, b *session.Bucket, r
 	if s.Sessions == nil {
 		return
 	}
-	s.Sessions.AppendTrailing(b, pipeline.SessionEvent{
-		At:             time.Now(),
-		Direction:      pipeline.Outbound,
-		Phase:          pipeline.SessionResponse,
-		RequestID:      pctx.RequestID(),
-		Identity:       pipeline.SnapshotIdentity(pctx),
-		Host:           pctx.Host,
-		HTTPMethod:     pctx.Method,
-		HTTPPath:       pctx.Path,
-		StatusCode:     statusCode,
-		Error:          fail,
-		Duration:       pipeline.DurationSince(pctx.StartedAt),
-		Tunnel:         true,
-		TunnelReason:   reason,
-		BytesUp:        up,
-		BytesDown:      down,
-		Client:         pctx.ClientInfo(),
-		Subagent:       pctx.Subagent(),
-		ParentSubagent: pctx.ParentSubagent(),
-		Proc:           pctx.AttributedProc(),
-	})
+	s.Sessions.AppendTrailing(b, sessionevent.TunnelClose(pctx, reason, statusCode, fail, up, down))
 }
 
 // tunnel bidirectionally copies between two connections, relaying each
@@ -408,6 +383,19 @@ func (s *Server) recordTunnelClosed(pctx *pipeline.Context, b *session.Bucket, r
 // full-closed, so a reply that keeps streaming extends the wait and finishes
 // without truncation.
 func tunnel(client, upstream net.Conn) (up, down int64) {
+	return tunnelTicked(client, upstream, newDrainTicker)
+}
+
+// drainTicker starts the ticker that drainTunnel counts idle time by.
+type drainTicker func(every time.Duration) (ticks <-chan time.Time, stop func())
+
+func newDrainTicker(every time.Duration) (<-chan time.Time, func()) {
+	t := time.NewTicker(every)
+	return t.C, t.Stop
+}
+
+// tunnelTicked is tunnel with the drain's ticker from newTicker.
+func tunnelTicked(client, upstream net.Conn, newTicker drainTicker) (up, down int64) {
 	var upBytes, downBytes atomic.Int64
 	upc := make(chan int64, 1)
 	downc := make(chan int64, 1)
@@ -423,9 +411,9 @@ func tunnel(client, upstream net.Conn) (up, down int64) {
 	}()
 	select {
 	case up = <-upc:
-		down = drainTunnel(&downBytes, downc, client, upstream)
+		down = drainTunnel(&downBytes, downc, client, upstream, newTicker)
 	case down = <-downc:
-		up = drainTunnel(&upBytes, upc, client, upstream)
+		up = drainTunnel(&upBytes, upc, client, upstream, newTicker)
 	}
 	_ = client.Close()
 	_ = upstream.Close()
@@ -435,16 +423,16 @@ func tunnel(client, upstream net.Conn) (up, down int64) {
 // drainTunnel waits for the second copy, extending the wait while bytes keep
 // flowing (seen via n). Idle for halfCloseDrainVar → full-close both ends to
 // unblock the copy, read its total, return.
-func drainTunnel(n *atomic.Int64, done <-chan int64, client, upstream net.Conn) int64 {
+func drainTunnel(n *atomic.Int64, done <-chan int64, client, upstream net.Conn, newTicker drainTicker) int64 {
 	last := n.Load()
-	tick := time.NewTicker(halfCloseDrainVar / 4)
-	defer tick.Stop()
+	ticks, stop := newTicker(halfCloseDrainVar / 4)
+	defer stop()
 	idle := time.Duration(0)
 	for {
 		select {
 		case total := <-done:
 			return total
-		case <-tick.C:
+		case <-ticks:
 			now := n.Load()
 			if now != last {
 				last, idle = now, 0

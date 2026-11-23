@@ -166,6 +166,8 @@ type LineageTelemetry struct {
 	// bgCancel stops the self_id_file poller Init starts when the file is not
 	// readable yet. Same shape as jwt-validation's audience_file poller.
 	bgCancel atomic.Pointer[context.CancelFunc]
+	// bgDone is closed when that poller returns.
+	bgDone chan struct{}
 	// exportFailures counts batches the collector refused or never received.
 	// Export is asynchronous and the dial is lazy, so this — with the WARN
 	// exportObserver logs — is how an unreachable collector or a TLS chain
@@ -209,10 +211,12 @@ func (p *LineageTelemetry) Capabilities() pipeline.PluginCapabilities {
 		// pctx.Body for the request size and the http payload,
 		// pctx.ResponseBody for the http payload — but every parser in
 		// RequiresAny declares ReadsBody, so the listener buffers them
-		// already (TestRequiredParsersBufferTheBody pins it). Declaring
-		// ReadsBody here would forbid lineage after a body-rewriting plugin,
-		// and after the rewriters is where it records the request as it was
-		// forwarded.
+		// already (TestRequiredParsersBufferTheBody pins it). A response no
+		// parser claimed is buffered on the forward proxy only for a
+		// ReadsResponseBody plugin, so its http payload is recorded only then.
+		// Declaring ReadsBody here would forbid lineage after a body-rewriting
+		// plugin, and after the rewriters is where it records the request as it
+		// was forwarded.
 		ReadsBody: false,
 		// The contract is cited major.minor only, deliberately: patch
 		// revisions (v1.5.x) clarify prose and never change span semantics,
@@ -226,7 +230,7 @@ func (p *LineageTelemetry) Configure(raw json.RawMessage) error {
 	if err != nil {
 		return err
 	}
-	// The shared bypass matcher (path.Match globs, path normalization) — the
+	// The shared bypass matcher (path.Match globs, canonical paths only) — the
 	// same package and wiring jwt-validation and sparc use for this key. It
 	// validates at boot: invalid syntax and match-everything patterns refuse
 	// to start.
@@ -385,7 +389,12 @@ func (p *LineageTelemetry) Init(ctx context.Context) error {
 		// bounds synchronous work, and the file may take longer than that.
 		bgCtx, cancel := context.WithCancel(context.Background())
 		p.bgCancel.Store(&cancel)
-		go p.awaitIdentity(bgCtx, pending, identityPollInterval)
+		done := make(chan struct{})
+		p.bgDone = done
+		go func() {
+			defer close(done)
+			p.awaitIdentity(bgCtx, pending, identityPollInterval)
+		}()
 		slog.Info("lineage-telemetry: initialized, not ready until self_id_file resolves", "endpoint", endpoint, "self_id_file", pending, "namespace", p.cfg.Namespace)
 		return nil
 	}

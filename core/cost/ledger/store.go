@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/rossoctl/cortex/core/cost/usage"
+	"github.com/rossoctl/cortex/core/model"
 )
 
 // dayLayout names a day file. Sortable, and the same layout Query parses back, so
@@ -317,9 +318,10 @@ var syncNewDayFileName = syncDir
 // BEST EFFORT BY DESIGN on the platforms where it is not a thing: opening a directory for
 // reading and fsyncing it is POSIX behaviour, and a filesystem that refuses either returns
 // an error here which the caller reports as a durability claim it cannot make. It never
-// affects whether the rows are readable.
+// affects whether the rows are readable. openDir opens the directory the way the platform
+// can flush it (syncdir_windows.go).
 func syncDir(dir string) error {
-	f, err := os.Open(dir)
+	f, err := openDir(dir)
 	if err != nil {
 		return fmt.Errorf("costledger: cannot open %s to make a new day file's name durable: %w", dir, err)
 	}
@@ -559,8 +561,15 @@ func (s *store) decodeDay(path string) ([]Row, dayIssues, error) {
 		if len(bytes.TrimSpace(b)) == 0 {
 			continue
 		}
-		var r Row
-		if derr := json.Unmarshal(b, &r); derr != nil {
+		// Source shadows Row.Source: a source of the wrong type must not drop the row and its cost.
+		var w struct {
+			Row
+			Source model.LenientString `json:"source,omitempty"`
+		}
+		derr := json.Unmarshal(b, &w)
+		r := w.Row
+		r.Source = string(w.Source)
+		if derr != nil {
 			// No offset in the message and no bytes from the line: a corrupt ledger line
 			// could contain anything, and this text reaches a log an operator pastes.
 			issues.skippedLines++
@@ -579,7 +588,8 @@ func (s *store) decodeDay(path string) ([]Row, dayIssues, error) {
 		// sanitizes then truncates, and both steps are fixed points on their own output.
 		// That is what makes doing it twice free rather than lossy.
 		//
-		// ALL FOUR, INCLUDING Provenance, which was the one left out. The write path caps every one
+		// ALL FIVE, INCLUDING Provenance, which was the one left out, and Project, a series key
+		// for group=project. The write path caps every one
 		// of them, and Provenance is the field pricedBy is reconstructed from — so a foreign file's
 		// multi-KB provenance carrying a C1 CSI escape reached a series key with nothing else
 		// checking it. It is a small closed set in this process's own output ("configured",
@@ -588,6 +598,8 @@ func (s *store) decodeDay(path string) ([]Row, dayIssues, error) {
 		// write.
 		r.Endpoint, r.Model = rowLabel(r.Endpoint), rowLabel(r.Model)
 		r.Agent, r.Provenance = rowLabel(r.Agent), rowLabel(r.Provenance)
+		r.Project, r.OwnProject = projectRowLabel(r.Project), projectRowLabel(r.OwnProject)
+		r.Source = rowLabel(r.Source)
 		out = append(out, r)
 	}
 	if serr := sc.Err(); serr != nil {
@@ -908,5 +920,7 @@ func mergeDayFiles(src, dst string) error {
 		"kept", filepath.Base(dst), "mergedFrom", filepath.Base(src),
 		"cause", "the host clock moved far enough for a day to be condemned and then written again",
 		"effect", "both sets of rows are in the surviving file; a per-minute total is the sum of what each held")
+	// Closed before the unlink: Windows will not remove a file that is still open.
+	_ = in.Close()
 	return os.Remove(src)
 }

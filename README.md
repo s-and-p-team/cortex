@@ -1,13 +1,13 @@
 # Cortex
 
 **`top` for your coding agent.** Watch every model call, tool call and dollar your
-agent spends, live — then cut the waste.
+agent spends, live.
 
 Claude Code · OpenCode · Codex · IBM Bob · Pi · any agent that can use an HTTPS proxy.
 One binary on macOS or Linux. No Kubernetes, no account.
 
 <img src="./docs/assets/cortex-demo.svg" width="100%"
-     alt="A terminal installs Cortex with one command, and a second command points Claude Code at it. Three Claude Code sessions run in separate directories, and agentop then lists all three with their token counts, cost and remaining context. Pressing $ breaks the spend down by tier, where cache reads dominate. Drilling into the busiest session shows the whole conversation and the fifteen-tool manifest it re-sends on every turn.">
+     alt="A terminal installs Cortex with one command, and a second command points Claude Code at it. Three Claude Code sessions run in separate directories. In agentop, the Timeline pane shows one session as it works: the main agent starts five subagents, their bars grow as they read files and run tools, they hand back one by one, and each row shows its tokens per second. Another session's events then list each tool call as its own row, and opening the Bash call shows its command and its test output.">
 
 ## Quick start
 
@@ -27,9 +27,16 @@ claude                                  # start (or restart) your agent as you a
 agentop observe                         # in another terminal: watch it live
 ```
 
+**Next: [Getting started](./docs/getting-started.md)**. It shows what you should see, how to read the screen, and how to undo it.
+
 Setup asks once before changing anything. If something looks wrong, `agentop doctor`
-names the fix. Can't reach rossoctl.dev? The same script is
-[in this repo](https://raw.githubusercontent.com/rossoctl/cortex/main/scripts/install.sh).
+names the fix. A service install [updates itself](./docs/laptop-service.md#automatic-updates);
+to update now, run `agentop update`. Can't reach
+rossoctl.dev? The same script is [in this repo](https://raw.githubusercontent.com/rossoctl/cortex/main/scripts/install.sh).
+
+Used your agent before Cortex? `agentop import` adds its past sessions and their
+cost from the transcripts on disk. Run `agentop import --dry-run` first to count
+them. See [Importing agent history](./cmd/agentop/README.md#importing-agent-history-agentop-import).
 
 ## What you can do with it
 
@@ -41,25 +48,25 @@ agentop observe
 agentop cost --window month --by agent
 ```
 
-**Trim 4–20% off Claude Code's prompts** (median 6% in our measurement). Cortex
-strips the tool definitions you never call.
+**See where a session's time went.** Press `T` on a session in `agentop observe`.
+The timeline shows the main agent and each subagent on one time axis: model time,
+tool time, retries, and the time the agent waited on you. It also shows each host
+that the session called, and its errors. See [Using agentop](./docs/using-agentop.md).
+
+**Switch any agent to another inference server.** Provider down, or your team
+has its own gateway? Point the agent at another server without changing the
+agent's settings: a LiteLLM gateway, a provider's API, or a model on your own
+machine.
 
 ```sh
-agentop tools scan --write ~/.cortex/config.yaml
+agentop server add work https://llm.example.com --main opus --helper haiku   # once; asks for the key
+agentop server use work --agent claude-code                                  # new sessions go there
 ```
 
-**Switch model servers without touching your agent.** Provider down, or want the
-traffic to stay local? Send new sessions to a LiteLLM gateway or Ollama. For Ollama,
-pull the model and [raise its context length](./docs/laptop-local-model.md#context-length) first.
+After the `add`, you can also switch in `agentop observe`: press `A` for the
+agents, then `S` on one.
 
-```sh
-echo ollama | agentop server add ollama http://localhost:11434 \
-  --main granite4.2:8b --helper granite4.2:8b --key-stdin   # Ollama takes any key
-agentop server use ollama --agent claude-code
-```
-
-Guides: [token savings](./docs/laptop-token-savings.md) ·
-[local models](./docs/laptop-local-model.md) · [pricing](./docs/pricing.md)
+Guides: [inference servers](./docs/inference-servers.md) · [pricing](./docs/pricing.md)
 
 ## How it works
 
@@ -113,10 +120,11 @@ The same binary also runs on a remote machine — a VM, a home server, a pod —
 
 ## Learn more
 
-[All docs](./docs/README.md) · [agentop reference](./cmd/agentop/README.md) ·
+[Getting started](./docs/getting-started.md) · [Using agentop](./docs/using-agentop.md) · [Troubleshooting](./docs/troubleshooting.md) · [All docs](./docs/README.md)
+
+[agentop reference](./cmd/agentop/README.md) ·
 [plugin catalog](./docs/plugin-catalog.md) · [script plugins](./docs/script-plugin.md) ·
-[cpex policy build](./docs/laptop-service.md#the-cpex-build) ·
-[full install guide](https://www.rossoctl.dev/docs/dev/get-started/laptop) ·
+[policy in praxis mode](./docs/praxis-policy.md) ·
 [install stats](https://rossoctl.github.io/cortex/install-stats/) (from GitHub's download counts, no telemetry)
 
 Something broke? Tell us with the **Laptop feedback** form under

@@ -58,17 +58,6 @@ func TestDecision_DefaultPortsWhenNil(t *testing.T) {
 	}
 }
 
-func TestSkipSet_AutoSkip(t *testing.T) {
-	s := NewSkipSet()
-	if s.Contains("h") {
-		t.Fatal("empty set should not contain h")
-	}
-	s.Fail("h")
-	if !s.Contains("h") {
-		t.Error("Fail then Contains failed")
-	}
-}
-
 func TestSkipSet_TTLExpires(t *testing.T) {
 	s := NewSkipSet()
 	s.ttl = 20 * time.Millisecond // same-package test can tighten the CAP
@@ -76,7 +65,10 @@ func TestSkipSet_TTLExpires(t *testing.T) {
 	if !s.Contains("h") {
 		t.Fatal("should contain immediately after Fail")
 	}
-	time.Sleep(40 * time.Millisecond)
+	if got := window(t, s, "h"); got > s.ttl {
+		t.Errorf("window %v exceeds the cap %v", got, s.ttl)
+	}
+	expireWindow(t, s, "h")
 	if s.Contains("h") {
 		t.Error("entry should have expired (self-healing re-attempt)")
 	}
@@ -130,6 +122,9 @@ func TestDefaultPassthrough_CoversTheToolsThatCannotBeConfigured(t *testing.T) {
 		// proxy.golang.org redirects module zips here; without it `go mod download`
 		// still failed on one host after every other Go host was skipped.
 		"storage.googleapis.com",
+		// The Claude Code updater's ~226MB binary: bridged, it hit the buffered
+		// response path's 10MB cap and `claude update` answered 502.
+		"downloads.claude.ai",
 	} {
 		if v, reason := d.Classify(host, 443, tlsHello); v != Passthrough || reason != "skip" {
 			t.Errorf("%s: got (%v,%q), want (Passthrough,\"skip\")", host, v, reason)
@@ -196,6 +191,21 @@ func TestDecisionOpts_ExplicitEmptyDisablesDefaults(t *testing.T) {
 	}
 }
 
+// Fail-closed intercepts the default list's hosts and still honours an explicit one.
+func TestDecisionOpts_FailClosedDropsDefaults(t *testing.T) {
+	fc := mustDecision(t, DecisionOpts{FailClosed: true})
+	if !fc.Intercepts("api.github.com", 443) {
+		t.Error("fail_closed should intercept a default passthrough host")
+	}
+	own := mustDecision(t, DecisionOpts{FailClosed: true, SkipHosts: []string{"pinned.example.com"}})
+	if own.Intercepts("pinned.example.com", 443) || !own.Intercepts("api.github.com", 443) {
+		t.Error("fail_closed should tunnel exactly the explicit list")
+	}
+	if fc.Intercepts("api.github.com", 22) {
+		t.Error("Intercepts should keep Classify's port gate")
+	}
+}
+
 // TestNewDecision_RejectsUnusablePatterns: a pattern that cannot match is a typo,
 // and ignoring it presents as "the bridge broke my tool" with nothing connecting
 // the symptom to the cause. Match-all is rejected for a different reason — it
@@ -246,6 +256,9 @@ func window(t *testing.T, s *SkipSet, host string) time.Duration {
 // time, repeatedly.
 func TestSkipSet_SucceedClears(t *testing.T) {
 	s := NewSkipSet()
+	if s.Contains("h") {
+		t.Fatal("empty set should not contain h")
+	}
 	s.Fail("h")
 	if !s.Contains("h") {
 		t.Fatal("Fail did not skip the host")
@@ -451,36 +464,14 @@ func TestSkipSet_TransientDoesNotShortenAnEarnedWindow(t *testing.T) {
 	}
 }
 
-// TestDefaultPassthrough_ClaudeCodeUpdater: the Claude Code updater fetches a
-// ~226MB binary from downloads.claude.ai, which belongs in the same category as
-// every other entry here — a developer tool pulling a large artifact that no
-// plugin can read. It is neither an inference nor a tool endpoint, so the
-// "NEVER add" rule above does not reach it.
-//
-// Bridging it was not merely wasteful: it put the download on the buffered
-// response path, where the 10MB cap answered 502 and `claude update` could not
-// succeed through the proxy at all.
-func TestDefaultPassthrough_ClaudeCodeUpdater(t *testing.T) {
-	d := mustDecision(t, DecisionOpts{}) // nil SkipHosts -> DefaultPassthroughHosts
-	tlsHello := []byte{0x16, 0x03, 0x01, 0x00, 0x05}
-	if v, reason := d.Classify("downloads.claude.ai", 443, tlsHello); v != Passthrough || reason != "skip" {
-		t.Errorf("downloads.claude.ai: got (%v,%q), want (%v,%q)", v, reason, Passthrough, "skip")
-	}
-	// The inference endpoint must stay bridged — that is where the parsers and
-	// the token accounting live.
-	if v, _ := d.Classify("api.anthropic.com", 443, tlsHello); v != Terminate {
-		t.Errorf("api.anthropic.com: got %v, want %v (must stay bridged)", v, Terminate)
-	}
-}
-
 // refuseAcrossWindows records n rejections of key, each after the window the one before
 // it earned has ended: a program refusing again when it is next tried, which is the only
-// rejection the program set counts. s's windows must be a few milliseconds for this to
-// be quick.
-func refuseAcrossWindows(s *SkipSet, key string, n int) {
+// rejection the program set counts.
+func refuseAcrossWindows(t *testing.T, s *SkipSet, key string, n int) {
+	t.Helper()
 	for i := 0; i < n; i++ {
 		if i > 0 {
-			time.Sleep(s.ttl + 5*time.Millisecond)
+			expireWindow(t, s, key)
 		}
 		s.Fail(key)
 	}
@@ -491,15 +482,14 @@ func refuseAcrossWindows(s *SkipSet, key string, n int) {
 // rejection stops the retries. The window would otherwise re-arm forever (#912).
 func TestProgramSkipSet_StopsAfterThreeRejections(t *testing.T) {
 	s := NewProgramSkipSet()
-	s.base, s.ttl = time.Millisecond, 4*time.Millisecond
 
-	refuseAcrossWindows(s, "p", 2)
-	time.Sleep(10 * time.Millisecond) // past any window two rejections earn
+	refuseAcrossWindows(t, s, "p", 2)
+	expireWindow(t, s, "p")
 	if s.Contains("p") {
 		t.Fatal("two rejections stopped the retries; three are required")
 	}
 	s.Fail("p")
-	time.Sleep(10 * time.Millisecond) // past the ceiling
+	expireWindow(t, s, "p")
 	if !s.Contains("p") {
 		t.Fatal("three rejections in a row did not stop the retries: the program will fail again when the window ends")
 	}
@@ -543,14 +533,13 @@ func TestProgramSkipSet_ABurstCountsOnce(t *testing.T) {
 // ends, where a rejection would count.
 func TestProgramSkipSet_TransientFailuresDoNotCountTowardStopping(t *testing.T) {
 	s := NewProgramSkipSet()
-	s.base, s.ttl = time.Millisecond, 4*time.Millisecond
 
 	s.Fail("p")
 	for i := 0; i < 5; i++ {
-		time.Sleep(10 * time.Millisecond)
+		expireWindow(t, s, "p")
 		s.FailTransient("p")
 	}
-	time.Sleep(10 * time.Millisecond)
+	expireWindow(t, s, "p")
 	if s.Contains("p") {
 		t.Fatal("transient failures stopped the retries")
 	}
@@ -559,15 +548,14 @@ func TestProgramSkipSet_TransientFailuresDoNotCountTowardStopping(t *testing.T) 
 // A transient failure never adds to the count, but as a program's first failure it
 // starts the count at one, so a hang-up followed by two spaced rejections stops the
 // program — one rejection sooner than three would. The program-refused row in
-// docs/laptop-service.md says so; this pins it.
+// docs/troubleshooting.md says so; this pins it.
 func TestProgramSkipSet_AHangUpFirstStartsTheCount(t *testing.T) {
 	s := NewProgramSkipSet()
-	s.base, s.ttl = time.Millisecond, 4*time.Millisecond
 
 	s.FailTransient("p")
-	time.Sleep(10 * time.Millisecond) // past the hang-up's window
-	refuseAcrossWindows(s, "p", 2)
-	time.Sleep(10 * time.Millisecond) // past the ceiling: only a stop still holds it
+	expireWindow(t, s, "p") // the hang-up's window ends
+	refuseAcrossWindows(t, s, "p", 2)
+	expireWindow(t, s, "p") // only a stop still holds it
 	if !s.Contains("p") {
 		t.Fatal("a hang-up and two spaced rejections did not stop the program")
 	}
@@ -575,9 +563,8 @@ func TestProgramSkipSet_AHangUpFirstStartsTheCount(t *testing.T) {
 
 func TestProgramSkipSet_SucceedClearsAStop(t *testing.T) {
 	s := NewProgramSkipSet()
-	s.base, s.ttl = time.Millisecond, 4*time.Millisecond
-	refuseAcrossWindows(s, "p", programStopAfter)
-	time.Sleep(10 * time.Millisecond) // past the ceiling: only a stop still holds it
+	refuseAcrossWindows(t, s, "p", programStopAfter)
+	expireWindow(t, s, "p") // only a stop still holds it
 	if !s.Contains("p") {
 		t.Fatal("precondition: the program is not stopped")
 	}
@@ -591,11 +578,10 @@ func TestProgramSkipSet_SucceedClearsAStop(t *testing.T) {
 // every client and the next one may well trust the CA.
 func TestSkipSet_HostSetNeverStops(t *testing.T) {
 	s := NewSkipSet()
-	s.base, s.ttl = time.Millisecond, 4*time.Millisecond
 	for i := 0; i < 10; i++ {
 		s.Fail("h")
 	}
-	time.Sleep(10 * time.Millisecond)
+	expireWindow(t, s, "h")
 	if s.Contains("h") {
 		t.Fatal("the host set stopped retrying; only the program set may")
 	}
@@ -606,14 +592,12 @@ func TestSkipSet_HostSetNeverStops(t *testing.T) {
 func TestSkipSet_StoppedEntriesAreEvictedLast(t *testing.T) {
 	s := NewProgramSkipSet()
 	s.max = 2
-	// The stopped entry earns a window that has ended by the time the set fills, so it
-	// is both the one expiring soonest and one the sweep would purge as expired. Left at
-	// the default windows its three rejections outlast live's one, and ordering by
-	// expiry alone would pass.
-	s.base, s.ttl = time.Millisecond, time.Millisecond
-	refuseAcrossWindows(s, "stopped", programStopAfter)
-	time.Sleep(5 * time.Millisecond)
-	s.base, s.ttl = skipBackoffBase, skipTTL
+	// The stopped entry's window has ended by the time the set fills, so it is both the
+	// one expiring soonest and one the sweep would purge as expired. With its window left
+	// open, its three rejections outlast live's one, and ordering by expiry alone would
+	// pass.
+	refuseAcrossWindows(t, s, "stopped", programStopAfter)
+	expireWindow(t, s, "stopped")
 	s.Fail("live")
 	s.Fail("newcomer") // full: one entry must go
 	if !s.Contains("stopped") {
@@ -629,14 +613,11 @@ func TestSkipSet_StoppedEntriesAreEvictedLast(t *testing.T) {
 
 func TestSkipSet_EntriesListsWhatContainsReports(t *testing.T) {
 	s := NewProgramSkipSet()
-	// Tiny windows to stop one entry across them and let another expire, then long
-	// ones so the live entry stays live for the rest of the test.
-	s.base, s.ttl = time.Millisecond, 2*time.Millisecond
-	refuseAcrossWindows(s, "stopped", programStopAfter)
+	refuseAcrossWindows(t, s, "stopped", programStopAfter)
+	expireWindow(t, s, "stopped")
 	s.Fail("expired")
-	s.base, s.ttl = time.Hour, time.Hour
+	expireWindow(t, s, "expired")
 	s.Fail("live")
-	time.Sleep(5 * time.Millisecond)
 
 	got := map[string]SkipEntry{}
 	for _, e := range s.Entries() {

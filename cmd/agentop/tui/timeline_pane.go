@@ -5,14 +5,17 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/muesli/termenv"
 
 	"github.com/rossoctl/cortex/cmd/agentop/apiclient"
+	"github.com/rossoctl/cortex/core/pipeline"
 	"github.com/rossoctl/cortex/core/session/timeline"
 )
 
@@ -30,7 +33,8 @@ import (
 const timelineRefresh = time.Second
 
 // timelineIdleRefresh is how often a live session with no new events is refetched anyway:
-// spans in flight grow and the window slides even when nothing new is recorded.
+// spans in flight grow and the window slides even when nothing new is recorded. A session with
+// a response in flight is refetched every tick instead, see openTurn.
 const timelineIdleRefresh = 10 * time.Second
 
 // timelineReadTimeout bounds one refresh. timelineFirstReadTimeout bounds the first fetch of a
@@ -76,8 +80,11 @@ type timelineState struct {
 	// it shows "all" without changing it; see window.
 	windowIdx int
 	tl        *timeline.Timeline
-	err       error
-	loading   bool
+	// tools is tl's tools by the seq of the response that asked for them, for the events
+	// table. It is set with tl, once per fetch.
+	tools   map[uint64][]toolRow
+	err     error
+	loading bool
 	// stale is set when the stream delivers an event for this session; the next tick refetches.
 	stale bool
 	// fails counts consecutive failed fetches, and retryAt is when the next may go; see
@@ -127,22 +134,59 @@ func (t *timelineState) window(now time.Time) int {
 func (m *model) openTimeline(session string) tea.Cmd {
 	m.timeline.returnPane = m.pane
 	m.pane = paneTimeline
-	if m.timeline.session != session {
-		m.timeline.tl, m.timeline.err, m.timeline.cursor, m.timeline.scroll = nil, nil, -1, 0
-		m.timeline.fails, m.timeline.retryAt = 0, time.Time{}
-	}
-	m.timeline.session = session
+	m.setTimelineSession(session)
 	return m.resumeTimeline()
 }
 
-// resumeTimeline starts one refresh chain and fetches now.
+// setTimelineSession makes session the timeline's session. A change drops what the previous
+// session loaded, and makes its in-flight reply and its tick chain stale, so neither lands on
+// the new session.
+func (m *model) setTimelineSession(session string) {
+	if m.timeline.session != session {
+		m.timeline.tl, m.timeline.tools, m.timeline.err, m.timeline.cursor, m.timeline.scroll = nil, nil, nil, -1, 0
+		m.timeline.fails, m.timeline.retryAt = 0, time.Time{}
+		m.timeline.reqSeq++
+		m.timeline.tickGen++
+		m.timeline.loading, m.timeline.stale = false, false
+	}
+	m.timeline.session = session
+}
+
+// followEventsTimeline starts the timeline fetch chain for the session the events pane shows.
+// The timeline session is then selectedSess, so it adds no #1542 retention.
+func (m *model) followEventsTimeline() tea.Cmd {
+	if m.selectedSess == "" {
+		return nil
+	}
+	m.setTimelineSession(m.selectedSess)
+	return m.resumeTimeline()
+}
+
+// timelineChainLive reports a pane that uses the timeline: the Timeline pane, or the events
+// and detail panes while the timeline follows their session.
+func (m *model) timelineChainLive() bool {
+	switch m.pane {
+	case paneTimeline:
+		return true
+	case paneEvents, paneDetail:
+		return m.selectedSess != "" && m.timeline.session == m.selectedSess
+	}
+	return false
+}
+
+// resumeTimeline starts one refresh chain and fetches now if the proxy lists the session.
 func (m *model) resumeTimeline() tea.Cmd {
 	m.timeline.tickGen++
-	return tea.Batch(m.fetchTimeline(), timelineTick(m.timeline.tickGen))
+	var fetch tea.Cmd
+	// cached-only: the proxy has no timeline for it, so a fetch only 404s
+	if m.sessionServed(m.timeline.session) {
+		fetch = m.fetchTimeline()
+	}
+	return tea.Batch(fetch, timelineTick(m.timeline.tickGen))
 }
 
 func timelineTick(gen uint64) tea.Cmd {
-	return tea.Tick(timelineRefresh, func(time.Time) tea.Msg { return timelineTickMsg{gen: gen} })
+	return tick(timelineRefresh, func(time.Time) tea.Msg { return timelineTickMsg{gen: gen} })
 }
 
 func (m *model) fetchTimeline() tea.Cmd {
@@ -182,7 +226,11 @@ func (m *model) handleTimelineLoaded(msg timelineLoadedMsg) {
 		return
 	}
 	m.timeline.tl, m.timeline.err, m.timeline.fetchedAt = msg.tl, nil, m.clock()
+	m.timeline.tools = indexTools(msg.tl)
 	m.timeline.fails, m.timeline.retryAt = 0, time.Time{}
+	if m.pane == paneEvents && m.timeline.session == m.selectedSess {
+		m.rebuildEventsTable()
+	}
 }
 
 // sessionServed reports a session the proxy lists, so it can be snapshotted and has a timeline.
@@ -196,17 +244,25 @@ func (m *model) sessionServed(id string) bool {
 }
 
 func (m *model) handleTimelineTick(msg timelineTickMsg) tea.Cmd {
-	if m.pane != paneTimeline || msg.gen != m.timeline.tickGen {
+	if !m.timelineChainLive() || msg.gen != m.timeline.tickGen {
 		return nil
 	}
 	t := &m.timeline
 	var fetch tea.Cmd
 	now := m.clock()
-	idle := !t.fetchedAt.IsZero() && now.Sub(t.fetchedAt) >= timelineIdleRefresh && m.timelineLive()
+	// A response in flight is refetched every tick: its live token estimate only a refetch
+	// grows, and the tick period is timelineRefresh. Its check must not be time-based, because
+	// fetchedAt is when the last reply arrived, one request time after the tick that fetched it:
+	// comparing against timelineRefresh would skip that next tick and halve the rate.
+	idle := m.timelineLive() && (t.openTurn() || (!t.fetchedAt.IsZero() && now.Sub(t.fetchedAt) >= timelineIdleRefresh))
 	// A failed fetch is retried on its backoff, and holds back the other triggers until then: a
 	// stream event or a live session's idle refresh would otherwise retry a dead proxy every tick.
-	retry := t.err != nil && !errors.Is(t.err, errTimelineUnsupported)
-	if waiting := !t.retryAt.IsZero() && now.Before(t.retryAt); (t.stale || idle || retry) && !waiting && !t.loading {
+	unsupported := errors.Is(t.err, errTimelineUnsupported)
+	retry := t.err != nil && !unsupported
+	// The chain outlives a list refresh that omits the session (#870); only the fetch waits.
+	served := m.sessionServed(t.session)
+	pending := t.tl == nil && t.err == nil // never fetched: resumeTimeline skipped it while unlisted
+	if waiting := !t.retryAt.IsZero() && now.Before(t.retryAt); (t.stale || idle || retry || pending) && served && !unsupported && !waiting && !t.loading {
 		fetch = m.fetchTimeline()
 	}
 	return tea.Batch(fetch, timelineTick(msg.gen))
@@ -218,6 +274,18 @@ func (m *model) handleTimelineTick(msg timelineTickMsg) tea.Cmd {
 func (m *model) timelineLive() bool {
 	t := &m.timeline
 	return t.tl != nil && m.clock().Sub(t.tl.End) <= timelineLiveFor
+}
+
+// openTurn reports a response in flight, whose live token estimate only a refetch grows. The
+// caller has checked tl is set. A lost turn is not one: its stream died, and no refetch makes
+// its estimate grow.
+func (t *timelineState) openTurn() bool {
+	for _, tu := range t.tl.Turns {
+		if tu.End == nil && !tu.Lost {
+			return true
+		}
+	}
+	return false
 }
 
 // timelineKey handles the pane's own keys; false leaves the key to the global handlers.
@@ -282,7 +350,7 @@ func (m *model) moveTimelineCursor(d int) {
 	}
 }
 
-// The label column and the right gutter, "│  1.6h    29m    316".
+// The label column and the right gutter, "│  1.6h    29m     85".
 const (
 	timelineLabelWidth  = 26
 	timelineGutterWidth = 22
@@ -330,7 +398,7 @@ func (m *model) timelineLayoutNow() (tlLayout, bool) {
 	// now is rounded to the refresh interval, so a redraw within it reuses the layout.
 	key := tlLayoutKey{tl: t.tl, window: win, cells: m.timelineCells(), from: from, now: now}
 	if key != t.layoutKey {
-		t.layout, t.layoutKey = buildTimelineLayout(t.tl, from, to, key.cells, now), key
+		t.layout, t.layoutKey = buildTimelineLayout(t.tl, from, to, key.cells, t.fetchedAt, now), key
 		// A narrower layout can leave the cursor past its end, or on what is now a gap.
 		if c := t.cursor; c >= t.layout.axis.width() || (c >= 0 && t.layout.axis.cells[c].gap) {
 			t.cursor = -1
@@ -340,9 +408,14 @@ func (m *model) timelineLayoutNow() (tlLayout, bool) {
 }
 
 // The pane's fixed lines: tabs, axis, column heads, the separator, the closing rule, the
-// legend and the cursor line. Each agent and host row takes two lines, its own and the blank
-// one that keeps a row's bars off the next row's.
-const timelineFixedLines = 7
+// legend's lines and the cursor line. Each agent and host row takes two lines, its own and the
+// blank one that keeps a row's bars off the next row's.
+const (
+	timelineFixedLines = 8
+	// timelineLegendLines is how many lines legend draws. The tok/s note has a line of its own,
+	// so it is not cut at a width where the chart itself still fits.
+	timelineLegendLines = 2
+)
 
 // tlEmptyLines is what an empty side draws in place of its rows: a note and a blank line.
 func tlEmptyLines(lay tlLayout) int {
@@ -356,14 +429,19 @@ func tlEmptyLines(lay tlLayout) int {
 	return n
 }
 
-// timelineRowBudget is how many two-line rows fit under the fixed lines and any empty side's
-// note. A body too short for the legend drops it; see renderTimeline.
-func (m *model) timelineRowBudget(lay tlLayout) int {
+// timelineFixed is the pane's fixed line count, less the legend when the body is too short for
+// it. A body too short for the legend drops it; see renderTimeline.
+func (m *model) timelineFixed(lay tlLayout) int {
 	fixed := timelineFixedLines + tlEmptyLines(lay)
 	if m.bodyHeight < timelineFixedLines+2*4 {
-		fixed-- // no legend
+		fixed -= timelineLegendLines
 	}
-	return max((m.bodyHeight-fixed)/2, 0)
+	return fixed
+}
+
+// timelineRowBudget is how many two-line rows fit under the fixed lines and any empty side's note.
+func (m *model) timelineRowBudget(lay tlLayout) int {
+	return max((m.bodyHeight-m.timelineFixed(lay))/2, 0)
 }
 
 // timelineAgentRows is how many agent rows fit, sharing the body with the host rows: hosts get
@@ -480,13 +558,13 @@ func (m *model) openEventsAtSeq(session string, seq uint64) tea.Cmd {
 		m.selectedEventKey = eventKey{}
 		delete(m.search, paneEvents)
 		delete(m.search, paneDetail)
+		m.resetDetailSearch()
 	}
 	m.selectedSess = session
 	m.pane = paneEvents
-	// Leaving the timeline pane: its session is a #1542 retention key, so the
-	// drill-down drops it the same way Esc does — the session stays watched
-	// through selectedSess, which the lines above just set.
-	m.timeline.session = ""
+	// The timeline keeps its session for the events pane's tool rows. That session is
+	// selectedSess, which the lines above just set, so it adds no #1542 retention.
+	follow := m.followEventsTimeline()
 	m.revealSeq, m.revealSess = seq, session
 	m.rebuildEventsTable()
 	revealed := m.revealPendingSeq()
@@ -494,9 +572,9 @@ func (m *model) openEventsAtSeq(session string, seq uint64) tea.Cmd {
 		if !revealed {
 			m.revealSeq, m.revealSess = 0, ""
 		}
-		return nil
+		return follow
 	}
-	return m.snapshotCmd(session)
+	return tea.Batch(m.snapshotCmd(session), follow)
 }
 
 // revealPendingSeq moves the events cursor to revealSeq if that event is on screen in its own
@@ -511,7 +589,7 @@ func (m *model) revealPendingSeq() bool {
 	// readily as the conversation's — open the block that holds the target and
 	// rebuild, then land as usual.
 	for _, ev := range m.events[m.selectedSess] {
-		if ev.Seq != m.revealSeq || ev.Subagent == "" || m.blockOpen(ev.Subagent, false) {
+		if ev.Seq != m.revealSeq || ev.Subagent == "" || m.blockOpen(ev.Subagent, ev.SubagentKind == pipeline.SubagentKindSubtask, false) {
 			continue
 		}
 		if m.subagentOpen == nil {
@@ -521,8 +599,11 @@ func (m *model) revealPendingSeq() bool {
 		m.rebuildEventsTable()
 		break
 	}
+	// Either half: the Timeline names a tool by the response that called it (#1681).
 	for i, r := range m.visibleRows {
-		if r.event != nil && r.event.Seq == m.revealSeq && eventSession(m.selectedSess, r.event) == m.selectedSess {
+		if rowHolds(r, func(e *pipeline.SessionEvent) bool {
+			return e.Seq == m.revealSeq && eventSession(m.selectedSess, e) == m.selectedSess
+		}) {
 			setCursorVisible(&m.eventsTbl, i)
 			m.selectedEventKey = keyOf(r.event)
 			m.revealSeq, m.revealSess = 0, ""
@@ -628,6 +709,9 @@ func (m *model) renderTimeline() string {
 		}
 		b.WriteString(styleMuted.Render("  loading… the last try failed, retrying"+wait+": "+t.err.Error()) + "\n")
 		return b.String()
+	case t.tl == nil && !m.sessionServed(t.session):
+		b.WriteString(styleMuted.Render("  The proxy no longer has this session, so it has no timeline.") + "\n")
+		return b.String()
 	case t.tl == nil:
 		b.WriteString(styleMuted.Render("  loading…") + "\n")
 		return b.String()
@@ -635,7 +719,7 @@ func (m *model) renderTimeline() string {
 	// The chart needs its fixed lines, any empty side's note and one row; below that, say so
 	// rather than run past the terminal.
 	lay, _ := m.timelineLayoutNow()
-	if m.bodyHeight < timelineFixedLines+tlEmptyLines(lay)+1 {
+	if m.bodyHeight < m.timelineFixed(lay)+1 {
 		b.WriteString(styleMuted.Render("  make the terminal taller to see the timeline"))
 		return b.String()
 	}
@@ -651,7 +735,7 @@ func (m *model) renderTimeline() string {
 	fmt.Fprintf(&b, "%s  %s\n", styleTitle.Render("window "+strings.Join(tabs, " ")), styleMuted.Render(m.timelineStatus(lay)))
 	width := lay.axis.width()
 	b.WriteString(strings.Repeat(" ", timelineLabelWidth) + styleMuted.Render(axisLabels(lay)) + "\n")
-	b.WriteString(strings.Repeat(" ", timelineLabelWidth+width) + styleMuted.Render("   model  tools  calls") + "\n")
+	b.WriteString(strings.Repeat(" ", timelineLabelWidth+width) + styleMuted.Render("   model  tools  tok/s") + "\n")
 
 	agentRows := m.timelineAgentRows(lay)
 	agentOff, hostOff := m.timelineOffsets(lay)
@@ -669,7 +753,7 @@ func (m *model) renderTimeline() string {
 			b.WriteString("\n")
 		}
 	}
-	b.WriteString(styleMuted.Render(strings.Repeat("╌", timelineLabelWidth+width+timelineGutterWidth)) + "\n")
+	b.WriteString(styleDim.Render(strings.Repeat("╌", timelineLabelWidth+width+timelineGutterWidth)) + "\n")
 	hostRows := m.timelineHostRows(lay, agentRows)
 	for i, r := range m.visibleHostRows(lay) {
 		b.WriteString(m.hostLine(r, lay) + "\n")
@@ -682,7 +766,7 @@ func (m *model) renderTimeline() string {
 	if len(lay.hosts) == 0 {
 		b.WriteString(styleMuted.Render("  no outbound requests in this window") + "\n\n")
 	}
-	b.WriteString(styleMuted.Render(strings.Repeat("─", timelineLabelWidth+width+timelineGutterWidth)) + "\n")
+	b.WriteString(styleDim.Render(strings.Repeat("─", timelineLabelWidth+width+timelineGutterWidth)) + "\n")
 	if m.bodyHeight >= timelineFixedLines+2*4 {
 		b.WriteString(m.legend() + "\n")
 	}
@@ -696,7 +780,8 @@ func (m *model) legend() string {
 	}
 	return sw(colorTLTool, "tools") + sw(colorTLModel, "model") + sw(colorTLRetry, "retrying") +
 		sw(colorTLSubs, "waiting on subagents") + sw(colorTLUser, "waiting on you") +
-		styleMuted.Render("┆ time cut from the axis, in its colour   ▁…█ requests in flight")
+		styleMuted.Render("┆ time cut from the axis, in its colour   ▁…█ requests in flight") + "\n" +
+		styleMuted.Render("  tok/s output per second of model time, last 60 s")
 }
 
 func (m *model) timelineStatus(lay tlLayout) string {
@@ -757,8 +842,46 @@ func axisLabels(lay tlLayout) string {
 	return strings.TrimRight(string(line[:min(len(line), w+8)]), " ")
 }
 
+// timelineLabelHarvestEvery is the shortest time between two harvests that the timeline pane
+// starts for subagents with no label.
+const timelineLabelHarvestEvery = 15 * time.Second
+
+// harvestedLabel is the description Claude Code wrote for a subagent with no spawn call on
+// the wire, or "". An agent that Claude Code's Workflow tool starts has no Agent tool call, so
+// the server can only label it "subagent <id>". Its meta file on disk holds the real label.
+func (m *model) harvestedLabel(a timeline.Agent) string {
+	if a.SpawnTool != "" {
+		return ""
+	}
+	return m.sessionsData[m.timeline.session].Subagents[a.ID].Description
+}
+
+func (m *model) timelineLabel(a timeline.Agent) string {
+	if l := m.harvestedLabel(a); l != "" {
+		return l
+	}
+	return a.Label
+}
+
+// harvestForTimeline starts a harvest when the timeline shows a subagent that has no label
+// yet. A workflow starts agents while its main transcript stays unchanged, so nothing else
+// starts a harvest during the run.
+func (m *model) harvestForTimeline() tea.Cmd {
+	if m.harvest == nil || m.harvesting || m.timeline.tl == nil || time.Since(m.lastHarvest) < timelineLabelHarvestEvery {
+		return nil
+	}
+	for _, a := range m.timeline.tl.Agents {
+		if a.SpawnTool == "" && a.ID != timeline.MainAgent && a.ID != timeline.UnseparatedAgent && m.harvestedLabel(a) == "" {
+			m.harvesting = true
+			m.lastHarvest = time.Now()
+			return harvestCmd(m.harvest)
+		}
+	}
+	return nil
+}
+
 func (m *model) agentLine(r tlAgentRow, lay tlLayout) string {
-	label := r.agent.Label
+	label := m.timelineLabel(r.agent)
 	if r.depth > 0 {
 		label = strings.Repeat("  ", r.depth) + label
 	}
@@ -779,10 +902,17 @@ func (m *model) agentLine(r tlAgentRow, lay tlLayout) string {
 		}
 		b.WriteString(m.cursorAt(c, g))
 	}
-	fmt.Fprintf(&b, "%s%s%s%s", styleMuted.Render("│"),
+	fmt.Fprintf(&b, "%s%s%s", styleDim.Render("│"),
 		lipgloss.NewStyle().Foreground(colorTLModel).Render(fmt.Sprintf("%6s", tlDuration(r.modelTime))),
-		lipgloss.NewStyle().Foreground(colorTLTool).Render(fmt.Sprintf("%7s", tlDuration(r.toolTime))),
-		styleMuted.Render(fmt.Sprintf("%7d", r.calls)))
+		lipgloss.NewStyle().Foreground(colorTLTool).Render(fmt.Sprintf("%7s", tlDuration(r.toolTime))))
+	rate, st := "", styleMuted
+	if r.hasRate {
+		rate = strconv.FormatFloat(r.tokPerSec, 'f', 0, 64)
+	}
+	if r.live {
+		st = lipgloss.NewStyle().Foreground(colorTLModel)
+	}
+	b.WriteString(st.Render(fmt.Sprintf("%7s", rate)))
 	return b.String()
 }
 
@@ -807,7 +937,7 @@ func (m *model) hostLine(r tlHostRow, lay tlLayout) string {
 		}
 		b.WriteString(m.cursorAt(c, g))
 	}
-	b.WriteString(styleMuted.Render("│" + fmt.Sprintf("%15d req", r.requests)))
+	b.WriteString(styleDim.Render("│") + styleMuted.Render(fmt.Sprintf("%15d req", r.requests)))
 	return b.String()
 }
 
@@ -815,8 +945,8 @@ func (m *model) cursorAt(c int, s string) string {
 	if c == m.timeline.cursor {
 		// Unstyled, so the cell's own reset does not undo the cursor's reverse video.
 		g := ansi.Strip(s)
-		if g == " " {
-			g = "│"
+		if g == " " && lipgloss.ColorProfile() == termenv.Ascii {
+			g = "│" // no colour drops reverse video, and this bar is then the only cursor mark
 		}
 		return styleTLCursor.Render(g)
 	}
@@ -829,7 +959,7 @@ func (m *model) cursorAt(c int, s string) string {
 func (m *model) cursorStrip(lay tlLayout) string {
 	c := m.timeline.cursor
 	if c < 0 || c >= lay.axis.width() {
-		return styleMuted.Render("▸ [←→] pick a moment: lists the tools running then, with their durations and commands")
+		return renderHints("▸ [←→] pick a moment: lists the tools running then, with their durations and commands")
 	}
 	cell := lay.axis.cells[c]
 	head := fmt.Sprintf("▸ %s  ", cell.from.Local().Format("15:04:05"))
@@ -902,11 +1032,12 @@ func (m *model) shortAgent(id string) string {
 	}
 	for _, a := range m.timeline.tl.Agents {
 		if a.ID == id {
-			l := []rune(a.Label)
+			label := m.timelineLabel(a)
+			l := []rune(label)
 			if len(l) > 14 {
 				return string(l[:13]) + "…"
 			}
-			return a.Label
+			return label
 		}
 	}
 	return id

@@ -189,7 +189,7 @@ func TestMCPParser_SkipsJSONThatIsNotJSONRPC(t *testing.T) {
 
 // A top-level JSON array is not JSON-RPC, so it is declined on shape
 // before any method check — the body here wraps a real MCP method that
-// would match isMCPMethod if it were an object.
+// would match mcp.isMCPMethod if it were an object.
 func TestMCPParser_TopLevelArray_NoMatch(t *testing.T) {
 	p := NewMCPParser()
 	pctx := &pipeline.Context{
@@ -513,7 +513,7 @@ func TestMCPParser_OnResponse_SSE_SkipsMalformedFramesUntilGoodOne(t *testing.T)
 
 // --- Configure ---
 
-// Default paths value: omitting the config gives ["/mcp"], which
+// Default paths value: omitting the config gives ["/mcp", "/mcp/"], which
 // matches the standard MCP Streamable HTTP setup. Most operators
 // won't override this.
 func TestConfigure_DefaultPaths(t *testing.T) {
@@ -521,15 +521,17 @@ func TestConfigure_DefaultPaths(t *testing.T) {
 	if err := p.Configure(nil); err != nil {
 		t.Fatalf("Configure(nil): %v", err)
 	}
-	// Probe the matcher with a body-less GET on /mcp; if the default
-	// is right, the synthetic transport extension fires.
-	pctx := &pipeline.Context{Method: "GET", Path: "/mcp", Headers: http.Header{}}
-	_ = p.OnRequest(context.Background(), pctx)
-	if pctx.Extensions.MCP == nil {
-		t.Fatal("default paths should match /mcp; MCP extension was nil")
-	}
-	if pctx.Extensions.MCP.Method != syntheticTransportStream {
-		t.Errorf("Method = %q, want %q", pctx.Extensions.MCP.Method, syntheticTransportStream)
+	// Probe the matcher with a body-less GET; if the default is right,
+	// the synthetic transport extension fires.
+	for _, path := range []string{"/mcp", "/mcp/"} {
+		pctx := &pipeline.Context{Method: "GET", Path: path, Headers: http.Header{}}
+		_ = p.OnRequest(context.Background(), pctx)
+		if pctx.Extensions.MCP == nil {
+			t.Fatalf("default paths should match %s; MCP extension was nil", path)
+		}
+		if pctx.Extensions.MCP.Method != "$transport/stream" {
+			t.Errorf("%s: Method = %q, want %q", path, pctx.Extensions.MCP.Method, "$transport/stream")
+		}
 	}
 }
 
@@ -614,8 +616,8 @@ func TestOnRequest_TransportTerminate(t *testing.T) {
 	if pctx.Extensions.MCP == nil {
 		t.Fatal("expected synthetic MCP extension")
 	}
-	if pctx.Extensions.MCP.Method != syntheticTransportTerminate {
-		t.Errorf("Method = %q, want %q", pctx.Extensions.MCP.Method, syntheticTransportTerminate)
+	if pctx.Extensions.MCP.Method != "$transport/terminate" {
+		t.Errorf("Method = %q, want %q", pctx.Extensions.MCP.Method, "$transport/terminate")
 	}
 	if pctx.Extensions.MCP.IsAction {
 		t.Error("IsAction should be false for transport terminate")
@@ -635,8 +637,8 @@ func TestOnRequest_TransportStream(t *testing.T) {
 	if pctx.Extensions.MCP == nil {
 		t.Fatal("expected synthetic MCP extension")
 	}
-	if pctx.Extensions.MCP.Method != syntheticTransportStream {
-		t.Errorf("Method = %q, want %q", pctx.Extensions.MCP.Method, syntheticTransportStream)
+	if pctx.Extensions.MCP.Method != "$transport/stream" {
+		t.Errorf("Method = %q, want %q", pctx.Extensions.MCP.Method, "$transport/stream")
 	}
 	if pctx.Extensions.MCP.IsAction {
 		t.Error("IsAction should be false for transport stream")

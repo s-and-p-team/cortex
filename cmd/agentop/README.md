@@ -1,15 +1,22 @@
 # agentop
 
-Interactive terminal UI for inspecting AuthBridge's in-memory session store.
-`agentop` connects to the [session API](../../docs/session-api.md) exposed by
-an AuthBridge sidecar (default `http://localhost:9094`, typically reached via
-`kubectl port-forward`) and lets you browse active sessions, follow a
-session's event stream live, and read individual events as pretty-printed
-JSON.
+Reference for `agentop`. For a first tour, read [Using agentop](../../docs/using-agentop.md).
+
+`agentop` works with the local Cortex on a laptop, and with an AuthBridge sidecar in a cluster.
+It reads the proxy's [session API](../../docs/session-api.md).
+It shows the sessions, the live event stream of each session, and each event as JSON.
 
 ## Install
 
-Download a prebuilt `agentop` for your platform (linux/macOS, amd64/arm64) from the
+Run the installer. It puts `agentop` and `cortex` in `~/.local/bin`:
+
+```sh
+curl -fsSL https://www.rossoctl.dev/cortex/install.sh | sh
+```
+
+[Getting started](../../docs/getting-started.md#install) tells what else the installer changes.
+
+Or download a prebuilt `agentop` for your platform (linux/macOS, amd64/arm64) from the
 [Releases page](https://github.com/rossoctl/cortex/releases) — see
 [Download prebuilt binaries](../../CONTRIBUTING.md#prebuilt-release-binaries) for the download,
 checksum-verify, and macOS quarantine steps — and drop it on your PATH.
@@ -23,10 +30,27 @@ go build .
 
 Either way you get a single binary (~10 MB; the linux build is fully static).
 
+## Updating (`agentop update`)
+
+`agentop update` installs the newest release at once.
+[Automatic updates](../../docs/laptop-service.md#automatic-updates) tells how a service
+install updates itself.
+
+`--auto` is what the updater runs. It implies `--yes` and never asks.
+
+The title bar shows one of these notices. When more than one applies, it shows the first:
+
+1. `· updated to vX.Y.Z, restart agentop`
+2. `· update to vX.Y.Z failed, see agentop doctor`
+3. `· vX.Y.Z available`: only when vX.Y.Z is newer than the installed release or
+   release candidate. A `dev` or `main` build shows no notice.
+4. `· no update check since <date>`: service installs only, after 72 hours with no check.
+
 ## Run
 
-`agentop observe` discovers AuthBridge agents in your current `kubectl`
-context and lets you pick one:
+`agentop observe` connects to the Cortex on this machine. With no local Cortex, it opens
+a picker of the AuthBridge agents in your current `kubectl` context. See
+[Choosing between a cluster and a local Cortex](#choosing-between-a-cluster-and-a-local-cortex---kubernetes):
 
 ```sh
 ./agentop observe
@@ -48,15 +72,6 @@ session content it is displaying. Requests carrying a browser `Origin`, or a
 `Host` other than `localhost` / `127.0.0.1` / `::1`, are refused — and so is a
 bind that does not land on loopback (`:47603`, `0.0.0.0:47603`), since those
 guards stop browsers, not a curl that names a loopback `Host`.
-
-You'll see a Namespaces pane listing each namespace that contains an
-AuthBridge agent. Enter drills into the Pods pane for that namespace;
-Enter on a pod starts a `kubectl port-forward` automatically and drops
-you into the session-events view. Esc backs out. `q` (or Ctrl+C) quits
-and tears the port-forward down.
-
-The picker shells out to `kubectl` — whatever context you're in is the
-context agentop uses. There's no separate auth.
 
 ### Connecting to an existing port-forward
 
@@ -128,6 +143,15 @@ wins. Resolution in full:
 | — | yes | absent (default) | the local Cortex |
 | — | yes | passed | Namespaces picker |
 | — | no | either | Namespaces picker |
+
+You'll see a Namespaces pane listing each namespace that contains an
+AuthBridge agent. Enter drills into the Pods pane for that namespace;
+Enter on a pod starts a `kubectl port-forward` automatically and drops
+you into the session-events view. Esc backs out. `q` (or Ctrl+C) quits
+and tears the port-forward down.
+
+The picker shells out to `kubectl` — whatever context you're in is the
+context agentop uses. There's no separate auth.
 
 ### Naming sessions from Claude Code (`--skip-claude-metadata`)
 
@@ -208,568 +232,14 @@ session still gets whatever title was found before the stop, which may be an old
 the background scan has nowhere to say so once the viewer owns the screen — so re-run the
 subcommand if a title looks wrong.
 
-## Which harnesses are wired into Cortex (`agentop configure status`)
-
-Each section below covers one harness. To see all of them at once — without running
-five `agentop configure <harness> status` commands and comparing five different output
-shapes — run it with no harness name:
-
-```console
-$ agentop configure status
-HARNESS       STATUS        DETAIL
-claude-code   enabled       ~/.claude/settings.json
-bob           uncertain     editor: ~/Library/.../IBM Bob/User does not exist, so IBM Bob has not run here; shell: CORTEX_BOBSHELL is unset in this shell
-opencode      uncertain     opencode not found on PATH or in ~/.opencode/bin
-codex         not enabled   no Cortex values in ~/.codex/.env
-pi            not enabled   extension: missing; shell: no pi function in ~/.zshrc
-
-For the detail on one of them: agentop configure <harness> status
-```
-
-Four verdicts, not two, because a boolean would be a lie for several of these:
-
-| STATUS | Means |
-|---|---|
-| `enabled` | Fully routed through Cortex, by that harness's own definition of fully. |
-| `not enabled` | agentop looked and the harness is not routed — a place to look, and nothing in it. |
-| `partly enabled` | Some of it is in place: N of M keys set, or a value pointing at a loopback proxy that is not this machine's Cortex. `enable` has something left to do. |
-| `uncertain` | agentop could not establish an answer — a file it cannot read or parse, a key defined twice, or no configuration to read at all (bob with no settings directory, opencode with no binary). |
-
-The distinction that matters is `uncertain` against `not enabled`: the first is "I
-could not tell", the second is a finding. The table takes no flags — the per-harness
-overrides (`--settings`, `--env`, `--config`, `--opencode`) do not compose into one
-flag set, and anyone who needs a non-default path wants one harness's `status`, which
-already takes it. Exit status is 0 whatever the rows say.
-
-## Running one command through Cortex (`agentop exec`)
-
-`agentop exec -- <command>` scopes Cortex routing to a single child process:
-the nine proxy/CA variables in its environment, nothing written anywhere.
-
-```sh
-agentop exec -- curl -sv https://api.anthropic.com/v1/messages
-agentop exec -- claude --dangerously-skip-permissions
-agentop exec --print              # the nine variables as export lines, runs nothing
-```
-
-It exits with the child's status, relays signals aimed at agentop to the child,
-and requires an enabled TLS bridge. The full contract — which variable gets
-which CA file and why, `--print`'s rules, what happens before Cortex's first
-start — is in [any-agent.md](../../docs/agents/any-agent.md).
-
-## Typing `bob` instead of `agentop exec -- bob` (the shell half of `agentop configure bob`)
-
-`agentop exec -- bob` routes one invocation. `agentop configure bob enable`
-makes that the meaning of `bob` in every new shell, by appending a delimited
-block to your rc file — the same command configures the editor above, and does
-both:
-
-```sh
-# >>> cortex agentop (bobshell) >>>
-bob() {
-  agentop exec -- bob "$@"
-}
-export CORTEX_BOBSHELL=1
-# <<< cortex agentop (bobshell) <<<
-```
-
-```sh
-agentop configure bob enable    # append the block (and set the editor's proxy)
-agentop configure bob disable   # remove exactly that block (and the editor's key)
-agentop configure bob status    # the verdict, then one line per half
-```
-
-Both `enable` and `disable` ask before writing, and `--yes` skips the question:
-
-```sh
-agentop configure bob enable --yes    # no prompt
-```
-
-With no terminal to ask on — CI, a container, a Dockerfile `RUN` — they decline
-rather than prompt, print `Re-run with --yes to apply`, write nothing and exit
-**3**. Not 0: a decline is not a failure, but it is also not an applied change,
-and 3 is what lets an unattended caller tell the two apart — the same code
-`configure claude-code` and `service` return when they are declined. An
-unattended caller that omits `--yes` is still a no-op; it is just no longer a
-silent one. Scripted callers should pass `--yes`.
-
-Bob is one agent with two faces, and `configure bob` configures both: the IBM Bob
-**editor** — a VS Code fork, so the lever is `http.proxy` in its `settings.json`
-(above) — and the **shell integration**, a `bob` function in your rc file so
-typing `bob` at a prompt runs through Cortex. Both halves' changes are listed
-under ONE preview and confirmed by ONE prompt, and a write failure in one half
-does not stop the other; a declined prompt declines both.
-
-The two were separate commands (`configure bob` and `configure bobshell`) until
-2026-10-15, when the agent converged on one name and one row in `agentop
-observe`; `bobshell` is no longer a command. The editor half briefly did not
-exist at all before that — it was removed on the reasoning that "IBM Bob itself
-needs no configuring", which was right about the binary and wrong about the
-editor.
-
-Let `enable` write it rather than pasting the block above. What `enable` appends
-begins with a blank line, which the fence cannot show you: it is invisible when
-rendered, and formatters strip a leading blank line inside a fence anyway. That
-newline is part of the block rather than something added to your content, so the
-block starts on a line of its own even after a file whose last line has no
-newline of its own, and `disable` takes the separator away with the rest of it.
-Paste the fence's text verbatim at the top of a file and `disable` will report a
-block "edited since it was written" and decline — it matches the whole constant,
-leading newline included. It declines rather than guessing, so nothing is lost,
-but the block is then yours to remove by hand.
-
-Letting `enable` write it is also why nothing else in the file is touched and the
-file comes back byte-for-byte — a round-trip test asserts exactly that,
-including on a file with no trailing newline, so the two halves cannot drift
-apart.
-Run `enable` twice and the second run is a no-op. If the block is there but
-hand-edited, or there twice over, both verbs decline and say so rather than
-guess which copy you meant.
-
-A shell function, not an alias: bash does not expand aliases in
-non-interactive shells unless `expand_aliases` is set, and `"$@"` forwards
-arguments explicitly, so `bob "two words"` stays one argument.
-
-It cannot recurse into itself, which is why there is no machinery to resolve
-the real binary past the function. `agentop exec` runs the `bob` binary as a child
-process, and that process never reads your rc file, so the `bob` inside the body
-is always the one on `PATH`.
-
-### Which file it writes
-
-The basename of `$SHELL` picks it, and only these two:
-
-| `$SHELL` | File |
-|---|---|
-| …`/zsh` | `~/.zshrc` |
-| …`/bash` | `~/.bashrc` |
-| anything else, or unset | nothing is written — `enable` prints the block for you to place, `disable` tells you which block to delete |
-
-That is the whole rule. `agentop` does not work out whether your shell will be a
-login or a non-login shell, or which of zsh's four startup files you meant,
-because being wrong about it writes a block into a file nothing reads and
-leaves you with no reason to look there.
-
-**bash on macOS is the case to know about.** Terminal.app starts bash as a
-*login* shell, which reads `~/.bash_profile` and not `~/.bashrc`. If the
-function does not appear in a new window, either source `~/.bashrc` from
-`~/.bash_profile` — the usual arrangement — or move the block there yourself.
-`enable` always prints the path it wrote, so you can see where it went.
-
-### Symlinks
-
-A `~/.zshrc` symlinked into a dotfiles repo is followed, and the block lands in
-the real file: writing the link itself would replace it with a regular file and
-silently detach it from the repo, leaving the tracked copy stale with nothing
-in `git status` to show it. Two or more links deep, or a dangling link, and
-both verbs decline to write — a chain that long is somebody's deliberate
-arrangement, and a write through it is more likely to surprise than to help.
-
-What they print instead follows the verb, as it does for an unrecognised
-`$SHELL`: `enable` gives you the block to paste, and `disable` names the markers
-to delete between, because you already have the block — it is in your file — and
-printing it at someone removing the integration reads as an instruction to put
-it back.
-
-The write is temp-file-then-rename, so a failure part way through leaves your
-rc file as it was rather than half-written. An existing file keeps its own
-permissions; a new one is created `0644`.
-
-### What `status` does and does not know
-
-It reports whether `CORTEX_BOBSHELL` is set in the environment, and it reads no
-files. So it says `not enabled` in the very shell that just ran `enable`, until
-you open a new terminal or source the file — recognising the block inside a
-startup script would mean parsing shell, which is the thing this command
-deliberately does not do.
-
-What the variable proves is narrower than "`bob` is routed", which is why the
-report separates the two. The variable is exported, so every child process inherits
-it — including a **non-interactive** subshell or a script, which does not read
-your startup file and therefore has no `bob` function at all. There, `bob` is the
-plain binary and Cortex is not in the path of the call, while the variable still
-says `1`. `status` cannot tell the two apart: the shell's function table lives in
-that shell's memory and is never exported, so `agentop`, as a child process, cannot
-see it. To settle it in a particular shell, ask that shell: `type bob` says
-`bob is a function` when the function is live, and names a file when it is not.
-
-Use `type`, not `which`. In bash, `which` is `/usr/bin/which` — a separate
-process, which cannot see its parent shell's functions, so with the function live
-it reports the `bob` binary's path and looks like a definitive "not routed". zsh's
-`which` is a builtin and does report the function, so the wrong advice works in
-one of the two shells this writes a file for. `type` is a shell builtin in sh,
-bash, zsh and dash alike. (`mise doctor` splits `activated:` from
-`shims_on_path:` for the same reason.)
-
-Both answers exit 0: "not enabled" is a report, not a failure.
-
-## Routing the IBM Bob editor through Cortex (`agentop configure bob`)
-
-This is the editor half of `configure bob`; the shell half has its own section
-below. IBM Bob is a VS Code fork, so it reads the VS Code proxy setting. `agentop
-configure bob enable` writes it as a flat, top-level key in Bob's user settings,
-and on macOS one more key beside it:
-```json
-{
-  "http.proxy": "http://127.0.0.1:47600",
-  "http.systemCertificates": false
-}
-```
-
-Flat and dotted, not nested under an `"http"` object — that is the shape VS Code
-reads, and the shape difference from `configure claude-code`, which writes a
-nested `"env"` block. The address is read from `listener.forward_proxy_addr` in
-`~/.cortex/config.yaml` on every run, so a moved port or an IPv6 loopback
-produces the right value rather than a hardcoded 47600.
-
-Nothing else in the file changes, and that is meant literally: the keys are spliced
-into the existing bytes rather than re-serialized from a parsed document, so your
-key order, your indent width, your inline arrays and your blank lines between
-groups all survive untouched. A settings.json is hand-curated and often lives in
-a dotfiles repo, where a diff that alphabetizes and reflows the whole file is
-worse than the setting is worth. `disable` takes the lines back out the same way,
-so enable-then-disable returns the file byte-for-byte.
-
-```sh
-agentop configure bob enable      # write the settings (and, on macOS, the shell block)
-agentop configure bob disable     # remove what enable wrote
-agentop configure bob status      # report, and act on nothing
-```
-
-`enable` and `disable` show every change and ask once before writing, keep a
-`.bak` of the settings file as it was first found, and take `--yes` for unattended
-use. Declined — or with no terminal to ask on — they write nothing and exit **3**,
-the same convention as `configure claude-code`. `--settings
-PATH` and `--config PATH` override either file. Restart Bob afterwards: whether
-it re-reads a proxy change live is unverified, so the message says restart rather
-than guess.
-### Trusting Cortex's CA without the keychain (macOS)
-
-The proxy terminates TLS with a forged leaf, so Bob has to trust Cortex's bridge
-CA or Cortex cannot read its requests. Bob's model calls leave from its extension
-host's `fetch`, which is Node, and Node trusts `NODE_EXTRA_CA_CERTS` — but VS
-Code's proxy layer hands that `fetch` an explicit CA list (Node's bundled roots
-plus the keychain) whenever `http.systemCertificates` is on, and an explicit list
-*replaces* Node's default store, dropping `NODE_EXTRA_CA_CERTS` with it. So on
-macOS `enable` makes two changes, and neither touches the keychain:
-
-- **`"http.systemCertificates": false`**, which leaves `fetch` on Node's default
-  store. `enable` adds it only when the key is absent, and records that it did in
-  `~/.cortex/bob-state.json`; a `true`, or any value you chose, is refused rather
-  than overwritten. `disable` removes it only when that record says agentop added
-  it and it is still `false`, so a `false` you set yourself is never taken out.
-- **A block in your shell's rc file** that exports `NODE_EXTRA_CA_CERTS` for IBM
-  Bob only. Started from the Dock or Spotlight, Bob has no terminal to inherit
-  from, so it runs your login shell once (`$SHELL -i -l -c`) with
-  `VSCODE_RESOLVING_ENVIRONMENT=1` set and copies that shell's environment into
-  its extension host. The block tests that variable *and* Bob's bundle id, so a
-  terminal, or another VS Code fork resolving its own environment, never sees it:
-
-  ```sh
-  # >>> cortex agentop (bob) >>>
-  # IBM Bob reads this when it starts from the Dock or Spotlight, so it trusts Cortex.
-  if [ "$VSCODE_RESOLVING_ENVIRONMENT" = 1 ] && [ "$__CFBundleIdentifier" = com.ibm.software.bob ]; then
-    export NODE_EXTRA_CA_CERTS=/Users/you/.cortex/ca/ca.crt
-  fi
-  # <<< cortex agentop (bob) <<<
-  ```
-
-  The file, and every rule for editing it, is the shell half of `configure
-  bob`'s: `~/.zshrc` for zsh, `~/.bashrc` for bash, followed through one symlink,
-  written atomically, and removed by `disable` only when it is exactly what
-  `enable` wrote. Any other shell, a dangling link, or a deeper chain gets the
-  block printed to place yourself.
-
-A block in a file your login shell never reads fails silently — Bob just goes back
-to being passed through unread — so `enable` then starts your shell the way Bob
-does and says what it found. The usual miss is bash: its login shell reads
-`~/.bash_profile`, not `~/.bashrc`, and the fix is to source one from the other.
-`status` reports both changes from the files alone and runs nothing.
-
-Quit Bob and reopen it from the Dock or Spotlight afterwards. A Bob started from a
-terminal (`bobide`) takes that terminal's environment instead and never runs the
-block.
-
-The cost of `http.systemCertificates: false` is that Bob's extensions stop reading
-the keychain. Everything Cortex decrypts is unaffected — Cortex presents its own
-certificate — but a host Cortex passes through unread whose certificate chains to
-a root trusted *only* in the keychain (some company-internal CAs) fails from Bob's
-extensions. Bob's own UI and webviews are Chromium, trust only the keychain, and
-are not affected by any of this: they stay passed through unread.
-
-Earlier versions of `enable` printed a `sudo security add-trusted-cert` command
-for the System keychain instead. `disable` still prints its undo — two commands,
-because `delete-certificate` alone leaves the admin-domain trust settings the add
-wrote:
-
-```sh
-sudo security remove-trusted-cert -d ~/.cortex/ca/ca.crt
-sudo security delete-certificate -c authbridge-tls-bridge-ca \
-  -t /Library/Keychains/System.keychain
-```
-
-Off macOS, `enable` prints how to add `ca.crt` to the system trust store — the
-usual Debian and Fedora routes, saying plainly that the step depends on the
-distribution — because that needs `sudo` and agentop does not escalate on its own.
-It is `ca.crt`, the single bridge CA, and deliberately **not** the `bundle.crt`
-beside it, which holds every platform root as well.
-
-### What it knows, and what it does not
-
-"Enabled" means the value's **host and port both match** `listener.forward_proxy_addr`
-from `~/.cortex/config.yaml` — the address this machine's Cortex actually listens
-on, not a port range. Compared whole via `url.Parse`, so neither a path
-(`http://corp.example.com/?next=127.0.0.1:47600`) nor a suffixed host
-(`localhost:47600.evil.com`) can pass as ours; only `http` counts, since it is the
-only scheme `enable` writes. The loopback spellings are folded together
-(`localhost` / `127.0.0.1` / `::1`) because `forward_proxy_addr` may bind `0.0.0.0`
-while the settings file names `127.0.0.1`, and a hand-typed address must not be
-called someone else's proxy.
-
-That is not a record agentop keeps: ownership of `http.proxy` is re-decided from
-the value each time. `http.systemCertificates` is the exception — see below.
-
-Ownership has three answers, not two. A value that matches is **ours**; a
-corporate proxy, or a non-string value, is **not ours** and is left alone by both
-verbs. The third is **cannot tell**: when there is no address to compare against
-— the config is missing or unreadable — any loopback `http` proxy could be this
-one, and a bool would have to guess. Guessing "not ours" toward a `delete` is the
-dangerous direction, so it is not a bool. `status` reports "cannot tell" in those
-words rather than ruling on it. `disable` asks before removing such a value and
-refuses under `--yes`, since `--yes` means "do not ask me", not "decide for me".
-`enable` refuses rather than overwriting anything it does not own. Either verb
-prints exactly what it will do to the file, and what it will leave beside it,
-before it does it.
-
-**Whether anything is listening is a separate question**, reported on its own
-line. A stopped Cortex is the normal state of a laptop and is not a verdict on the
-setting: the setting is right either way, and the answer to "nothing is listening"
-is `agentop service start`, not an edit here.
-
-`http.proxy` governs VS Code's core networking and its extension host. An
-extension that bundles its own HTTP client can still go around it; this is the
-documented lever, not a guarantee of coverage.
-
-A settings file with comments in it is refused, not rewritten. VS Code permits
-them; the strict JSON reader here does not, and silently stripping a user's
-comments to add one key is the wrong trade.
-
-A missing `settings.json` is normal. Bob writes the file only the first time a
-setting changes, so a Bob still on its defaults has none. What says Bob has run is
-its `User` directory, which it creates on first launch: with the directory there,
-`enable` creates the file and `status` reports Bob as not configured. With the
-directory missing too — a `--settings` typo, or the wrong machine — `enable`
-refuses and names the flag, and `status` reports the Cortex status as unknown. A
-file holding only `null` is refused the same way. `disable` never fails on any of
-these: there is simply nothing to remove from that file.
-
-Only macOS's settings location is known (`~/Library/Application Support/IBM
-Bob/User/settings.json`). Elsewhere `--settings PATH` is required rather than
-guessed — writing a proxy setting into a file nothing reads is a silent no-op,
-which is worse than a refusal that names the flag.
-
-The full guide — both halves, the CA-trust flow, the record files, verified
-depth, known issues — is in [bob.md](../../docs/agents/bob.md).
-
-## Routing OpenCode through Cortex (`agentop configure opencode`)
-
-```sh
-agentop configure opencode enable    # set the nine variables in the service's environment
-agentop configure opencode disable   # remove them again
-agentop configure opencode status    # the nine, and the running service
-```
-
-OpenCode's traffic leaves from a per-user background service, `opencode serve
---service`, whose own environment `enable` edits through the OpenCode CLI.
-`enable` and `disable` take `[--yes] [--config PATH] [--opencode BIN]`; `status`
-takes `[--config PATH] [--opencode BIN]`. Changing the service's environment
-restarts it, which interrupts every OpenCode session using it — the commands
-say so and ask first. A restart that fails is reported: the service may be
-stopped, or running with its old environment, and `opencode service restart`
-applies the change. Everything else — undo by hand, CA trust, the record
-file, verified depth, known issues — is in
-[opencode.md](../../docs/agents/opencode.md).
-
-## Routing Pi through Cortex (`agentop configure pi`)
-
-```sh
-agentop configure pi enable    # a pi shell function, plus Pi's session extension
-agentop configure pi disable   # remove both
-agentop configure pi status    # which of the two is in place
-```
-
-The shell function runs `agentop exec -- pi`, because Pi reads the bridge CA only
-from `NODE_EXTRA_CA_CERTS` at startup. The extension,
-`~/.pi/agent/extensions/cortex-session.ts`, sends Pi's session id as `x-session-id`,
-which Pi does not send on its own. `enable` and `disable` take `[--yes]`. Both
-pieces are fixed text, so a file or block agentop did not write is left alone and
-reported. Everything else is in [pi.md](../../docs/agents/pi.md).
-
-## Installing a bundled script plugin (`agentop script`)
-
-Cortex ships some [script plugins](../../docs/script-plugin.md#bundled-scripts)
-inside agentop. `agentop script` installs one in a single step:
-
-    agentop script list                  every bundled plugin and its state
-    agentop script install <name>        copy it and add its slot
-    agentop script remove <name>         take both back out
-
-- **`install`** copies the plugin's folder to `~/.cortex/plugins/<name>/` and
-  adds a `script` slot for it to `~/.cortex/config.yaml`. It then waits for
-  Cortex to load the slot and checks every script in it started. If one did not,
-  it takes back what it added and says why.
-- **Run again,** it updates a copy from an earlier release and leaves a current
-  one alone. A copy you edited is refused: `remove` it first.
-- **`remove`** refuses a folder holding a file `install` did not write.
-- **`list --json`** is for other programs, such as moca. Its fields are `name`,
-  `description`, `state`, `failClosed`, `scripts` and, with Cortex running,
-  `loaded` and `notStarted`.
-
-`--config PATH` names another Cortex config, as for `agentop server`.
-
-## Choosing an inference server (`agentop server`)
-
-With several inference servers — LiteLLM gateways or local model servers — each
-with its own URL and key, `agentop server`
-chooses which one an agent's **new** sessions use, through the
-[`inference-router`](../../docs/plugin-catalog.md#inference-router) plugin. A
-session stays on the server it started on, including one already running when its
-agent is first routed, until you move it with `agentop server move` or `S` on the
-sessions pane. Routing is opt-in per agent: until an agent is given
-a server, its traffic goes where the agent sends it. Once it is given one, its
-inference goes to that server wherever the agent addressed it — Anthropic,
-OpenCode Zen, Bob's gateway, or another server — so the agent needs no setting of
-its own beyond going through Cortex.
-
-```sh
-agentop server add ete https://ete-litellm.example.com     --main opus --helper haiku                            # asks for the key; it does not echo
-agentop server add glm https://glm-litellm.example.com     --main glm --helper nemotron
-agentop server use glm --agent opencode                   # new opencode sessions → glm
-agentop server move <session-id> glm                      # move one running session → glm
-agentop server                                            # the servers, their models, their agents
-agentop server reset --agent opencode                     # stop routing opencode
-agentop server remove glm                                 # refused while an agent uses it
-```
-
-In the TUI, `S` on the agents pane does what `use` and `reset` do, for an agent
-the pane lists; see [Choosing an agent's server](#choosing-an-agents-server-s).
-On the sessions pane, `S` moves the highlighted session to a server (or to its own
-provider), confirming what the move costs first: the session's context is re-sent
-uncached on its first turn at the new server. A `server move` from the shell also
-prunes the config's `sessions:` entries for sessions that are neither live nor
-archived; the TUI's move does not.
-
-The listing after `use` reads:
-
-```
-  ete   ete-litellm.example.com   main opus → aws/claude-opus-5-5 · helper haiku → aws/claude-haiku-4-5
-  glm   glm-litellm.example.com   main glm → rits/zai-org/glm-5-3 · helper nemotron → rits/nvidia/nemotron-3   opencode
-```
-
-**Models.** A routed request goes with the model the agent asked for, so an agent
-keeps choosing its own models wherever the server serves them. Only when the
-server refuses the name is the
-request sent again, once and before the agent sees the refusal, with one of the
-server's own models: the one `--main` names for a request with tools, the agent's
-main work, and the one `--helper` names for a request without, such as a title.
-Each is a word, not a full name: the newest model on the server's list whose name
-contains it, so a newer model the server adds is used without an edit. The
-refusal is believed for an hour, and a session keeps the model it was given.
-
-- **`add <name> <url> --main <word> --helper <word>`** reads the key at a prompt
-  that does not echo, or from stdin with `--key-stdin`, which is refused when
-  stdin is a terminal, where the key would echo as typed. It is never an argument,
-  so it never reaches shell history. It then reads the server's model list with
-  that key and refuses a word that names none of its models, listing them, so a
-  wrong URL or key is caught here; it prints what each word names now. A name that
-  exists is replaced only after a yes (`--yes` skips the question), which is how a
-  key is rotated; with no terminal to ask on, nothing is written. A server on a
-  host another server already has, on any port, is refused, except on a loopback
-  host such as `localhost`, where each port is a host of its own. The first `add`
-  creates the plugin's entry, last in the outbound pipeline. A key or a word
-  containing `$` is refused: the config loader would read it as an environment
-  variable.
-- **`use <name> --agent <agent>`** routes the agent's new sessions to the server,
-  including an agent that has not run yet. **`reset --agent <agent>`** stops
-  routing it. Either way a session already running stays where it is: its pin holds
-  it, kept in `~/.cortex/plugin-state.json` so a proxy restart forgets none.
-  **`move <session-id> <name>`** moves one running session; `own` sends it back to
-  its agent's own provider.
-- **`remove <name>`** refuses while an agent is routed to the server, and names
-  the command that takes the agent off it; it also refuses the last server. A
-  session that started on a removed server gets a 503 asking for a new session
-  until the server is added back or the session is moved. So when
-  sessions the proxy is running last sent their inference to the server, `remove`
-  warns how many before it goes ahead. It leaves
-  out the default and `pending:` buckets, which the router never pins.
-- **`agentop server`** lists each server's host (its whole URL when it is plain
-  `http`), what its main and helper words name on its list now, read with its own
-  key, and the agents routed to it. A server whose list cannot be read shows its
-  words and why. When the router's entry has `on_error: observe`, which records
-  what it would route and routes nothing, or `on_error: off`, which stops it
-  running, the listing says so first, and `use` and `add` say so too.
-
-The router routes only requests it can read: a plain `http` request sent through
-the proxy, or an `https` one the TLS bridge decrypts, which needs the bridge on
-and the port the agent connects to in `tls_bridge.ports`, 443 and 8443 unless set.
-An agent whose provider is `https` on another port, such as `:4000`, reaches the
-proxy as an opaque `CONNECT` tunnel and is never routed.
-
-Every change is written to `~/.cortex/config.yaml`, keeping its comments except
-those on the lines the change replaces or removes, every line of a removed block
-among them, and returns once the proxy has reloaded it; nothing restarts. If the
-proxy refuses the reload, the command puts the file back as it was, prints the
-proxy's error and exits 1, and the proxy keeps the configuration it had. If the
-proxy stops answering before it reports the reload, the command puts the file back
-the same way, says the proxy stopped answering, and exits 1. A file someone edited
-while the proxy was reloading is not put back but left as found, with an error
-saying so. If the proxy reports neither a reload nor a refusal within 30 seconds,
-the command exits 1 and leaves the file as written. With no proxy running the file is still written, and the change applies at
-the next start. Nothing is written unless the result loads as a Cortex config and
-passes the router's own rules; what only the running proxy can check, such as
-whether its build includes the router, is what a refused reload reports. A change
-that changes nothing writes nothing. `--config PATH` points every form at another
-config, with the stats address read from it: that is how to try this against a
-second Cortex without touching the one every session uses. Flags go after the
-action. Exit codes: 0 done, or nothing to do; 1 refused or failed; 2 a usage error,
-a malformed name, agent or URL included; 3 a replacement declined.
-
-### Local model servers
-
-Ollama, vLLM and llama.cpp's `llama-server` are added like any other server. None
-of them checks the key unless started with one, but `add` needs one, so give any word.
-Setting the server itself up — installing it, picking a model, the context
-length — is walked in [Run an agent on a local
-model](../../docs/laptop-local-model.md). An agent keeps asking for its own
-model names, which a local server does not have;
-the server's refusal is answered with the `--main` or `--helper` model, as a
-LiteLLM refusal is:
-
-```sh
-echo ollama | agentop server add ollama http://localhost:11434 \
-  --main granite4.2:8b --helper granite4.2:8b --key-stdin
-agentop server use ollama --agent bob
-```
-
-The refusals recognised are Ollama 0.40.4's and 0.7.0's, vLLM 0.31.0's and
-llama.cpp b11429's serving several models (`--models-dir`); the two Ollama
-versions word theirs differently, and both readings are matched. llama.cpp serving
-one model (`-m`) and LM Studio with a model loaded answer any name with that model,
-so their `--main` and
-`--helper` never come into play; LM Studio with nothing loaded refuses in words the
-router does not read. A prompt larger than the server's window is trimmed by Ollama
-rather than refused, so set its context length above the agent's prompts: Claude
-Code's opening turn can pass 64k tokens, Bob's reach about 21k. On a Mac with
-less than 64 GB, see [Choose a model](../../docs/laptop-local-model.md#choose-a-model).
-
 ## Panes
 
 The UI has these panes. `Enter` drills in; `Esc` backs out.
 
 **Sessions is the only pane you land on.** Pipeline (`P`), Usage (`u`), Timeline
-(`T`) and the plugin catalog (`C`) are each opened by a key from the session views
+(`T`) and Agents (`A`) are each opened by a key from the session views
 and return to the pane you pressed it on. There is no tab strip: Sessions is what
-agentop is for, and the other four are surfaces you visit and leave.
+agentop is for, and the others are surfaces you visit and leave.
 
 - **Sessions** (default): table of active sessions in the store, most
   recently updated first. Columns: session (truncated), title, updated
@@ -810,75 +280,8 @@ agentop is for, and the other four are surfaces you visit and leave.
   process the calls came from. Headers keep the full id, which is still what the
   API and `/` match on.
 
-  `CTX(1M)` is a gauge, not a figure: how full the **conversation's**
-  context was on its latest turn, against a fixed one-million-token window. The
-  brackets are the scale, drawn on every row, so a nearly-empty session reads
-  as empty-out-of-something rather than as a blank cell — and an em dash, which
-  means *no context known*, stays distinguishable from the sliver a barely-used
-  session gets.
-
-  **A session is three kinds of caller, not one conversation.** Claude Code
-  sends your conversation, the subagents it spawns, and its own one-shot
-  completions — title generation, the permission security monitor, the auto-mode
-  classifier — under one session id. Two facts sort them out, and the gauge
-  needs both:
-
-  | | tool manifest | `agentRole` |
-  |---|---|---|
-  | your conversation | present | `main` |
-  | a subagent | present | `subagent` |
-  | a one-shot | **absent** | `main` |
-
-  The manifest excludes the one-shots. Measured across 115 responses in three
-  live sessions they carry *no tools* and 2–3 messages, while every conversation
-  turn carried 27–31 tools and 63–1572 messages. They are not small, which is
-  why size is not the filter: one measured 295k and another 421,220 against a
-  true context of 998,334. And they declare themselves `main`, because the CLI
-  issues them rather than a subagent.
-
-  The role excludes the subagents, which Claude Code states on every request.
-  The message count only approximated it — subagent turns reached 177 and 186
-  messages against main threads at 188 and 288 — and it cannot see a compaction,
-  which restarts your conversation at a low count while leaving the role alone.
-
-  Among what is left, the **latest** turn wins. There is deliberately no recency
-  window: your conversation goes silent while a subagent runs, and that silence
-  is structural, so a last-N-requests window can fill with the subagent's
-  traffic and hand the gauge to it. Both filters are exact, so none of that
-  traffic is a candidate in the first place.
-
-  Three things worth knowing. The denominator is fixed at 1M, the largest
-  window on any path the proxy sees, so a model with a smaller window reads
-  lower than it really is.
-
-  The figure comes from agentop's own event cache, filled by the live stream or
-  by drilling into a session. The timeline fetch asks for `view=summary`, and
-  that projection drops the slices this rule used to read, so it records their
-  **lengths** before dropping them (`messageCount` / `toolCount`) and the gauge
-  reads either shape. Without that a delivered row could not be read at all, and
-  an idle session showed a dash however long you looked at it. `agentRole` needs
-  none of that: it is a scalar the projection copies as-is.
-
-  Against a proxy older than those fields, an idle row still shows the dash
-  until traffic arrives or you open one of its events — the one request that
-  returns an event in full. Once a figure is established it is kept, so a
-  projection that says nothing cannot erase it.
-
-  **Against a proxy that publishes no `agentRole`**, the gauge falls back to the
-  old rule — tool-carrying requests, the one with the most messages — and pays
-  what that costs. After a compaction it can stay on the pre-compaction context
-  for the rest of the session, because the older, longer request still holds the
-  most messages: measured at 999,623 against a true 400,249, a bar at 98.6% for
-  a session with 600k of headroom. A stale figure is still preferred to one that
-  flips to a subagent's. With the role published there is nothing to wait for —
-  the column follows the compaction on the next turn.
-
-  Since the figure outlives the events it was read from, the way to clear one you
-  do not believe is `Esc` back to the Pods pane and re-enter: a different pod is
-  the one thing that discards it, and re-attaching starts the column from
-  whatever streams next. That reset only exists in picker mode — under
-  `--endpoint` there is no Pods pane to back out to, so restarting agentop is the
-  equivalent.
+  `CTX(1M)` shows how full the conversation's context was on its latest turn.
+  [How CTX is derived](#how-ctx-is-derived) tells how agentop calculates it.
 
   It replaced an `ACTIVE` column whose `●` nobody acted on — `UPDATED` already
   answers "is this live", in seconds rather than as a dot. The `cached` marker
@@ -889,9 +292,9 @@ agentop is for, and the other four are surfaces you visit and leave.
   archive holds beside the ones in memory, so neither a restart nor
   `session.max_sessions` eviction takes a row off it. Enter opens an old session
   like any other; its events are read back from disk a page at a time — the
-  latest on Enter, older ones with `o`, as for a resident session — so a long one
-  costs no more to open than a short one. `X` erases all of it, after asking; see
-  the keybindings below.
+  latest on Enter, older ones from the timeline's first row, as for a resident session — so a long one
+  costs no more to open than a short one. `x` on the agents pane's *All agents* row
+  erases all of it, after asking; see the keybindings below.
 
   **Every figure in this table is a per-session total**, summed over that
   session's whole history rather than over a clock window — which is why its
@@ -908,23 +311,7 @@ agentop is for, and the other four are surfaces you visit and leave.
   and survives restarts. `[?]` states both facts; the title deliberately does
   not, since no single span is true of every row.
 
-  Rendered at 100 columns, where every column has its declared width; 93 is the
-  narrowest terminal that carries them all at once:
-
-  ```
-  agentop · http://localhost:9094
-  LAST 1H    TODAY   7 DAYS    MONTH
-    $4.04   $18.80  $216.44  $703.18
-  ────────────────────────────────────────────────────────────────────────────────────────────────────
-   SESSION         TITLE        UPDATED           EVENTS      TOKENS        COST      SAVED~  CTX(1M)
-   ctx-abc-123-4…  …pend-spans  3s ago                42       48.2k       $0.12       $0.01  ▕████ ▏
-   ctx-def-567-4…  weather-ag…  18m ago               15        1.2k      <$0.01           —  ▕▏    ▏
-   ctx-ghi-901-4…               42m ago                7        2.9k           —           —  ▕██   ▏
-   default                      1h ago                 8           —           —           —        —
-
-  ● connected  2.1 events/sec   feedback: https://github.com/rossoctl/cortex/issues/new/choose
-  [↑↓] nav  [↵] drill  [u] usage  [$] spend  [/] search  [p] pause  [P] plugins  [?] keys  [q] quit
-  ```
+  The screen is shown in [Using agentop](../../docs/using-agentop.md#the-screen).
 
   The two money columns are dropped entirely on a terminal too narrow to show a
   sub-cent charge honestly — below 93 columns — rather than rounded to `$0.00`
@@ -1094,7 +481,7 @@ agentop is for, and the other four are surfaces you visit and leave.
   100% of rows. Avoided spend now lives per session in the sessions table and per
   series in the `$` breakdown; volume readings live in the Usage pane.
 - **Events**: per-session event table. `c` opens a column picker — a popup with
-  a checkbox and a one-line description per column, since thirteen abbreviated
+  a checkbox and a one-line description per column, since twelve abbreviated
   headers are not self-describing.
 
   The picker is also where sorting lives: `s` orders the table by the column
@@ -1109,27 +496,38 @@ agentop is for, and the other four are surfaces you visit and leave.
   90ms before 1.20s, and TOKENS orders 900 before 1,048,576. Blank cells — a
   request whose response has not landed, or a figure the proxy could not model —
   sort to the bottom of a descending view rather than crowding the end you sorted
-  toward. Sorting never changes the `#` exchange pairing or the per-row token and
-  cost figures; it reorders the finished rows only.
+  toward. Sorting never changes the `#` numbers or a row's figures. It reorders the
+  finished rows only.
 
-  The thirteen default columns together need ~185 terminal columns, so the table
+  Each tool call has its own row under the exchange whose response asked for it.
+  The row shows the tool's name, not its command or arguments: `/` still finds
+  them, and `Enter` opens the full call. Its `#` cell is `┣⚒` or `┗⚒` (the last tool of the exchange). A sort
+  orders the exchanges, and the tool rows stay under their exchange: a long tool does
+  not move its exchange up a DURATION sort. The tool's DURATION is measured
+  from outside the agent: from the reply to the next request of the same agent. So
+  it includes the client's own delay, and it can miss a tool that started while the
+  reply still streamed. `Enter` on a tool row opens the exchange whose request
+  carries the tool's output, with the cursor on the call and the output open below
+  it. When no such request is held, it opens the exchange that asked for the tool.
+  `Esc` goes back to the tool row.
+
+  The twelve default columns together need about 180 terminal columns, so the table
   drops what does not fit and the footer says how many (`→ N more columns`). Columns carry a
   keep rank rather than being equally expendable: DIR, DURATION, TOKENS and COST
   give way first, while `#` and HOST survive longest. That is what makes HOST
   usable at 80 columns despite being last in display order — it is the column
   most people open this pane for.
 
-  All thirteen are on by default: `#` (exchange number, shared by a request and
-  its response), TIME, DIR, PHASE, ACTION, PLUGIN, METHOD, STATUS, DURATION,
-  BYTES, TOKENS, COST, HOST. On a narrow terminal the low-ranked ones are hidden
-  rather than turned off, so widening the window brings them back without
-  touching the picker.
+  All twelve are on by default: `#` (exchange number), TIME, DIR, ACTION, PLUGIN,
+  METHOD, STATUS, DURATION, BYTES, TOKENS, COST, HOST. On a narrow terminal the
+  low-ranked ones are hidden rather than turned off, so widening the window brings
+  them back without touching the picker.
 
   BYTES was the one opt-in column until recently, on the grounds that only an
   opaque tunnel's close row had a figure for it. Ordinary rows now carry one too
-  — a request row the body size it forwarded, a response row the body size that
-  came back — so the reason for hiding it is gone and the picker is where you go
-  to turn it *off*. A blank cell means the proxy counted nothing, which is not
+  — the body size the request forwarded (↑) and the body size that came back (↓) —
+  so the reason for hiding it is gone and the picker is where you go to turn it
+  *off*. A blank cell means the proxy counted nothing, which is not
   the same as a body of zero bytes: a body no plugin asked to buffer is relayed
   unmeasured and reads exactly as a body-less GET does.
 
@@ -1148,62 +546,73 @@ agentop is for, and the other four are surfaces you visit and leave.
   Live-updates while in view — if the cursor is on the last row, it
   auto-follows new events.
 
-  All thirteen columns, on a terminal wide enough for them. Each `#` appears
-  twice — once for the request, once for its response — which is how a row
-  with no STATUS is read as "still in flight" rather than "failed":
+  All twelve columns, on a terminal wide enough for them. Each row is one
+  exchange: a request and its response. A blank STATUS means the response is on
+  its way. `lost` means an outbound request with a request id got no response
+  for 10 minutes, by the rule the Timeline uses. A tunnel open or an inbound
+  request never shows `lost`. A request the proxy did not stamp with a request id
+  (an older proxy) keeps two rows that share one `#`:
 
   ```
   agentop · ctx-abc-1234…
 
-   #     TIME          DIR   PHASE    ACTION    PLUGIN              METHOD              STATUS   DURATION    BYTES              TOKENS             COST                 HOST
-   1     14:23:07.41   in    req      allow     jwt-validation                                               ↑1.4kB                                                     weather-agent
-   1     14:23:07.52   in    resp     —         —                                       200      118ms       ↓842B                                                      weather-agent
-   2     14:23:07.71   out   req      observe   inference-parser    claude-sonnet-5                          ↑118.6kB                             681,300(−9.9k)   $0.2546(−$0.0037)   api.anthropic.com
-   2     14:23:08.91   out   resp     —         —                   claude-sonnet-5     200      1.20s       ↓12.4kB            412                                     api.anthropic.com
-   3     14:23:09.01   out   req      modify    token-exchange      tools/call                               ↑318B                                                      github-tool-mcp
-   3     14:23:09.10   out   resp     —         —                   tools/call          503      96ms                                                                   github-tool-mcp
+   #   TIME          DIR   ACTION    PLUGIN             METHOD            STATUS   DURATION              BYTES              TOKENS                COST   HOST
+   1   14:23:07.41   in    allow     jwt-validation                          200      118ms       ↑1.4kB ↓842B                                           weather-agent
+   2   14:23:07.71   out   observe   inference-parser   claude-sonnet-5      200      1.20s   ↑118.6kB ↓12.4kB   681.3k(−9.9k)→412   $0.2767(−$0.0037)   api.anthropic.com
+   3   14:23:09.01   out   modify    token-exchange     tools/call           503       96ms              ↑318B                                           github-tool-mcp
+   4   14:23:09.40   out   observe   inference-parser   claude-sonnet-5                               ↑121.0kB                                           api.anthropic.com
 
   ● connected   2.1 events/sec   [/anthropic 2 matches]   [sort: DURATION▼]
   [↑↓] nav  [b/f] page  [↵] detail  [c] columns  [u] usage  [s] hide passthru/skip  [p] pause  [/] search  [n/N] next/prev  [esc] back  ·  [?] keys  [q] quit
   ```
 
-  Exchange 3's response has no BYTES figure because there was nothing to count:
+  Exchange 3 has no ↓ figure because there was nothing to count:
   token-exchange could not reach the IdP, so the 503 is the proxy's own and no
-  upstream body ever arrived.
+  upstream body ever arrived. Exchange 4 is still on its way.
 
   `—` in ACTION and PLUGIN means no plugin acted on that message; a `tunnel`
   there is an opaque CONNECT, where METHOD is blank because opaque bytes carry
-  no request line. The tunnel's STATUS arrives on its `resp` row when it closes,
-  with DURATION for how long it stayed open and, in BYTES, what it carried each
-  way — the one row that reports both directions at once, since opaque bytes
-  have no body-and-headers split to separate. That STATUS is the
-  CONNECT's own (200, or 502 when the destination could not be reached), never
-  the destination's, which travels inside the client's TLS. The TOKENS and COST figures on a request
-  row carry what `tool-prune` saved in parentheses — `−` for a counted saving,
-  `~` for a projected one.
-- **Detail**: pretty-printed JSON of a single event. Scroll with arrow
-  keys; `y` yanks to `~/.cortex/agentop-events/<timestamp>-<rand>.json` and
-  shows the path in the footer until you press another key. The directory is
-  private to you (0700, inside `~/.cortex`) and the files are 0600 — yanked
-  events carry identity subjects, raw LLM completions and tool arguments, so
-  they are deliberately not written to a shared location such as `/tmp`.
-  Nothing prunes them: they accumulate until you delete them, and unlike
-  `$TMPDIR` this location is never cleared by the OS. Given what they hold,
-  `rm` the ones you are done with. The footer shows the path expanded rather
-  than abbreviated with `~`, and gives it the whole line while the notice is up;
-  on a terminal too narrow for it the path is truncated from the left, so the
-  filename stays readable.
+  no request line. A tunnel's row gets its STATUS when the tunnel closes, with
+  DURATION for how long it stayed open and, in BYTES, what it carried each way.
+  That STATUS is the CONNECT's own (200, or 502 when the destination could not be
+  reached), never the destination's, which travels inside the client's TLS.
+  TOKENS reads prompt→output. TOKENS and COST carry what `tool-prune` saved in
+  parentheses — `−` for a counted saving, `~` for a projected one.
+- **Detail**: one exchange in full, at the full width of the terminal: a
+  REQUEST section, then a RESPONSE section, each the event as the proxy recorded
+  it, under a title that names its time and the plugins that acted on it. The
+  line above the JSON names the section at the top of the screen, then the
+  exchange's figures. `Tab` moves to the other section's title, and `Enter` folds
+  the section or node at the cursor. The response leaves out the fields equal to
+  the request's (client, direction, host, method, path, ids), and `invocations`
+  starts folded. A half that is missing says why: on its way, lost, denied, or
+  not loaded yet. Move with the arrow keys. `y` yanks the section the cursor is in
+  to `~/.cortex/agentop-events/<timestamp>-<rand>.json` and shows the path in the
+  footer until you press another key. The directory is private to you (0700,
+  inside `~/.cortex`) and the files are 0600 — yanked events carry identity
+  subjects, raw LLM completions and tool arguments, so they are deliberately not
+  written to a shared location such as `/tmp`. Nothing prunes them: they
+  accumulate until you delete them, and unlike `$TMPDIR` this location is never
+  cleared by the OS. Given what they hold, `rm` the ones you are done with. The
+  footer shows the path expanded rather than abbreviated with `~`, and gives it
+  the whole line while the notice is up; on a terminal too narrow for it the path
+  is truncated from the left, so the filename stays readable.
 - **Pipeline**: the active plugin chain in inbound + outbound order, opened by
   `P` from Sessions, Events or Detail; `Esc` returns to whichever of those it was
   opened from. Columns: position, direction, plugin name, DEPS (✓/✗ — see "Plugin
   dependencies" below), writes, body access, event count. `e` opens
-  the editor. Outside the viewer, `agentop pipeline get` prints the same
+  the editor. Under the chain, an `── available ──` divider lists every plugin the
+  running binary can build (`/v1/plugins`) that the chain does not run, so you can
+  see what to add before you edit. Those rows have no position, direction, DEPS or
+  events, and `Enter` on one opens its detail. The list is fetched each time `P`
+  opens the pane. This section replaced the plugin catalog pane, which had its own
+  key, `C`. Outside the viewer, `agentop pipeline get` prints the same
   composition — plus each plugin's description and config — and `--json` emits
   `/v1/pipeline`'s own shape for a script. It has no DEPS or event count:
   one is derived from the chain rather than reported by the proxy, the other
   counts invocations in cached session events, which a one-shot command has
   none of.
-- **Plugin detail**: drill-into-row for Pipeline or Catalog. Shows
+- **Plugin detail**: drill-into-row for a Pipeline row, available rows included. Shows
   description, position, reads/writes, body access, plugin config, and
   per-dependency satisfaction status against the active chain.
 - **Usage**: time-bucketed charts of volume, errors, latency and cost,
@@ -1265,7 +674,7 @@ agentop is for, and the other four are surfaces you visit and leave.
 
     updated 7s ago (every 20s)
 
-  [m] metric  [w] window  [b] breakdown  [s] this session  [esc] back  [?] keys  [q] quit
+  [m] metric  [w] 10m  [o] breakdown  [/] search  [esc] back  [?] keys  [q] quit
   ```
 
   Under `latency` the bars give way to mean-with-whiskers and the breakdown
@@ -1299,10 +708,10 @@ agentop is for, and the other four are surfaces you visit and leave.
   ```
   window 5m 1h [all]  10-26 14:28 → 10-26 20:08
                             14:28           15:17           16:06   37m  39m      18:41
-                                                                                           model  tools  calls
-  main agent                ▂█▃▅▃██▁▄▃▁▃█▁▆▁▂▇█▂▁▁▂████████▁▁▅▁███▅▁ ┆ ▄▁ ┆ ▂▁▆▂▁███▄▁│  1.6h    29m    316
+                                                                                           model  tools  tok/s
+  main agent                ▂█▃▅▃██▁▄▃▁▃█▁▆▁▂▇█▂▁▁▂████████▁▁▅▁███▅▁ ┆ ▄▁ ┆ ▂▁▆▂▁███▄▁│  1.6h    29m     85
 
-    Survey cortex egress da ▃▂▁                                      ┆    ┆           │    4m     1m     41
+    Survey cortex egress da ▃▂▁                                      ┆    ┆           │    4m     1m     92
 
   ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
   llm-gateway.example   LLM ▂▃▂▁▂  ▁▂▁▁▃▄▄▂▁▁▁ ▁▁▁▂▂▂▂▂▂▂▂▂▂▂▁▁   ▂▁ ┆ ▁▁ ┆ ▂▂▁▁▁   │           1041 req
@@ -1327,8 +736,10 @@ agentop is for, and the other four are surfaces you visit and leave.
   at 1h or 5m) shows its two largest; the line below the chart has the detail. A
   host cell's height is how many requests were in flight at once (`▁` one … `█`
   eight or more); red is an error or a refusal. Loopback hosts, the proxy itself
-  among them, are not drawn. The gutter is the window's model time, tool time and
-  tool calls for an agent, and the request count for a host.
+  among them, are not drawn. The gutter is the window's model time and tool time
+  for an agent, and its output tokens for each second of model time over its
+  last 60 s of model time (`tok/s`, in the model colour while a turn
+  streams, blank when no turn has tokens), and the request count for a host.
 
   `w` cycles 5m / 1h / 24h / all, offering only the windows shorter than the
   session, so a short session shows "all" alone; the choice is saved, and a saved
@@ -1353,41 +764,17 @@ agentop is for, and the other four are surfaces you visit and leave.
   2s, 4s … up to 30s, and the first fetch of a visit waits up to 30s, since a
   session only on disk is read from its archive.
 
-  **Claude Code only.** Agents come from the requests the proxy attributed to a
-  Claude Code agent, and a tool's end from the first request carrying its
-  result. Sessions recorded before the proxy captured agent ids show their
-  subagents as one row; other agents show host rows alone. A proxy too old to
+  **Subagent rows: Claude Code and IBM Bob only.** Every recognised agent gets its
+  main row. Subagents come from Claude Code's agent-id headers and Bob's task ids,
+  and a tool's end from the first request carrying its result. Sessions recorded
+  before the proxy captured agent ids show their subagents as one row; a client
+  Cortex does not recognise shows host rows alone. A proxy too old to
   serve the endpoint gets a line saying so.
-- **Catalog**: registered-plugin browser, opened by `P` from any
-  session-view pane. Lists every plugin the running binary knows how to
-  construct, including ones not in the active pipeline. Useful for
-  discovering what's available before adding to the pipeline. Sourced
-  from `/v1/plugins`.
-
-  REQUIRES lists a plugin's hard dependencies comma-separated; an either-or
-  group appears as one entry joined by `|`. Both are checked against the
-  ACTIVE pipeline in the Pipeline pane's DEPS column, not here — this pane
-  lists what the binary can build, not what is wired up.
-
-  ```
-  agentop · http://localhost:9094 · catalog
-
-   NAME                    REQUIRES                      DESCRIPTION
-   jwt-validation                                        Validate inbound JWTs against JWKS
-   token-exchange                                        RFC 8693 exchange for a target audience
-   mcp-parser                                            Parse MCP JSON-RPC requests and results
-   inference-parser                                      Parse LLM chat/completions traffic
-   ibac                    mcp-parser                   Intent-based access control
-   tool-prune              inference-parser              Drop unused tool definitions
-
-  [↑↓] nav  [↵] plugin detail  [r] refresh  [esc] back  [?] keys  [q] quit
-  ```
-
 - **Kubernetes Namespaces** (optional): the way in when agentop has no endpoint
   to connect to — one row per namespace holding an AuthBridge agent, then a
   Pods pane, then an automatic `kubectl port-forward` into the session view.
   Shown when `--endpoint` was not given and either no local Cortex is answering
-  or `--kubernetes` was passed; `[l]` leaves it for the Cortex on this machine.
+  or `--kubernetes` was passed; `[L]` leaves it for the Cortex on this machine.
 
   ```
   agentop · pick namespace
@@ -1397,7 +784,7 @@ agentop is for, and the other four are surfaces you visit and leave.
    team2                           1
    default                         1
 
-  [↑↓/jk] nav  [↵] open  [l] localhost:47601  [r] reload  [?] keys  [q] quit
+  [↑↓/jk] nav  [↵] open  [L] localhost:47601  [r] reload  [?] keys  [q] quit
   ```
 
   Without `--kubernetes`, a running local Cortex is connected to directly and
@@ -1413,10 +800,9 @@ Layered on top of all of them:
   1. the current pane, highlighted — what it shows, then its own keys;
   2. **GO TO ANOTHER PANE** — the keys that leave, each naming the pane
      it opens and what is on it. Rendered per pane and only where the
-     key actually works: all four (`u`, `P`, `C`, `$`) from the session
-     views, `C` alone on Usage, and on the two pickers the heading kept
-     with a line saying they open once you're connected, rather than four
-     dead keys;
+     key actually works: `u`, `P` and `$` from the session views, and on
+     the two pickers the heading kept with a line saying they open once
+     you're connected, rather than dead keys;
   3. **THE DRILL PATH** — `namespaces → pods → sessions → events → event
      detail` on one line, since that spine is also what `Esc` walks back.
      If you're on one of its five panes it's in brackets; the four
@@ -1465,26 +851,25 @@ Layered on top of all of them:
 | `?` | any (not while searching or mid-edit) | open the key-help overlay (`?`/`Esc`/`q` closes) |
 | `↑ ↓` / `k j`, `b`/`f`, `u`/`d`, `g`/`G` | key help | scroll the overlay |
 | `↑ ↓` / `k j` | picker, list | navigate rows |
-| `Enter` | namespaces | open the namespace |
-| `l` | namespaces | connect directly to this machine's Cortex, or to `localhost:9094` when none is installed |
-| `Enter` | pods | port-forward + connect |
+| `Enter` / `→` / `l` | namespaces | open the namespace |
+| `L` | namespaces | connect directly to this machine's Cortex, or to `localhost:9094` when none is installed. Capital, because `l` opens the row here as on every list |
+| `Enter` / `→` / `l` | pods | port-forward + connect |
 | `Esc` | pods | back to namespaces |
 | `r` | namespaces, pods | reload agent list from cluster |
 | `Enter` / `→` / `l` | sessions, events | drill into selection; on a subagent block's header row in the events pane, collapse/expand the block instead |
 | `Esc` / `←` / `h` | detail, events | back out |
 | `Esc` | sessions | back to the agents picker when the list was reached by picking an agent there; otherwise (picker mode) tear down port-forward and back to pods. Sessions and the agents picker above it are the only panes that tear down — every key-opened surface returns to its caller instead |
-| `/` | any pane, and the key help | search what the pane shows, as in a text editor: every row stays, the matched characters are highlighted, and the cursor (or, in a text view, the view) jumps to the first match at or after where you pressed `/`, wrapping past the end, as you type. Case-insensitive substring of the text the pane displays: a table's columns that are turned on, at full width (a value cut to `…` matches in full, and so does a column the terminal had no room for); a message's or plugin's detail line by line, before it is wrapped; the key help's and the usage chart's lines as drawn. `deny` finds denied events because ACTION shows it. `Enter` keeps the place; `Esc` puts the place and the previous search back; `Enter` on an empty box clears the search. Each pane keeps its own search; the events pane's and a message's detail's last while you stay with one session (the detail's carries from message to message), and none is saved |
+| `/` | any pane, and the key help | search what the pane shows, as in a text editor: every row stays, the matched characters are highlighted, and the cursor (or, in a text view, the view) jumps to the first match at or after where you pressed `/`, wrapping past the end, as you type. Case-insensitive substring of the text the pane displays: a table's columns that are turned on, at full width (a value cut to `…` matches in full, and so does a column the terminal had no room for); an exchange's or plugin's detail line by line, before it is wrapped; the key help's and the usage chart's lines as drawn. `deny` finds denied events because ACTION shows it. `Enter` keeps the place; `Esc` puts the place and the previous search back; `Enter` on an empty box clears the search. Each pane keeps its own search; the events pane's and an exchange's detail's last while you stay with one session (the detail's carries from exchange to exchange), and none is saved. On the events pane, `Tab` in the prompt turns on `[x] details`: then `Enter`, `n` and `N` find the next row whose detail view shows the query — in either half, every field, the exact capture too. The proxy finds the matches in one pass over memory and the archive (`GET /v1/sessions/{id}/search`), and agentop checks the summary rows it holds itself, so nothing is fetched. The footer counts the matches, and also the matches in events older than the ones agentop holds: Enter on the timeline's `▲` row loads those. A Cortex that predates the search says so in the footer |
 | `n` / `N` | any pane with a search, and the key help | next / previous match, wrapping at both ends; in a text view an off-screen match is scrolled to a third of the way down |
-| `X` | sessions | clear all history: every session this Cortex holds, in memory and on disk. Asks first, with the count and the size on disk; `y` erases, `n`/`esc` keeps. The cost ledger is kept. Refused — with the proxy's reason — anywhere but a loopback-only laptop install. Not in the footer, like `A`: a destructive key should not be advertised on the always-visible line |
-| `x` | sessions, agents | erase the row under the cursor, in memory and on disk: the highlighted session, or every session of the highlighted agent — on *All agents*, everything, as `X`. Asks first, with the count; `y` erases, `n`/`esc` keeps. The cost ledger is kept. An agent still using a session brings it back with its next request. Refused — with the proxy's reason — anywhere but a loopback-only laptop install. Not in the footer, like `X` |
-| `s` | events | toggle hiding exchanges no plugin acted on (default: shown; a request and its response are hidden or shown together; the events footer shows the hidden count) |
-| `c` | events | open the column picker (`↑↓`/`jk` move, `space`/`x` toggle, `s` sort, `r` reset, `Esc`/`Enter`/`c` close); the selection and sort are saved on close |
+| `x` | sessions, agents | erase the row under the cursor, in memory and on disk: the highlighted session, or every session of the highlighted agent — on *All agents*, every session this Cortex holds; that confirmation also shows the size on disk. Asks first, with the count; `y` erases, `n`/`esc` keeps. The cost ledger is kept. An agent still using a session brings it back with its next request. Refused — with the proxy's reason — anywhere but a loopback-only laptop install. Not in the footer; the `?` overlay names it |
+| `s` | events | toggle hiding exchanges no plugin acted on (default: shown; an exchange is hidden only when no plugin acted on either half; the events footer shows the hidden count) |
+| `c` | events | open the column picker (`↑↓`/`jk` move, `space` toggle, `s` sort, `r` reset, `Esc`/`Enter`/`c` close); the selection and sort are saved on close |
 | `s` | column picker | sort by the column under the cursor: descending → ascending → chronological. Pressing it on a different column starts that column descending. `#` is not sortable — its order already *is* chronological |
 | `p` | any | pause/resume stream |
-| `y` | detail | yank event JSON to `~/.cortex/agentop-events` (path stays until the next keypress) |
-| `g` / `G` | lists | jump to top / bottom. In the events timeline this also sets where the *next* session opens — see [Where a session opens](#where-a-session-opens) |
-| `o` | events | load the page before the oldest event shown — the timeline's history goes back further than one response holds, and `o` pages backward into it |
-| `t` | events | back to the live tail from a paged-back timeline — resumes receiving updates |
+| `y` | detail | yank the event of the section the cursor is in (request or response) to `~/.cortex/agentop-events` (path stays until the next keypress) |
+| `Tab` | detail | jump to the other section's title: request or response |
+| `g` / `G` | lists | jump to top / bottom. In the events timeline this also sets where the *next* session opens — see [Where a session opens](#where-a-session-opens). On a paged-back events timeline, `G` also goes back to the live tail and resumes updates |
+| `Enter` on the `▲` row | events | load the page before the oldest event shown. When a session holds more events than one response, the timeline's first row reads `▲ press Enter to load N older events`, and the footer says `N older (▲ at top)` |
 | `u` | sessions, events, detail | open the usage charts (sessions: all sessions; events/detail: the selected session) |
 | `T` | sessions, events, detail | open the timeline (sessions: the highlighted row; events/detail: the selected session) |
 | `w` | timeline | cycle window: 5m / 1h / 24h / all, only the windows shorter than the session |
@@ -1498,21 +883,19 @@ Layered on top of all of them:
 | `w` | agents | cycle the pane's window, drawer open or not: the rows, the title and the breakdown move together through the same four spans. Opens on today; the drawer's own span on other panes is left alone |
 | `m` | usage | cycle metric: tokens / requests / errors / latency / cost |
 | `w` | usage | cycle window: 10m / 1h / 6h |
-| `b` | usage | cycle breakdown: none / status / method / plugin (not offered for latency — there is no per-label latency) |
-| `s` | usage | toggle between this session and all sessions |
+| `o` | usage | cycle breakdown: none / status / method / plugin / host (not offered for latency — there is no per-label latency — or under an agent or project scope). Not `b`, which pages up everywhere else. The pane's scope comes from where `u` was pressed: all sessions from Sessions, the session being read from Events or Detail |
 | `Esc` | usage | back to the pane it was opened from |
-| `P` | sessions, events, detail | open the pipeline. Capital `P` because lowercase `p` pauses the stream and has no replacement worth the trade — `space` and `d` are the table's page-down and half-page-down |
+| `P` | sessions, events, detail | open the pipeline. Capital `P` because lowercase `p` pauses the stream and has no replacement worth the trade — `space` and `d` page the table, except on the agents pane, where `space` opens projects and `d`, `PgDn` and `f` still page down |
 | `Esc` | pipeline | back to the pane `P` was pressed on |
-| `C` | any session-view pane (not the picker) | open the registered-plugin catalog. Was `P` until the pipeline took that letter |
-| `r` | catalog | refresh the catalog from `/v1/plugins` |
 | `A` | any session-view pane (not the picker) | open the per-agent breakdown — each coding agent's sessions, when it was last seen, and what it has spent today (`w` moves the window), plus a row for any agent that owns a listed session but has spent nothing in it, since the sessions list is not limited to today and every session in it needs a row to scope to. Capital `A` because lowercase `a` cycles the spend drawer's axis. Refetches on every press and opens however many agents it finds, one or none included; pressed on the agents pane it only refreshes the rows. Not in the footer, for width; the `?` overlay names it |
 | `↑↓` / `jk` | agents | move the cursor |
-| `↵` | agents | scope to the agent under the cursor and list its sessions, whichever pane `A` was pressed on — including the agent already scoped, which stays scoped. **The first row, All agents, clears the scope.** It reaches the sessions list, the usage pane, and the spend band and its drawer — except on the agents pane itself, where the band and the drawer follow the highlighted row instead of the committed scope; `agentop cost --agent` is a separate process |
+| `↵` | agents | on a row that opens (sessions record a project), open it into its projects or close it. Opening puts the cursor on its `All projects` sub-row, so `↵` `↵` lists the agent's sessions. On any other row, scope to the agent under the cursor and list its sessions, whichever pane `A` was pressed on — including the agent already scoped, which stays scoped. **The first row, All agents, clears the scope** — from its `All projects` sub-row when sessions record a project. It reaches the sessions list, the usage pane, and the spend band and its drawer — except on the agents pane itself, where the band and the drawer follow the highlighted row instead of the committed scope; `agentop cost --agent` is a separate process. On a project sub-row, `↵` scopes to that project and its agent; on a project under All agents, to the project only; on the project `Other`, to the sessions and spend that record no project. `All projects` clears only the project scope. `x` and `S` act on the parent on the open row and on `All projects`, and do nothing on a project or `Other` sub-row |
 | `S` | agents | choose the inference server the highlighted agent's new sessions use: a picker over the pane, its cursor on what the agent has now. `↵` applies the highlighted entry, `Esc`/`q`/`Ctrl+C` close it, and an entry the config file already holds writes nothing. Opens only on an agent's row, when agentop is attached to this machine's Cortex and its `inference-router` routes; elsewhere a panel says why. See [Choosing an agent's server](#choosing-an-agents-server-s) |
+| `S` | sessions | move the highlighted session to another server: a picker, its cursor on the server the session uses now, so `↵` at once changes nothing. Opens only when agentop is attached to this machine's Cortex and its `inference-router` routes; elsewhere a notice says why |
 | `Esc` | agents | back to the pane `A` was pressed on, leaving the scope as it is. When the picker opened itself at startup, or was reached with `Esc` from the sessions list, it is the level above that list instead, and `Esc` backs out as `Esc` on sessions does: to the pods picker, or nowhere with `--endpoint` |
 | `e` | pipeline | edit pipeline subtree in `$EDITOR` |
 | `y` | edit/diff | apply the edit |
-| `N` | edit/diff | abort the edit |
+| `n` / `Esc` | edit/diff | cancel the edit |
 | `r` | edit/error | retry: re-open the editor (post-edit failure) or refetch (fetch failure) |
 | `Esc` | edit/{fetching,editing,applying} | abort the edit, return to Pipeline pane |
 | `Esc` | edit/{waiting,rollback} | background the watch; result lands as a footer flash |
@@ -1563,6 +946,11 @@ than asked of the server, so the spend drawer reads `BY NONE` on every axis unde
 it. The raw User-Agents are still in the unscoped drawer's agent axis and in
 `agentop cost --by agent`.
 
+**`agentop cost --by project` gives a row per project**, costliest first. A project is
+the git repo root of the agent process's cwd, and traffic that had no project is the row
+`unknown`. On every `--by` axis the LABEL column widens to the longest label and cuts
+nothing. `--by` together with `--agent` stays refused: use one or the other.
+
 [#1210]: https://github.com/rossoctl/cortex/issues/1210
 
 While a scope is active, two things on the usage pane change: `[b]` disappears
@@ -1588,19 +976,52 @@ two agents are listed, and the agents pane `SESSIONS` and `LAST SEEN` once sessi
 name their agent. Those two describe the whole sessions list; `COST <window>` is the
 pane's only windowed column, and `w` moves it.
 
+**`↵` opens an agents row into its projects, and closes it.** An open row shows `All projects`
+(the agent's figures), one row per project, then `Other`. A project row shows the last
+path segment, or the shortest unique tail of segments when two share it, for example
+`github.com/kagenti/kagenti-extensions` and `git/kagenti/kagenti-extensions`. `Other`
+holds traffic with no project (no PID, or an app started by macOS with cwd `/`) and the
+overflow past 16 series. COST of the projects and `Other` adds up to `All projects`;
+SESSIONS does not, because a session that used two projects counts under both. Spend
+recorded before the upgrade has no project and is in `Other`: for the month window
+that can be most of the spend for up to a month. Rows start closed and stay open across
+the 20s refresh, `w` and `A`, not across a restart. On a sub-row, the spend band and
+drawer follow that project.
+
+**`↵` on a project sub-row scopes to that project.** The project scope narrows the
+sessions list to the sessions that recorded the project, and narrows the usage pane,
+the spend band and its drawer to the project's figures. Every title then says
+`project=<display name>`, beside `agent=` when an agent is scoped. agentop asks for
+the `group=project` series and narrows the reply itself: the server has no `project=`
+parameter. Under a project scope, `[b]` is inert on the usage pane, latency is not
+available per project, and the drawer shows no breakdown (`no breakdown for this
+scope`). Within one session, the usage pane reads that session's projects without the
+agent. Against a server that names no session's project, the sessions list stays whole
+and its footer says `list not scoped`. `esc` keeps both scopes; `All projects` clears
+the project scope, and All agents clears both. The project scope is not saved across
+a restart.
+
 ### Choosing an agent's server (`S`)
 
 When this Cortex runs the [`inference-router`](../../docs/plugin-catalog.md#inference-router),
 the agents pane gains a `SERVER` column: the server each agent's new sessions go to,
-or `own choice` for an agent the router leaves alone. `All agents`, `Other` and
+or `by key` for an agent with no `agents:` entry: each of its sessions goes to the
+server its key selects. `All agents`, `Other` and
 `unknown` show nothing there — routing is chosen per agent, `Other` is every client
 Cortex does not recognise, and `unknown` is requests that carry no User-Agent, which
 belong to no one agent. A router under `on_error: observe` records what it would
 route and routes nothing, so it gets no column.
 
 `S` on an agent's row opens a picker over the pane, its cursor on what the agent has
-now: *its own choice (not routed)* first, then each server with its host and its
-main and helper words. `↵` applies the highlighted entry, as in every agentop picker; `Esc`, `q` or
+now: *Each terminal's key decides* first, then each server with its host and its
+main and helper words. The first row removes the agent's `agents:` entry. Under it, a
+muted line counts the agent's sessions by the server each one goes to by its key: the
+`key_routes:` target of its key's server (one hop only), else that server. For example
+`by key: 2 sessions → team-b, 1 → team-a`. A running session stays on the server it
+started on, so the line does not say where each session is now. When no session sent
+the key of a configured server, the line reads `no session sends a known key now`.
+When the agent has an `agents:` entry, there is no line: that entry wins over the key.
+`↵` applies the highlighted entry, as in every agentop picker; `Esc`, `q` or
 `Ctrl+C` closes it; choosing what the config file already holds writes nothing — the
 file decides, not where the cursor opened, since the route can change while the
 picker is up. The change is
@@ -1613,7 +1034,7 @@ New claude-code sessions → glm. 3 running sessions stay where they are.
 ```
 
 The count is of the agent's sessions this proxy holds in memory whose inference last
-went somewhere other than the new choice (for a switch back to its own choice, to any
+went somewhere other than the new choice (for a switch back to `by key`, to any
 of the servers), and is left out when there are none. A switch moves none of them:
 the router keeps a running session on the server it started on, across a proxy
 restart too (see [`agentop server`](#choosing-an-inference-server-agentop-server)).
@@ -1691,7 +1112,7 @@ events:
 | `timeline.window` | string | `5m` | timeline-pane window: `5m`, `1h`, `24h` or `all`. A session shorter than it shows `all` |
 | `usage.group` | string | `none` | usage-pane breakdown. `[b]` cycles `none`, `status`, `method`, `plugin`, `host`; a hand-edited file may also use `model`, `endpoint`, `session` or `agent` |
 
-List a column only to change it — the thirteen are all visible until you hide one, and
+List a column only to change it — the twelve are all visible until you hide one, and
 an unrecognised name or sort column is ignored. Inside an entry, always write
 `visible:` explicitly: it is optional to the parser but reads as `false`, so
 `- name: COST` on its own hides COST rather than showing it.
@@ -1708,18 +1129,17 @@ Column ids, in display order — the same headers the picker shows:
 
 | Id | Shows |
 |---|---|
-| `#` | exchange number; a request and its response share one — quote it as `"#"` in YAML, or it reads as a comment |
-| `TIME` | wall-clock time the message was recorded |
+| `#` | exchange number: one per request and its response — quote it as `"#"` in YAML, or it reads as a comment |
+| `TIME` | wall-clock time the request was recorded |
 | `DIR` | `in` = toward your agent, `out` = toward an upstream |
-| `PHASE` | `req`, `resp`, or `denied` |
 | `ACTION` | what took effect: `deny`, `modify`, `observe`, `allow`, or `tunnel` |
 | `PLUGIN` | which plugin acted; blank when none did |
 | `METHOD` | protocol operation: model name, MCP or A2A method |
-| `STATUS` | HTTP status of the response |
+| `STATUS` | HTTP status of the response: blank while it is on its way, `lost` when none came for 10 minutes |
 | `DURATION` | how long the exchange took |
-| `BYTES` | body bytes: ↑ request sent, ↓ response received (tunnels show both); blank when the proxy counted nothing |
-| `TOKENS` | tokens used, and what `tool-prune` saved |
-| `COST` | estimated cost, and what `tool-prune` saved |
+| `BYTES` | body bytes: ↑ request sent, ↓ response received; blank when the proxy counted nothing |
+| `TOKENS` | prompt→output tokens, and what `tool-prune` saved |
+| `COST` | the exchange's estimated cost, and what `tool-prune` saved |
 | `HOST` | host the message was sent to |
 
 A narrow terminal also hides columns to fit, with a `→ N more columns` note in the
@@ -1750,43 +1170,454 @@ preference does not apply at all: there "an end" is the largest or smallest valu
 rather than the oldest or newest event, so the cursor stays pinned to the event you
 were reading instead.
 
-## How a timeline is fetched
+## Commands
 
-The events table renders no message body, so it does not ask for one. Each fetch
-sends `?view=summary`, which drops the conversation payloads and keeps everything
-the table shows — measured at ~163x smaller, and the
-difference between a session that opens in milliseconds and one that takes seconds.
+### Which harnesses are wired into Cortex (`agentop configure status`)
 
-The summary keeps completion and A2A message text, which the table does not show,
-because the events search used to match them. It no longer does: `/` matches what a
-pane displays, and a message's text is searched in its detail, which fetches the
-whole event. Dropping those fields as well would be ~299x instead of ~163x.
+Each harness has its own `agentop configure <harness>` command. The guides for Bob,
+OpenCode and Pi are listed in [Per-agent configure](#per-agent-configure).
+To see all of them at once — without running five `agentop configure <harness> status`
+commands and comparing five different output shapes — run it with no harness name:
 
-The consequence is worth knowing: the first `↵` on a row fetches that one event in
-full from `/v1/sessions/{id}/events/{seq}`. The detail pane renders the summary
-immediately and the bodies appear when they arrive, so there is no loading screen —
-but on a slow link the message text lands a moment after the rest. Re-opening the
-same row is free; the bodies are kept. If the fetch fails, the pane keeps what it
-has and the error goes to the footer.
+```console
+$ agentop configure status
+HARNESS       STATUS        DETAIL
+claude-code   enabled       ~/.claude/settings.json
+bob           uncertain     editor: ~/Library/.../IBM Bob/User does not exist, so IBM Bob has not run here; shell: CORTEX_BOBSHELL is unset in this shell
+opencode      uncertain     opencode not found on PATH or in ~/.opencode/bin
+codex         not enabled   no Cortex values in ~/.codex/.env
+pi            not enabled   extension: missing; shell: no pi function in ~/.zshrc
 
-`y` yanks whatever the pane is showing, so while the bodies are still in flight — or
-after a failed fetch — it says so in the flash rather than handing you a body-less
-event that looks complete.
+For the detail on one of them: agentop configure <harness> status
+```
 
-Because a projected event is ~1KB rather than ~200KB, agentop asks for the server's
-full 2000-event ceiling instead of the old 500. A normal session therefore arrives
-whole, and the `N older ([o] to load)` note appears only for genuinely long ones.
+Four verdicts, not two, because a boolean would be a lie for several of these:
 
-Against a proxy that predates `?view=summary` this still works — that server
-ignores the parameter and returns full events, so the timeline is correct and as
-slow as it used to be. agentop can tell the difference from the response and does not
-waste a per-row fetch on bytes it already holds.
+| STATUS | Means |
+|---|---|
+| `enabled` | Fully routed through Cortex, by that harness's own definition of fully. |
+| `not enabled` | agentop looked and the harness is not routed — a place to look, and nothing in it. |
+| `partly enabled` | Some of it is in place: N of M keys set, or a value pointing at a loopback proxy that is not this machine's Cortex. `enable` has something left to do. |
+| `uncertain` | agentop could not establish an answer — a file it cannot read or parse, a key defined twice, or no configuration to read at all (bob with no settings directory, opencode with no binary). |
 
-## Editing the pipeline
+The distinction that matters is `uncertain` against `not enabled`: the first is "I
+could not tell", the second is a finding. The table takes no flags — the per-harness
+overrides (`--settings`, `--env`, `--config`, `--opencode`) do not compose into one
+flag set, and anyone who needs a non-default path wants one harness's `status`, which
+already takes it. Exit status is 0 whatever the rows say.
+
+### Running one command through Cortex (`agentop exec`)
+
+`agentop exec -- <command>` scopes Cortex routing to a single child process:
+the nine proxy/CA variables in its environment, nothing written anywhere.
+
+```sh
+agentop exec -- curl -sv https://api.anthropic.com/v1/messages
+agentop exec -- claude --dangerously-skip-permissions
+agentop exec --print              # the nine variables as export lines, runs nothing
+```
+
+It exits with the child's status, relays signals aimed at agentop to the child,
+and requires an enabled TLS bridge. The full contract — which variable gets
+which CA file and why, `--print`'s rules, what happens before Cortex's first
+start — is in [any-agent.md](../../docs/agents/any-agent.md).
+
+### Choosing an inference server (`agentop server`)
+
+With several inference servers — LiteLLM gateways or local model servers — each
+with its own URL and key, `agentop server`
+chooses which one an agent's **new** sessions use, through the
+[`inference-router`](../../docs/plugin-catalog.md#inference-router) plugin. A
+session stays on the server it started on, including one already running when its
+agent is first routed, until you move it with `agentop server move` or `S` on the
+sessions pane. Routing is opt-in per agent: until an agent is given
+a server, its traffic goes where the agent sends it. Once it is given one, its
+inference goes to that server wherever the agent addressed it — Anthropic,
+OpenCode Zen, Bob's gateway, or another server — so the agent needs no setting of
+its own beyond going through Cortex.
+
+```sh
+agentop server add ete https://ete-litellm.example.com     --main opus --helper haiku                            # asks for the key; it does not echo
+agentop server add glm https://glm-litellm.example.com     --main glm --helper nemotron
+agentop server use glm --agent opencode                   # new opencode sessions → glm
+agentop server use ete --key-of glm                       # new sessions that send glm's key → ete
+agentop server reset --key-of glm                         # glm's key goes to glm again
+agentop server move <session-id> glm                      # move one running session → glm
+agentop server                                            # the servers, their models, their agents
+agentop server reset --agent opencode                     # stop routing opencode
+agentop server remove glm                                 # refused while an agent uses it
+```
+
+A request that sends the key of a configured server goes to that server.
+`use <name> --key-of <server>` writes `key_routes.<server>: <name>` in the
+router's config, so new sessions that send `<server>`'s key go to `<name>`.
+`key_routes:` is one hop only. An agent's server, from `use --agent`, wins over
+it. `reset --key-of <server>`, or `use <server> --key-of <server>`, removes the
+entry. A session already running stays where it is. agentop never shows a key; it
+names a key by the name of its server. See
+[`key_routes`](../../docs/inference-router-plugin.md#choosing-a-server-by-the-key-a-request-sends).
+
+In the TUI, `S` on the agents pane does what `use` and `reset` do, for an agent
+the pane lists; see [Choosing an agent's server](#choosing-an-agents-server-s).
+On the sessions pane, `S` moves the highlighted session to a server (or to its own
+provider, *its own choice (not routed)*). The picker shows a muted line with the cost:
+the session's context is re-sent uncached on its first turn at the new server. It asks
+for no confirmation.
+
+When the session sent the key of a configured server, `↵` on a server opens a second
+step, `Move to: <server>`, with two rows:
+
+- *This session only* moves the session, as the one-step picker does. The cursor
+  starts here, so `↵ ↵` does what `↵` does with one step.
+- *This session and new sessions that send <server>'s key* also writes
+  `key_routes.<key's server>: <target>`, in the same write. When the target is the
+  key's server, it removes that entry. It moves no other running session. Its note,
+  on the line under the row, says how many other running sessions that sent the key
+  are not on the target and stay where they are, for example
+  `(1 other running session with this key stays where it is)`. When the agent has an `agents:` entry,
+  the note says instead that the agent ignores `key_routes:`, for example
+  `(claude-code ignores this: the Agents pane sends it to ete)`.
+
+`Esc` or `q` goes back to the server list; `Ctrl+C` closes the picker and writes
+nothing. The flash after the second row adds what it changed, for example
+`New sessions that send team-b's key → team-a.` With no key of a configured server,
+and on the *its own choice* row, the picker has one step. A `server move` from the shell also
+prunes the config's `sessions:` entries for sessions that are neither live nor
+archived; the TUI's move does not.
+
+The listing after `use` reads:
+
+```
+  ete   ete-litellm.example.com   main opus → aws/claude-opus-5-5 · helper haiku → aws/claude-haiku-4-5
+  glm   glm-litellm.example.com   main glm → rits/zai-org/glm-5-3 · helper nemotron → rits/nvidia/nemotron-3   opencode
+```
+
+A server whose key is routed to another server shows `its key → <server>` in its
+agents cell: for example `its key → ete` on the row of `glm` after
+`agentop server use ete --key-of glm`.
+
+**Models.** A routed request goes with the model the agent asked for, so an agent
+keeps choosing its own models wherever the server serves them. Only when the
+server refuses the name is the
+request sent again, once and before the agent sees the refusal, with one of the
+server's own models: the one `--main` names for a request with tools, the agent's
+main work, and the one `--helper` names for a request without, such as a title.
+Each is a word, not a full name: the newest model on the server's list whose name
+contains it, so a newer model the server adds is used without an edit. The
+refusal is believed for an hour, and a session keeps the model it was given.
+
+- **`add <name> <url> --main <word> --helper <word>`** reads the key at a prompt
+  that does not echo, or from stdin with `--key-stdin`, which is refused when
+  stdin is a terminal, where the key would echo as typed. It is never an argument,
+  so it never reaches shell history. It then reads the server's model list with
+  that key and refuses a word that names none of its models, listing them, so a
+  wrong URL or key is caught here; it prints what each word names now. A name that
+  exists is replaced only after a yes (`--yes` skips the question), which is how a
+  key is rotated; with no terminal to ask on, nothing is written. Two servers can
+  have one URL, for example two teams' keys for one gateway. agentop names a
+  session's server from the server name that the proxy records for the session.
+  A proxy older than this change does not record that name. For such a proxy,
+  agentop names the server from the host, so with two servers on one host it
+  shows the first name in alphabetical order. The first `add`
+  creates the plugin's entry, last in the outbound pipeline. A key or a word
+  containing `$` is refused: the config loader would read it as an environment
+  variable.
+  - `--api <protocol>=<path>` (repeatable) names a protocol the server serves and
+    the path it serves it at: `anthropic-messages`, `chat-completions` or
+    `responses`. A second `--api` for one protocol replaces the first. `--api`
+    skips the probe (see below).
+  - `--auth-header <name>` names the header that carries the key: `authorization`
+    sends `Bearer <key>`, any other name sends the raw key. A given header is
+    fixed: the model list and the probe do not try the other header.
+  - `--header <name>=<value>` (repeatable) sets a fixed header on every request to
+    the server. A value with `$` is refused, as a key is: write
+    `headers: {<name>: ${NAME}}` by hand. The key headers and the hop-by-hop
+    headers are refused.
+
+  `agentop server` shows these under the server: its `api`, its auth header, and
+  the header names, never their values.
+
+  The URL can have a path, such as `https://h.example.com/inference`. The router
+  puts this prefix before each path it builds (see
+  [`url`](../../docs/inference-router-plugin.md)). The model list is read from
+  `/v1/models`, or from LiteLLM's `/v1/model/info` when `/v1/models` gives 403 or
+  404, after the prefix.
+
+  **The probe.** With no `--api`, `add` finds which protocols the server serves.
+  It sends one small request for each candidate path, with the main model, the
+  text `ping`, and `max_tokens: 1` for `anthropic-messages`, no output limit for
+  `chat-completions`, and `max_output_tokens: 16` for `responses`:
+
+  | Protocol | Candidate paths, in order |
+  |---|---|
+  | `anthropic-messages` | `/v1/messages`, `/messages`, `/anthropic/v1/messages` |
+  | `chat-completions` | `/v1/chat/completions`, `/chat/completions` |
+  | `responses` | `/v1/responses`, `/responses` |
+
+  - A path is served only when the reply is 2xx and its body has the protocol's
+    shape. A 200 with an error body is not served.
+  - `add` writes the first served path of each protocol to `api`, and prints
+    `api <protocol> → <path>`.
+  - On 401 or 403, the probe sends the request once more with the other auth
+    header (`authorization` or `x-api-key`), unless the header is fixed.
+  - `add` writes `auth_header` only when a protocol needed a header that is not
+    its usual one, and prints `auth_header → <name>`. The usual header is
+    `x-api-key` for `anthropic-messages` and `authorization` for the other two.
+  - When no path serves, `add` exits 1 and writes nothing. When every path gave
+    the same reply, the message shows it: then the model or the key is wrong,
+    not the path.
+
+  The probe runs only in `add`: to probe again, run `add` again.
+
+  **A server that needs its own headers.** `add` has no defaults for a vendor.
+  It does not look at the host. When a gateway needs a given auth header or a
+  fixed header, give it with `--auth-header` and `--header`. Give them on the
+  first `add`, because the model list and the probe send them too. Without
+  them, the gateway can refuse each request. Then `add` stops at the model list:
+
+  ```
+  agentop server add: could not read bob's model list: the server answered 403, 403, 403, 403 to its model list. Check its URL and key.
+  ```
+
+  This message names the URL and the key, but a missing header gives it too.
+  Before you change the key, look up which headers the gateway needs.
+
+  **IBM Bob.** Bob's gateway needs two settings:
+
+  | Setting | Flag | Why |
+  |---|---|---|
+  | `auth_header: x-api-key` | `--auth-header x-api-key` | Bob takes its API key as `x-api-key`. It refuses the key as `Authorization: Bearer` with 401 `invalid jwt string`. |
+  | `User-Agent: bob-shell` | `--header User-Agent=bob-shell` | Bob's edge refuses a request whose User-Agent does not start with `bob-shell`. It sends back an HTML 403 page, not a Bob error. The model list request is refused too. |
+
+  Use a static Bob API key from Bob's settings. A Bob login token does not work:
+  it is a JWT that expires after 12 hours.
+
+  ```sh
+  agentop server add bob https://api.us-east.bob.ibm.com/inference \
+    --main premium-ide --helper fast \
+    --auth-header x-api-key --header User-Agent=bob-shell
+  agentop server use bob --agent claude-code
+  ```
+
+  When you give `--auth-header`, the probe does not try `Authorization`, and
+  `add` does not print an `auth_header →` line. Nobody has run the probe on a
+  live Bob gateway. It is expected to find `chat-completions` at
+  `/v1/chat/completions`. The expected entry is in
+  [the router's doc](../../docs/inference-router-plugin.md#servers-that-serve-another-protocol).
+- **`use <name> --agent <agent>`** routes the agent's new sessions to the server,
+  including an agent that has not run yet. **`reset --agent <agent>`** stops
+  routing it. Either way a session already running stays where it is: its pin holds
+  it, kept in `~/.cortex/plugin-state.json` so a proxy restart forgets none.
+  **`use <name> --key-of <server>`** routes the new sessions that send the key of
+  `<server>` to `<name>`. **`reset --key-of <server>`** removes that entry.
+  `--agent` and `--key-of` are exclusive, and each name must be a configured
+  server.
+  **`move <session-id> <name>`** moves one running session; `own` sends it back to
+  its agent's own provider.
+- **`remove <name>`** refuses while an agent is routed to the server, and names
+  the command that takes the agent off it; it also refuses the last server. It
+  also refuses while a `key_routes:` entry names the server on either side, and
+  names the entry and `agentop server reset --key-of <server>`. A
+  session that started on a removed server gets a 503 asking for a new session
+  until the server is added back or the session is moved. So when
+  sessions the proxy is running last sent their inference to the server, `remove`
+  warns how many before it goes ahead. It leaves
+  out the default and `pending:` buckets, which the router never pins.
+- **`agentop server`** lists each server's host (its whole URL when it is plain
+  `http`), what its main and helper words name on its list now, read with its own
+  key, the agents routed to it and, for a server whose key is routed to another
+  server, `its key → <server>`. A server whose list cannot be read shows its
+  words and why. When the router's entry has `on_error: observe`, which records
+  what it would route and routes nothing, or `on_error: off`, which stops it
+  running, the listing says so first, and `use` and `add` say so too.
+
+The router routes only requests it can read: a plain `http` request sent through
+the proxy, or an `https` one the TLS bridge decrypts, which needs the bridge on
+and the port the agent connects to in `tls_bridge.ports`, 443 and 8443 unless set.
+An agent whose provider is `https` on another port, such as `:4000`, reaches the
+proxy as an opaque `CONNECT` tunnel and is never routed.
+
+Every change is written to `~/.cortex/config.yaml`, keeping its comments except
+those on the lines the change replaces or removes, every line of a removed block
+among them, and returns once the proxy has reloaded it; nothing restarts. If the
+proxy refuses the reload, the command puts the file back as it was, prints the
+proxy's error and exits 1, and the proxy keeps the configuration it had. If the
+proxy stops answering before it reports the reload, the command puts the file back
+the same way, says the proxy stopped answering, and exits 1. A file someone edited
+while the proxy was reloading is not put back but left as found, with an error
+saying so. If the proxy reports neither a reload nor a refusal within 30 seconds,
+the command exits 1 and leaves the file as written. With no proxy running the file is still written, and the change applies at
+the next start. Nothing is written unless the result loads as a Cortex config and
+passes the router's own rules; what only the running proxy can check, such as
+whether its build includes the router, is what a refused reload reports. A change
+that changes nothing writes nothing. `--config PATH` points every form at another
+config, with the stats address read from it: that is how to try this against a
+second Cortex without touching the one every session uses. Flags go after the
+action. Exit codes: 0 done, or nothing to do; 1 refused or failed; 2 a usage error,
+a malformed name, agent or URL included; 3 a replacement declined.
+
+#### Local model servers
+
+Ollama, vLLM and llama.cpp's `llama-server` are added like any other server. None
+of them checks the key unless started with one, but `add` needs one, so give any word.
+Setting the server itself up — installing it, picking a model, the context
+length — is walked in [Local model with
+Ollama](../../docs/inference-servers.md#local-model-with-ollama). An agent keeps asking for its own
+model names, which a local server does not have;
+the server's refusal is answered with the `--main` or `--helper` model, as a
+LiteLLM refusal is:
+
+```sh
+echo ollama | agentop server add ollama http://localhost:11434 \
+  --main granite4.2:8b --helper granite4.2:8b --key-stdin
+agentop server use ollama --agent bob
+```
+
+The refusals recognised are Ollama 0.40.4's and 0.7.0's, vLLM 0.31.0's and
+llama.cpp b11429's serving several models (`--models-dir`); the two Ollama
+versions word theirs differently, and both readings are matched. llama.cpp serving
+one model (`-m`) and LM Studio with a model loaded answer any name with that model,
+so their `--main` and
+`--helper` never come into play; LM Studio with nothing loaded refuses in words the
+router does not read. A prompt larger than the server's window is trimmed by Ollama
+rather than refused, so set its context length above the agent's prompts: Claude
+Code's opening turn can pass 64k tokens, Bob's reach about 21k. On a Mac with
+less than 64 GB, see [Choose a model](../../docs/inference-servers.md#choose-a-model).
+
+### Importing agent history (`agentop import`)
+
+`agentop import` reads the transcripts that an agent keeps on disk, and adds
+them to Cortex's session history and cost ledger. Use it for the sessions that
+ran before you installed Cortex, or that did not go through it.
+
+```sh
+agentop import                                  # every supported agent
+agentop import --agent claude-code --since 30d
+agentop import --agent bob                      # Bob's tasks, from ~/.bob/db/bob.db
+agentop import --agent codex                    # Codex's rollouts, from ~/.codex/sessions
+agentop import --agent opencode                 # OpenCode, from ~/.local/share/opencode/opencode.db
+agentop import --agent pi                       # Pi's sessions, from ~/.pi/agent/sessions
+agentop import --since 2026-10-01 --dry-run     # count only, write nothing
+```
+
+| Flag | Meaning |
+|---|---|
+| `--agent` | `claude-code`, `bob`, `codex`, `opencode` or `pi`. `bob` and `opencode` need the `sqlite3` program on `PATH` |
+| `--since` | skip a transcript file last changed before this time: `YYYY-MM-DD` (local midnight) or `<N>d` (N days ago) |
+| `--dry-run` | count what an import would do, and write nothing |
+| `--endpoint` | the session API, as for `agentop cost` |
+
+The proxy does the work in
+[`POST /v1/import`](../../docs/session-api.md#post-v1import--transcript-import-laptop-only).
+agentop does not open the archive or the ledger. The route exists only on a
+local install: the archive is on and the session API is loopback-only.
+Otherwise agentop says that the proxy has no import route, and exits 1. Only one
+import runs at a time. A second one prints `agentop import: an import is already
+running` and exits 1.
+
+On a terminal, agentop shows a progress bar on stderr while the proxy works:
+
+```text
+importing claude-code [█████████░░░░░░░░░░░]  45%  837/1851 sessions
+```
+
+The bar counts sessions, skipped sessions too. Skipped sessions are fast, so
+the bar moves fast at first. With an older proxy, agentop shows a spinner.
+
+The output is one line for each agent:
+
+```text
+claude-code: 12 imported, 3 replaced, 40 skipped (live), 7 skipped (current), 1 skipped (expired), 2 lines not recognized
+```
+
+`--dry-run` puts `dry run: ` before each line. A `stopped:` line follows when the
+archive got full, and an `error:` line when the agent failed. The exit status is
+1 when an agent has an error.
+
+**What it does not change.** A session that Cortex captured live is skipped, and
+the import never changes it. An imported copy that is as new as its transcript
+is skipped. A newer transcript replaces the imported copy, and only its new
+turns are counted as cost. A session that you erased with `x` comes back
+as an imported session while its transcript is still on disk. Its cost is not
+counted again, because the erase kept the ledger rows.
+
+An imported session has `(*)` before its title in the sessions pane. When the
+terminal is too narrow for TITLE, `(*)` is before its id.
+Its events show `n/a` for status, duration, bytes, host and plugin, because the
+proxy did not see them. Tokens and cost show values. A Claude Code, Codex,
+OpenCode or Pi turn is priced at today's rates. A Bob turn shows Bob's own cost.
+
+### Installing a bundled script plugin (`agentop script`)
+
+Cortex ships some [script plugins](../../docs/script-plugin.md#bundled-scripts)
+inside agentop. `agentop script` installs one in a single step:
+
+    agentop script list                  every bundled plugin and its state
+    agentop script install <name>        copy it and add its slot
+    agentop script remove <name>         take both back out
+
+- **`install`** copies the plugin's folder to `~/.cortex/plugins/<name>/` and
+  adds a `script` slot for it to `~/.cortex/config.yaml`. It then waits for
+  Cortex to load the slot and checks every script in it started. If one did not,
+  it takes back what it added and says why.
+- **Run again,** it updates a copy from an earlier release and leaves a current
+  one alone. A copy you edited is refused: `remove` it first.
+- **`remove`** refuses a folder holding a file `install` did not write.
+- **`list --json`** is for other programs, such as moca. Its fields are `name`,
+  `description`, `state`, `failClosed`, `scripts` and, with Cortex running,
+  `loaded` and `notStarted`.
+
+`--config PATH` names another Cortex config, as for `agentop server`.
+
+### What your agents have spent (`agentop cost`)
+
+`agentop cost` prints what your agents spent in a window. With no flag, it prints
+the total for today. The flags:
+
+- `--window`: `today` (the default, from local midnight), `month` (from the 1st), `7d` (the last seven days, rolling), or a duration such as `1h` or `6h` (from the in-memory ring).
+- `--by <axis>`: one row for each label, costliest first. The axes are agent, project, model, endpoint, currency, session, status, plugin and host.
+- `--agent <name>`: only this agent, spelled as the Agents pane shows it (for example `bob`).
+- `--json`: the totals as JSON.
+- `--endpoint <URL>`: ask this proxy. The default is the Cortex on this machine.
+
+The ledger windows (`today`, `month` and `7d`) serve only the agent, project,
+model, endpoint and currency axes. The other axes need a duration window.
+
+`today`, `month` and `7d` come from the cost ledger. The ledger is on for a local
+install and off in Kubernetes. When it is off, the command prints the window that
+the proxy holds, not the window that you asked for.
+
+```sh
+agentop cost --window month --by agent
+agentop cost --by model
+agentop cost --json
+```
+
+[Pricing](../../docs/pricing.md) tells how Cortex calculates a cost.
+
+### The pipeline that runs (`agentop pipeline get`)
+
+`agentop pipeline get` prints the active plugin pipeline as a table. The table
+shows the inbound chain, then the application, then the outbound chain. This is
+the same composition as the Pipeline pane (`P`).
+
+DESCRIPTION is the last column. The table has no EVENTS column and no DEPS column.
+`--json` prints the shape of `/v1/pipeline`, with `requires` and `requiresAny`.
+`--endpoint <URL>` asks this proxy, as for `agentop cost`.
+
+```sh
+agentop pipeline get
+agentop pipeline get --json
+```
+
+Use it to see the pipeline that runs. The config file alone does not show the
+defaults. To change the pipeline, see [Editing the pipeline](#editing-the-pipeline).
+
+### Editing the pipeline
 
 Press `e` on the Pipeline pane to edit the runtime `pipeline:` subtree in
 `$EDITOR` (or `vi` if unset). On save, agentop shows a diff and asks
-`apply this change? (y/N)`. Confirming writes the change back, then polls the
+`apply this change?  [y] apply  [n] cancel`. `y` writes the change back, then polls the
 framework's `/reload/status` until the reload completes (success or failure).
 
 Where it writes depends on what you are connected to, not on how agentop was
@@ -1861,7 +1692,7 @@ pod identity to resolve a ConfigMap from and no local config file to write, so
 pressing `e` flashes a hint naming the remedy instead of opening an edit it
 cannot finish.
 
-### Pre-apply validation
+#### Pre-apply validation
 
 After save, agentop runs the same Requires/RequiresAny/RequiresLater
 checks the framework runs at reload-time, against the cached
@@ -1874,15 +1705,15 @@ cluster, or about a second later locally:
   • [outbound] ibac pos 1: Requires "mcp-parser", but it is not in the outbound chain
 ```
 
-The y/N prompt becomes "apply anyway? (y/N)" — agentop's check is
+The prompt becomes "apply anyway?  [y] apply  [n] cancel" — agentop's check is
 non-blocking. The framework's own validateRelationships is the
 source of truth and will fire again at reload regardless.
 
-Validation is silently skipped when the catalog isn't loaded
-(operator hasn't pressed `P` yet). Visit the catalog pane once to
-populate it for the rest of the session.
+Validation is silently skipped when the catalog isn't loaded. `P` loads
+it each time it opens the Pipeline pane, so this happens only when that
+fetch failed.
 
-### Agent-name resolution
+#### Agent-name resolution
 
 Cluster path only — a local edit has no agent and skips all of this.
 
@@ -1892,7 +1723,7 @@ label (operator sets this). If the label is absent, agentop
 falls back to stripping the last two dash-separated segments of the
 pod name (the ReplicaSet hash + pod suffix).
 
-### Auto-rollback on reload failure
+#### Auto-rollback on reload failure
 
 If the write succeeds but the reload fails (unknown plugin name, malformed
 config, validation error), the framework keeps the previous in-memory pipeline
@@ -1914,7 +1745,7 @@ guarded by the staleness check described above, but the rollback deliberately is
 not — it runs *because* the file changed, so checking would refuse every
 rollback. The running pipeline is unaffected either way.
 
-### Backgrounding the watch
+#### Backgrounding the watch
 
 Pressing `Esc` while waiting for hot-reload (or during rollback)
 moves the watch to the background instead of aborting it. The
@@ -1932,14 +1763,14 @@ Flashes auto-dismiss after a few seconds; if you miss one, query
 `/reload/status` directly — through the port-forward for a pod, or at the
 `stats.address` in `~/.cortex/config.yaml` for a local Cortex.
 
-### Permissions
+#### Permissions
 
 agentop shells out to `kubectl`; kubectl uses your kubeconfig. Editing
 requires `update` on `configmaps` in the agent's namespace (in
 addition to `get pods` which the picker already needs). RBAC denial
 surfaces verbatim in the overlay.
 
-### Tempfile lifecycle
+#### Tempfile lifecycle
 
 agentop writes the editable pipeline subtree to `$TMPDIR/agentop-pipeline-*.yaml`
 on every edit. The tempfile is **left in place on every exit path**
@@ -1947,7 +1778,7 @@ on every edit. The tempfile is **left in place on every exit path**
 agentop launch, files older than 24h in this glob are swept
 automatically — no manual cleanup needed.
 
-### Hot-reload window
+#### Hot-reload window
 
 The framework reloads via a config-file watcher, so how long the wait is depends
 on how the edit reaches that file. In a cluster, kubelet syncs ConfigMap edits
@@ -1962,7 +1793,9 @@ The poller terminates with one of:
 - **Success** — `/reload/status.last_success` advances past the apply
   time.
 - **Failure** — `reloads_failed` increments past its baseline; the
-  framework's `last_error` is shown.
+  framework's `last_error` is shown. agentop reads the baseline before it
+  writes, so a refusal that lands before the first poll is still seen. When
+  `/reload/status` does not answer before the write, the first poll sets it.
 - **Unreachable** — 5 consecutive transport errors against `/reload/status`
   surface as `reload status endpoint unreachable` after a few seconds rather than
   waiting the full deadline. The endpoint is the port-forward's `:9093` for a pod
@@ -1976,7 +1809,11 @@ The poller terminates with one of:
   moment `last_success` moves, so this only bounds how long a *failed* reload
   takes to be declared.
 
-## Plugin dependencies
+The proxy's half of this rule is in [`proxy-contract.md`](../../docs/proxy-contract.md#hot-reload).
+That page also lists the ports, endpoints and command lines that agentop uses in a
+local Cortex.
+
+### Plugin dependencies
 
 Plugins declare dependencies in their `Capabilities()`:
 
@@ -2003,6 +1840,12 @@ agentop surfaces these in three places:
 The framework's own validateRelationships is the source of truth and
 runs at every reload. agentop's checks are the fast-feedback layer.
 
+## Per-agent configure
+
+- `agentop configure bob`: [docs/agents/bob.md](../../docs/agents/bob.md)
+- `agentop configure opencode`: [docs/agents/opencode.md](../../docs/agents/opencode.md)
+- `agentop configure pi`: [docs/agents/pi.md](../../docs/agents/pi.md)
+
 ## Trust model
 
 `agentop` does no authentication — same as the server. Use only against
@@ -2010,10 +1853,143 @@ sidecars reachable via in-cluster networking or a local port-forward.
 Session events contain raw user messages, LLM completions, and tool
 results; treat the output accordingly.
 
-## Architecture
+## Internals
+
+### How a timeline is fetched
+
+The events table renders no message body, so it does not ask for one. Each fetch
+sends `?view=summary`, which drops the conversation payloads and keeps everything
+the table shows — measured at ~163x smaller, and the
+difference between a session that opens in milliseconds and one that takes seconds.
+
+The summary keeps completion and A2A message text, which the table does not show,
+because the `details` search reads them: agentop checks the summary rows it holds,
+and the proxy checks only what the summary drops (`GET /v1/sessions/{id}/search`).
+So the search fetches no event. Dropping those fields as well would be ~299x instead
+of ~163x, and the proxy would then have to check them too.
+
+The consequence is worth knowing: the first `↵` on a row fetches each half of the
+exchange whose bodies are not loaded yet, in full, from
+`/v1/sessions/{id}/events/{seq}`. The detail pane renders the summary
+immediately and the bodies appear when they arrive, so there is no loading screen —
+but on a slow link the message text lands a moment after the rest. Re-opening the
+same row is free; the bodies are kept. If the fetch fails, the pane keeps what it
+has and the error goes to the footer.
+
+`y` yanks the half the cursor is in. While that half's bodies are still in flight —
+or after a failed fetch — it says so in the flash rather than handing you a
+body-less event that looks complete.
+
+Because a projected event is ~1KB rather than ~200KB, agentop asks for the server's
+full 2000-event ceiling instead of the old 500. A normal session therefore arrives
+whole, and the `▲ press Enter to load N older events` row appears only for genuinely long ones.
+
+Against a proxy that predates `?view=summary` this still works — that server
+ignores the parameter and returns full events, so the timeline is correct and as
+slow as it used to be.
+
+**The exact request and response.** On a laptop install the session archive keeps
+each request exactly as it crossed the proxy, and each response as the origin sent
+it. The detail pane fetches that capture too, and shows it under a closed `raw`
+section: `↵` on it opens it. In it:
+
+- `request` is the body the agent sent, with thinking blocks where the model wrote
+  them, and each image or document as `[image image/png 34.1kB]`.
+- `forwarded` says whether a plugin rewrote the body, and `forwardedBody` is what
+  went upstream when one did.
+- `query` is the request's.
+- In the RESPONSE section, `response` has the status, the body (a compressed one as
+  `[gzip body 12.0kB]`) and `truncated` or `incomplete` when either applies.
+
+The captured headers are in a closed `headers` node beside `raw`, not in it, so `↵`
+opens them without the bodies. A request's headers are without credentials. A search
+opens `headers` when it matches there.
+
+Each section has its own `raw`. Its capture comes with the fetch of that half, and
+agentop keeps it. A section has no `raw` when the archive has no capture for its
+half: an older proxy, an event written before capture, or one recorded in the last
+second. A search does not open
+`raw`, because it repeats the whole conversation; open it with `↵` to search inside
+it. A row opened from a details search that matches only in a capture opens with
+that half's `raw` open. A row opened from a details search shows its first match, also
+when the match arrives with the fetch. `y` writes the half without its capture.
+
+### Architecture
 
 - `apiclient/` — HTTP + SSE client. Sole owner of the `:9094` wire format.
   Auto-reconnects with exponential backoff (1s → 30s, capped, indefinite).
 - `tui/` — Bubble Tea model/update/view. All state mutation runs on the
   Tea event loop; the SSE goroutine produces messages the loop consumes.
 - `main.go` — flag parsing, signal handling, wires `tui.Run`.
+
+### How CTX is derived
+
+`CTX(1M)` is a gauge, not a figure: how full the **conversation's**
+context was on its latest turn, against a fixed one-million-token window. The
+brackets are the scale, drawn on every row, so a nearly-empty session reads
+as empty-out-of-something rather than as a blank cell — and an em dash, which
+means *no context known*, stays distinguishable from the sliver a barely-used
+session gets.
+
+**A session is three kinds of caller, not one conversation.** Claude Code
+sends your conversation, the subagents it spawns, and its own one-shot
+completions — title generation, the permission security monitor, the auto-mode
+classifier — under one session id. Two facts sort them out, and the gauge
+needs both:
+
+| | tool manifest | `agentRole` |
+|---|---|---|
+| your conversation | present | `main` |
+| a subagent | present | `subagent` |
+| a one-shot | **absent** | `main` |
+
+The manifest excludes the one-shots. Measured across 115 responses in three
+live sessions they carry *no tools* and 2–3 messages, while every conversation
+turn carried 27–31 tools and 63–1572 messages. They are not small, which is
+why size is not the filter: one measured 295k and another 421,220 against a
+true context of 998,334. And they declare themselves `main`, because the CLI
+issues them rather than a subagent.
+
+The role excludes the subagents, which Claude Code states on every request.
+The message count only approximated it — subagent turns reached 177 and 186
+messages against main threads at 188 and 288 — and it cannot see a compaction,
+which restarts your conversation at a low count while leaving the role alone.
+
+Among what is left, the **latest** turn wins. There is deliberately no recency
+window: your conversation goes silent while a subagent runs, and that silence
+is structural, so a last-N-requests window can fill with the subagent's
+traffic and hand the gauge to it. Both filters are exact, so none of that
+traffic is a candidate in the first place.
+
+Three things worth knowing. The denominator is fixed at 1M, the largest
+window on any path the proxy sees, so a model with a smaller window reads
+lower than it really is.
+
+The figure comes from agentop's own event cache, filled by the live stream or
+by drilling into a session. The timeline fetch asks for `view=summary`, and
+that projection drops the slices this rule used to read, so it records their
+**lengths** before dropping them (`messageCount` / `toolCount`) and the gauge
+reads either shape. Without that a delivered row could not be read at all, and
+an idle session showed a dash however long you looked at it. `agentRole` needs
+none of that: it is a scalar the projection copies as-is.
+
+Against a proxy older than those fields, an idle row still shows the dash
+until traffic arrives or you open one of its events — the one request that
+returns an event in full. Once a figure is established it is kept, so a
+projection that says nothing cannot erase it.
+
+**Against a proxy that publishes no `agentRole`**, the gauge falls back to the
+old rule — tool-carrying requests, the one with the most messages — and pays
+what that costs. After a compaction it can stay on the pre-compaction context
+for the rest of the session, because the older, longer request still holds the
+most messages: measured at 999,623 against a true 400,249, a bar at 98.6% for
+a session with 600k of headroom. A stale figure is still preferred to one that
+flips to a subagent's. With the role published there is nothing to wait for —
+the column follows the compaction on the next turn.
+
+The figure stays after the events that it came from. In a cluster, to clear a
+figure that you do not trust, press `Esc` to go back to the Pods pane and enter
+the pod again. A different pod is the only thing that discards the figure.
+Re-attaching starts the column from the next event that streams. This reset is
+for the cluster picker only. On a laptop and under `--endpoint`, there is no
+Pods pane, so restart agentop.

@@ -39,7 +39,7 @@ remembers writing.
 
 **Start here:** [RECIPE.md](RECIPE.md) — six steps, expected output, back
 out. **Why it works and where it stops:** [DESIGN.md](DESIGN.md). **See it
-run:** the [lineage demo](../../demos/lineage/README.md) on the Weather Agent pair.
+run:** the [lineage demo](https://github.com/rossoctl/cortex-demos/blob/main/lineage/README.md) on the Weather Agent pair.
 
 ---
 
@@ -336,7 +336,7 @@ BAKE — once per app image                 ATTACH — once per Deployment
 | `build-otel-shim.sh` | bakes, attests (gate off: nothing OTel-shaped loads; gate on: a `traceparent` is injected), kind-loads; refuses images it cannot safely wrap |
 | `lineage-propagate-hook.py` | the env-gated site hook the Dockerfile installs (`.pth` + module); read its docstring for the contract |
 | `container-runtime.sh` | sourced helper: docker vs podman, kind load either way |
-| `test/propagation/` | the propagation matrix: one probe image per instrumented library, baked with the real script, four verdicts each (base / inert / on / carried) |
+| [`test/propagation/`](test/propagation/README.md) | the propagation matrix: one probe image per instrumented library, baked with the real script, four verdicts each (base / inert / on / carried) |
 
 ---
 

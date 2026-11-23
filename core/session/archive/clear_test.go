@@ -41,7 +41,7 @@ func TestClear_EventsQueuedBeforeAreGoneAndAfterStartFresh(t *testing.T) {
 	r.record("s1", synthSession(83, 1, 512)...) // after the clear: numbered on from 4
 	close(a.gate)
 
-	res, err := a.AwaitClear(5 * time.Second)
+	res, err := a.AwaitClear(time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +81,7 @@ func TestClear_ForgetsTheNumberingOfEverySessionNotRecordedSince(t *testing.T) {
 		t.Fatalf("LastSeq(quiet) = %d before the clear ran, want 3: the disk still holds it", a.LastSeq("quiet"))
 	}
 	r.record("busy", synthSession(86, 1, 512)...)
-	if _, err := a.AwaitClear(5 * time.Second); err != nil {
+	if _, err := a.AwaitClear(time.Hour); err != nil {
 		t.Fatal(err)
 	}
 	if n := a.LastSeq("quiet"); n != 0 {
@@ -101,7 +101,7 @@ func TestClear_UsesTheReserveWhenTheQueueIsFull(t *testing.T) {
 	newRecorder(a).record("s1", synthSession(87, 34, 512)...) // 102 events: more than the whole queue
 	a.Cleared()
 	close(a.gate)
-	if _, err := a.AwaitClear(5 * time.Second); err != nil {
+	if _, err := a.AwaitClear(time.Hour); err != nil {
 		t.Fatalf("a clear behind a full queue failed: %v", err)
 	}
 	if rows := a.Summaries(); len(rows) != 0 {
@@ -140,17 +140,13 @@ func TestClear_AFailedRenameKeepsEverythingAndReportsIt(t *testing.T) {
 	r := newRecorder(a)
 	r.record("s1", synthSession(88, 1, 512)...)
 	settle(a)
-	// The rename needs to create an entry in root; a read-only root refuses it, while data/
-	// underneath stays writable.
-	if err := os.Chmod(root, 0o500); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { os.Chmod(root, 0o700) })
+	release := blockRenames(t, root, filepath.Join(root, dataDirName, dirName("s1")))
 
 	a.Cleared()
-	if _, err := a.AwaitClear(5 * time.Second); err == nil {
+	if _, err := a.AwaitClear(time.Hour); err == nil {
 		t.Fatal("a clear whose rename failed reported success")
 	}
+	release()
 	if rows := a.Summaries(); len(rows) != 1 || rows[0].ID != "s1" {
 		t.Fatalf("Summaries after a failed clear = %+v, want s1 kept", rows)
 	}

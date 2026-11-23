@@ -3,15 +3,11 @@ package tui
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/url"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -42,7 +38,6 @@ const (
 	paneDetail
 	panePipeline
 	panePluginDetail
-	paneCatalog
 	paneUsage
 	// paneAgents shows what each CODING AGENT has spent, and picks which one the views are
 	// scoped to; see agentScope. Not to be confused with paneNamespaces,
@@ -87,19 +82,19 @@ type connStateInfo struct {
 // confirmation) stays in the footer.
 const flashDuration = 3 * time.Second
 
-// defaultLocalEndpoint is where `[l]` connects when nothing better is known:
+// defaultLocalEndpoint is where `[L]` connects when nothing better is known:
 // the session API's in-cluster default port, reached through an existing
 // `kubectl port-forward`. Useful when agentop runs inside the mesh, or when the
 // cluster's pod list isn't visible to their kubeconfig but a tunnel is.
 //
 // A local install listens somewhere else entirely (47601 by default), so
 // RunOptions.LocalEndpoint overrides this with the address read from the
-// machine's own Cortex config. Hardcoding 9094 sent `[l]` to the wrong port on
+// machine's own Cortex config. Hardcoding 9094 sent `[L]` to the wrong port on
 // every laptop.
 const defaultLocalEndpoint = "http://localhost:9094"
 
 // localEndpointOr returns the resolved local endpoint, falling back to the
-// in-cluster default. One accessor so `[l]`, the footer and the help overlay
+// in-cluster default. One accessor so `[L]`, the footer and the help overlay
 // cannot disagree about where the key goes.
 func (m *model) localEndpointOr() string {
 	if m.localEndpoint != "" {
@@ -120,7 +115,7 @@ func (m *model) localEndpointOr() string {
 // Local wins when the endpoint on screen IS the local Cortex. Deliberately a
 // question about the connection rather than about how agentop was started, so
 // `--endpoint http://127.0.0.1:47601` aimed at your own proxy edits it just
-// like a bare `agentop` does, and `[l]` gains the same ability mid-session.
+// like a bare `agentop` does, and `[L]` gains the same ability mid-session.
 // Compared against localEndpoint rather than localEndpointOr(): the fallback
 // is the in-cluster 9094, and matching that would claim a hand-run
 // port-forward to a POD is this machine's config file.
@@ -180,7 +175,7 @@ func isLoopbackHost(h string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-// localProbeTimeout bounds the pre-connect reachability check for `[l]`.
+// localProbeTimeout bounds the pre-connect reachability check for `[L]`.
 // Without it, a dead localEndpoint would leave the operator in an empty
 // session view wondering why nothing streams; with it they get a footer
 // error and stay in the picker.
@@ -283,7 +278,7 @@ type snapshotLoadedMsg struct {
 }
 
 // olderPageLoadedMsg carries a page from BEFORE the events already held — the result of
-// [o]. Separate from snapshotLoadedMsg because that one REPLACES the timeline and this one
+// [↵ on ▲]. Separate from snapshotLoadedMsg because that one REPLACES the timeline and this one
 // extends it backwards; conflating them would drop everything the operator had loaded.
 //
 // gen is the request generation, so a response from a superseded request can be recognised
@@ -295,7 +290,7 @@ type olderPageLoadedMsg struct {
 	serverOldest uint64
 }
 
-// olderPageFailedMsg reports a failed [o] fetch.
+// olderPageFailedMsg reports a failed [↵ on ▲] fetch.
 //
 // Its own type rather than errMsg, whose handler decides severity by string-prefixing
 // `where` and treats anything unrecognised as a terminal connection failure — so a single
@@ -390,7 +385,7 @@ type model struct {
 
 	endpoint string
 	client   *apiclient.Client
-	// localEndpoint is what `[l]` connects to and what the footer and help
+	// localEndpoint is what `[L]` connects to and what the footer and help
 	// overlay name. Resolved from the local Cortex config when there is one.
 	localEndpoint string
 
@@ -483,8 +478,15 @@ type model struct {
 	// version is the build agentop was started as, shown after its name on every title bar.
 	// Empty renders the bare name, which is what tests construct.
 	version string
-	// lastHarvest is when the most recent harvest was STARTED. Read by ONE caller: the sessions
-	// pane's backoff gate, which asks whether untitledBackoff has elapsed since then. The picker
+	// updateFile is ~/.cortex/update.json. Empty shows no update notice.
+	updateFile string
+	// serviceInstall is true when the laptop service unit exists.
+	serviceInstall bool
+	// updateNote is the update notice after the build on the title bar.
+	updateNote string
+	// lastHarvest is when the most recent harvest was STARTED. Read by TWO callers: the sessions
+	// pane's backoff gate, which asks whether untitledBackoff has elapsed since then, and the
+	// timeline pane's gate for unlabeled subagents (timelineLabelHarvestEvery). The picker
 	// no longer has a cadence to measure — it harvests on arrival — so nothing there reads this.
 	//
 	// STAMPED BY EVERY PATH, THOUGH, INCLUDING THE ONES THAT NEVER READ IT, and that is a real
@@ -638,7 +640,14 @@ type model struct {
 	// searchOrigin is where the target was when `/` was pressed: the place typing searches
 	// from, and the place Esc puts it back.
 	searchOrigin searchSpot
-	paused       bool
+	// searchDetails is the events pane's `details` box: with it on, Enter, n and N go to the
+	// rows whose detail view shows the query. detailSearch is that search, in flight or
+	// answered, and detailSearchGen numbers each one, so an answer for an older one is
+	// dropped. See search_details.go.
+	searchDetails   bool
+	detailSearch    *detailSearch
+	detailSearchGen uint64
+	paused          bool
 	// hideInactive toggles whether passthrough / skip-only messages are
 	// hidden from the events table. False (default) shows every message —
 	// the operator asked to see all network traffic, processed or not.
@@ -668,7 +677,7 @@ type model struct {
 
 	// pageGen numbers page requests monotonically across the whole model, so a response
 	// from a superseded request is recognisable. Per-model rather than per-session state
-	// because a session's state is torn down and rebuilt by [t] followed by [o], and a
+	// because a session's state is torn down and rebuilt by [t] followed by [↵ on ▲], and a
 	// per-state counter would reissue a generation an in-flight request already holds.
 	pageGen uint64
 
@@ -706,7 +715,6 @@ type model struct {
 	sessionRowIDs []string
 	eventsTbl     table.Model
 	pipelineTbl   table.Model
-	catalogTbl    table.Model
 	detailVp      viewport.Model
 	// detailDoc is detailVp's text, searched — see searchdoc.go. Shared by message detail
 	// and plugin detail, as the viewport is.
@@ -715,19 +723,24 @@ type model struct {
 	// detailRow is the full events-pane row (event + any folded CONNECT
 	// tunnel) the detail view was opened on. Kept so layout() can re-render
 	// the detail pane on resize without re-deriving the tunnel fold.
-	detailRow    eventRow
-	detailPlugin *apiclient.PipelinePlugin
-	// The event detail pane as a tree — see detail_tree.go. detailHead is the header blocks
-	// drawn above it, detailLines what the last render drew, detailFolds the folds the reader
-	// opened or closed, and detailCursorPath the node the cursor is on and detailCursorOff its
-	// line within that node, so a re-render can put it back.
+	detailRow eventRow
+	// detailNum is the # the row showed when Enter opened it, and detailSummary the
+	// exchange's figures. The detail's fixed line quotes both (#1681).
+	detailNum     string
+	detailSummary string
+	detailPlugin  *apiclient.PipelinePlugin
+	// The event detail pane as a tree — see detail_tree.go. detailTree holds the page's two
+	// sections (see sectionsRoot), detailLines what the last render drew, detailFolds the
+	// folds the reader opened or closed, and detailCursorPath the node the cursor is on and
+	// detailCursorOff its line within that node, so a re-render can put it back.
 	detailTree       *node
-	detailHead       []string
 	detailLines      []treeLine
 	detailFolds      map[string]foldChoice
 	detailCursorPath string
 	detailCursorOff  int
-	searchInput      textinput.Model
+	// detailAim is where Enter on a tool row puts the cursor once the tree holds it (#1795).
+	detailAim   *toolAim
+	searchInput textinput.Model
 
 	// visibleRows holds the eventRow for each rendered row in eventsTbl —
 	// one per network message. Populated by rebuildEventsTable so
@@ -744,8 +757,9 @@ type model struct {
 	// when no row names one. Rebuilt on every rebuild; the collapse state
 	// lives in subagentOpen, not here.
 	subagentBlocks map[string]*subagentBlock
-	// subagentOpen is the subagent ids whose blocks are expanded. Absent =
-	// collapsed, which is the default. Kept across rebuilds so a live tail
+	// subagentOpen is the operator's open (true) or closed (false) choice per
+	// subagent id. Absent = the default: collapsed, but open for a Bob subtask
+	// (blockOpen). Kept across rebuilds so a live tail
 	// does not re-collapse a block the operator opened; cleared when another
 	// session is opened, since ids are per-session.
 	subagentOpen map[string]bool
@@ -840,12 +854,26 @@ type model struct {
 	// window at all — which is the error case the fetch has to report rather than a state worth
 	// restoring into.
 	agentScope string
-	agentsTbl  table.Model
-	// agentRowLabels is the scope each agentsTbl row selects, "" for All agents.
-	agentRowLabels []string
+	// projectScope is the project label the views are narrowed to under agentScope ("" is every
+	// project, otherProjects the sessions and spend that no named project holds). Enter on a
+	// project sub-row sets it (#1818). Not persisted, for the reason agentScope gives.
+	projectScope string
+	agentsTbl    table.Model
+	// agentRowDescs identifies each agentsTbl row, in row order (see rebuildAgentsTable).
+	agentRowDescs []agentRowDesc
 	// agentsErr is the last fetch failure, shown in the pane rather than swallowed: an empty
 	// breakdown and an unreachable endpoint look identical otherwise.
 	agentsErr error
+	// agentsExpanded holds the agent rows that space opened ("" is All agents); a closed row has
+	// no key. Not persisted across runs. agentProjects is each open row's last project fetch, and
+	// agentProjectsErr the last project fetch failure. agentsCursorWant is a project sub-row the
+	// cursor goes back to when its open row's fetch lands, while the cursor stays at
+	// agentsCursorWantAt (see rebuildAgentsTable).
+	agentsExpanded     map[string]bool
+	agentProjects      map[string]agentProjectsData
+	agentProjectsErr   error
+	agentsCursorWant   *agentRowDesc
+	agentsCursorWantAt int
 	// agentsFetchedAt is when the last per-agent fetch was issued, so the open pane polls.
 	agentsFetchedAt time.Time
 	// agentsWindowStep is how far `w` has moved the agents pane's window past today; see
@@ -881,7 +909,7 @@ type model struct {
 	// or quit.
 	activePF cluster.PortForward
 
-	// localDirect is true when the session view was entered via `[l]`
+	// localDirect is true when the session view was entered via `[L]`
 	// (direct connection to localEndpoint) rather than by picking a pod.
 	// There is no pod to go back to, so Esc returns to the Namespaces
 	// pane instead of Pods.
@@ -913,7 +941,10 @@ type model struct {
 	//
 	// Tracked rather than inferred from the event: see needsFullEvent for why a
 	// presence check cannot answer this for response events.
-	fullFetched map[string]map[uint64]bool
+	//
+	// The value is the event's exact capture, nil when the proxy had none: a capture never
+	// changes, so a row opened again shows it without asking the archive again.
+	fullFetched map[string]map[uint64]*pipeline.RawCapture
 
 	// serverProjects records that this proxy honours view=summary, learned from its
 	// echo on any snapshot. It decides whether the detail pane has to fetch the row
@@ -991,7 +1022,6 @@ func New(ctx context.Context, c *apiclient.Client, opts ...Option) tea.Model {
 		sessionsTbl:  newSessionsTable(),
 		eventsTbl:    newEventsTable(),
 		pipelineTbl:  newPipelineTable(),
-		catalogTbl:   newCatalogTable(),
 		agentsTbl:    newAgentsTable(),
 		previousPane: paneNone,
 		// paneNone, not the zero value: paneNamespaces is 0, and a return pane
@@ -1037,7 +1067,7 @@ func (m *model) initSessionView() tea.Cmd {
 // ctx / cancel is derived from m.parentCtx so the next session-view
 // entry has a usable context.
 //
-// When the session was entered via `[l]` there is no pod to return to,
+// When the session was entered via `[L]` there is no pod to return to,
 // so the destination is the Namespaces pane instead.
 func (m *model) backToPodsPane() {
 	// Cancel current ctx — stops the SSE goroutine and any in-flight
@@ -1103,7 +1133,6 @@ func (m *model) backToPodsPane() {
 	// different framework instance with potentially different plugin
 	// versions registered. The next `P` press refetches.
 	m.catalog = nil
-	m.catalogTbl.SetRows(nil)
 	// pickerHarvested and pickerShowing are deliberately NOT reset here. They are edge-derived: the
 	// next refresh tick recomputes "is the picker showing", finds it disagrees with the recorded
 	// pickerShowing, and clears the budget on that inequality. Resetting them here would make this
@@ -1154,6 +1183,7 @@ func (m *model) backToPodsPane() {
 			delete(m.search, t)
 		}
 	}
+	m.resetDetailSearch()
 	m.searching = false
 	m.searchInput.SetValue("")
 	// The prompt's line comes off the height budget while it is open, so dropping the flag
@@ -1170,7 +1200,7 @@ func (m *model) backToPodsPane() {
 	m.ctx, m.cancel = context.WithCancel(m.parentCtx)
 
 	if m.localDirect {
-		// Entered via `[l]`: no pod was ever selected, so the Pods pane
+		// Entered via `[L]`: no pod was ever selected, so the Pods pane
 		// would render an empty table for a namespace the user never
 		// picked. Go back to where they actually were.
 		m.localDirect = false
@@ -1273,9 +1303,8 @@ type catalogLoadedMsg struct {
 	err     error
 }
 
-// loadCatalogCmd fetches /v1/plugins. Called lazily when the user
-// presses `P` to enter the catalog pane; the result is cached on the
-// model and refreshed on demand.
+// loadCatalogCmd fetches /v1/plugins: on each `P`, for the pipeline pane's
+// available rows, and kept on the model for the pipeline editor.
 func (m *model) loadCatalogCmd() tea.Cmd {
 	return func() tea.Msg {
 		cat, err := m.client.GetPluginCatalog(m.ctx)
@@ -1283,12 +1312,17 @@ func (m *model) loadCatalogCmd() tea.Cmd {
 	}
 }
 
+// tick schedules every tick this package arms. It is tea.Tick, as a var so the package's
+// tests can fire a tick at once and read the interval it was given. Nothing in production
+// writes it.
+var tick = tea.Tick
+
 func tickCmd() tea.Cmd {
-	return tea.Tick(time.Second, func(t time.Time) tea.Msg { return tickMsg(t) })
+	return tick(time.Second, func(t time.Time) tea.Msg { return tickMsg(t) })
 }
 
 func refreshTickCmd() tea.Cmd {
-	return tea.Tick(refreshInterval, func(t time.Time) tea.Msg { return refreshTickMsg(t) })
+	return tick(refreshInterval, func(t time.Time) tea.Msg { return refreshTickMsg(t) })
 }
 
 // loadSessionsCmd fetches the session list: every session the proxy holds in memory and, where it
@@ -1358,9 +1392,16 @@ func (m *model) snapshotCmd(id string) tea.Cmd {
 // Decided HERE, around the dispatch, rather than at the thirty-odd places that assign
 // m.pane, so a pane change added later cannot forget it.
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	before := m.pane
+	before, reserved := m.pane, m.spendDrawerReservesRows()
 	next, cmd := m.update(msg)
+	if m.spendDrawerReservesRows() != reserved {
+		// The drawer's rows depend on the pane now, and no other layout() call sees every pane change.
+		m.layout()
+	}
 	if m.pane != before {
+		if before == paneEvents && m.detailSearching() {
+			m.cancelDetailSearch() // an answer that already landed stays, for n on the way back
+		}
 		cmd = tea.Batch(tea.ClearScreen, cmd)
 	}
 	return next, cmd
@@ -1586,11 +1627,33 @@ func (m *model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// background refresh reordered under the cursor — the one transition no keypress
 		// sees, since `A` enters a round trip after the press. See syncSpendScope.
 		sync := m.syncSpendScope()
+		// The open rows refetch their projects with the rows: the poll, `w`, `A` and esc all come
+		// here.
+		projects := m.fetchOpenProjectsCmd()
 		if m.client != nil && !m.pipelineFetching {
 			m.pipelineFetching = true
-			return m, tea.Batch(m.loadPipelineCmd(), sync)
+			return m, tea.Batch(m.loadPipelineCmd(), sync, projects)
 		}
-		return m, sync
+		return m, tea.Batch(sync, projects)
+
+	case agentProjectsLoadedMsg:
+		if msg.window != m.agentsSpanDef().window {
+			return m, nil
+		}
+		// A failed fetch keeps the sub-rows it has, with the error under the table.
+		m.agentProjectsErr = msg.err
+		if msg.err == nil {
+			if m.agentProjects == nil {
+				m.agentProjects = map[string]agentProjectsData{}
+			}
+			m.agentProjects[msg.agent] = msg.data
+		}
+		if m.pane == paneAgents {
+			m.rebuildAgentsTable()
+			// The rebuild can move the cursor onto the scoped sub-row.
+			return m, m.syncSpendScope()
+		}
+		return m, nil
 
 	case usageLoadedMsg:
 		// Discard anything but the newest request's reply. Two rapid `w` presses
@@ -1618,7 +1681,7 @@ func (m *model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case timelineLoadedMsg:
 		m.handleTimelineLoaded(msg)
-		return m, nil
+		return m, m.harvestForTimeline()
 
 	case timelineTickMsg:
 		return m, m.handleTimelineTick(msg)
@@ -1633,6 +1696,9 @@ func (m *model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(m.fetchUsage(), usageTick(m.usage.tickGen))
 
 	case refreshTickMsg:
+		// On each tick, not on reconnect: the updater writes the file after the
+		// restarted proxy serves, so a reconnect usually reads the old result.
+		m.readUpdateNotice()
 		// ARRIVING AT THE PICKER ENDS ITS ONE-HARVEST-PER-VISIT BUDGET. Detected here, on the
 		// edge, so the two dozen places that assign m.pane do not each have to remember to clear
 		// it — and so one added later cannot quietly skip the harvest by inheriting a set flag.
@@ -1777,7 +1843,7 @@ func (m *model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.catalog = msg.catalog
-		m.rebuildCatalogTable()
+		m.rebuildPipelineTable()
 		return m, nil
 
 	case snapshotLoadedMsg:
@@ -1844,7 +1910,7 @@ func (m *model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// Older than the tail the snapshot holds: say so rather than leave the cursor
 				// somewhere the operator did not ask for.
 				m.revealSeq, m.revealSess = 0, ""
-				m.setFlash("that event is older than the loaded tail — [o] loads earlier pages")
+				m.setFlash("that event is older than the loaded tail — the first row loads earlier pages")
 			}
 		}
 		// AND THE SESSIONS ROW, because the rebase above changed this session's CTX(1M)
@@ -1904,8 +1970,9 @@ func (m *model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		ev := apiclient.StreamEvent(msg)
 		m.handleStreamEvent(ev)
 		// Re-pump the same channel for the next message. A single apiclient
-		// goroutine fills the channel for the duration of ctx.
-		return m, streamPump(m.streamCh)
+		// goroutine fills the channel for the duration of ctx. A response for the
+		// exchange open in the detail pane fills it (#1681).
+		return m, tea.Batch(streamPump(m.streamCh), m.fillDetailResponse(ev.Event))
 
 	case spendLoadedMsg:
 		m.applySpendLoaded(msg)
@@ -1965,6 +2032,10 @@ func (m *model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case detailEventLoadedMsg:
 		m.applyDetailEvent(msg)
+		return m, nil
+
+	case detailSearchMsg:
+		m.applyDetailSearch(msg)
 		return m, nil
 
 	case errMsg:
@@ -2032,12 +2103,12 @@ func (m *model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		//
 		// The pod fields are CLEARED rather than assumed empty. They are only
 		// empty when no pod was ever visited: backToPodsPane clears ~20 fields
-		// but not these, so "pick a pod → esc → [l]" arrives here with
+		// but not these, so "pick a pod → esc → [L]" arrives here with
 		// selectedNamespace / selectedPod naming the pod and statusURL naming
 		// its closed port-forward. Since pipelineStore falls back to the
 		// ConfigMap branch on exactly those three, leaving them set let `e`
 		// kubectl-apply against a pod the screen was not showing — and poll a
-		// forward this path never established. Harmless while `[l]` sessions
+		// forward this path never established. Harmless while `[L]` sessions
 		// were assumed storeless; a wrong-target write once they were not.
 		m.selectedNamespace = ""
 		m.selectedPod = ""
@@ -2172,7 +2243,7 @@ func (m *model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.editState.applyTime = msg.ApplyTime
 		m.editState.phase = editPhaseWaiting
 		return m, withGen(m.editState.generation, edit.PollCmd(
-			m.ctx, m.editState.statusURL, msg.ApplyTime,
+			m.ctx, m.editState.statusURL, msg.ApplyTime, msg.BaselineFailed,
 			describeTarget(m.editState.store)))
 
 	case genPolledMsg:
@@ -2388,7 +2459,7 @@ func (m *model) handleStreamEvent(ev apiclient.StreamEvent) {
 	}
 stale:
 	m.sessionsStale = true
-	if m.pane == paneTimeline && m.timeline.session == e.SessionID {
+	if m.timelineChainLive() && m.timeline.session == e.SessionID {
 		m.timeline.stale = true // refetched on the pane's next tick, at most once a second
 	}
 	if m.pane == paneEvents && m.selectedSess == e.SessionID {
@@ -2408,7 +2479,8 @@ stale:
 // only opening another session or erasing clears it) or the timeline's
 // (openTimeline does not set selectedSess; leaving the timeline pane clears
 // it, so a session glanced at once does not keep its stream for the rest of
-// the run). This is the retention predicate for streamed events (#1542):
+// the run. The events pane sets it only to selectedSess, and erasing clears
+// it with selectedSess). This is the retention predicate for streamed events (#1542):
 // everything else arrives, updates its summary, and is dropped.
 func (m *model) watchingSession(id string) bool {
 	return m.selectedSess == id || m.timeline.session == id
@@ -2492,12 +2564,13 @@ func (m *model) paneView() string {
 		if m.namespaces != nil && len(m.namespaces) == 0 && m.pickerErr == "" {
 			body = styleHint.Render(
 				"No Cortex agents found in this cluster.\n" +
-					"Press [l] to connect to " + m.localEndpointOr() + " (an existing\n" +
+					"Press [L] to connect to " + m.localEndpointOr() + " (an existing\n" +
 					"port-forward), or use `agentop --endpoint http://...`.")
 		} else {
 			body = m.namespacesTbl.View()
 		}
-		footer := m.helpView()
+		keys := m.helpView()
+		footer := keys
 		if m.pickerErr != "" {
 			footer = "error: " + m.pickerErr + "    " + footer
 		}
@@ -2515,16 +2588,17 @@ func (m *model) paneView() string {
 		// the title alone. layout() reserves its row unconditionally, so a pane that skipped
 		// drawing it would leave a row nobody fills.
 		return lipgloss.JoinVertical(lipgloss.Left,
-			styleTitle.Render(title),
-			styleMuted.Render(renderDivider(m.width)),
+			renderTitle(title),
+			styleDim.Render(renderDivider(m.width)),
 			body,
-			styleHint.Render(footer),
+			renderTrailingHints(footer, keys),
 		)
 	}
 	if m.pane == panePods {
 		title := m.appName() + " · " + m.selectedNamespace + " · pick pod"
 		body := m.podsTbl.View()
-		footer := m.helpView()
+		keys := m.helpView()
+		footer := keys
 		if m.pickerErr != "" {
 			footer = "error: " + m.pickerErr + "    " + footer
 		}
@@ -2539,10 +2613,10 @@ func (m *model) paneView() string {
 		// row of the table above it.
 		footer = fitHintLine(footer, m.width)
 		return lipgloss.JoinVertical(lipgloss.Left,
-			styleTitle.Render(title),
-			styleMuted.Render(renderDivider(m.width)),
+			renderTitle(title),
+			styleDim.Render(renderDivider(m.width)),
 			body,
-			styleHint.Render(footer),
+			renderTrailingHints(footer, keys),
 		)
 	}
 	if m.width == 0 {
@@ -2573,8 +2647,10 @@ func (m *model) paneView() string {
 		// for a reader who wants it spelled out.
 		title = fmt.Sprintf("%s · %s", m.appName(), m.endpoint)
 		body = m.sessionsTbl.View()
-		if m.sessionsScope() != "" && len(m.sessionRowIDs) == 0 {
-			body = styleHint.Render("(no session belongs to " + sanitizeLabel(m.agentScope) + ")")
+		if (m.sessionsScope() != "" || m.sessionsProjectScope() != "") && len(m.sessionRowIDs) == 0 {
+			rest := strings.TrimPrefix(m.scopeSuffix(m.sessionsScope(), m.sessionsProjectScope()), " · ")
+			rest = strings.TrimPrefix(rest, "agent=")
+			body = styleHint.Render("(no session belongs to " + rest + ")")
 		}
 	case paneEvents:
 		// Fitted to the terminal rather than to a fixed 36: a bare UUID is 36 characters, so
@@ -2588,7 +2664,7 @@ func (m *model) paneView() string {
 		}
 	case paneDetail:
 		title = m.sessionHeader(m.selectedSess, "event")
-		body = m.detailVp.View()
+		body = m.detailFixedLine() + "\n" + m.detailVp.View()
 	case panePipeline:
 		// Names itself, because nothing else does any more. While the tab strip
 		// was in the title it said which of the two top-level views was showing;
@@ -2613,11 +2689,9 @@ func (m *model) paneView() string {
 			scope = m.usage.session
 		}
 		title = fmt.Sprintf("%s · %s · usage · %s", m.appName(), m.endpoint, scope)
-		// The agent scope goes in the TITLE because it changes what every figure on the pane
-		// means.
-		if m.agentScope != "" {
-			title += " · agent=" + sanitizeLabel(m.agentScope)
-		}
+		// The agent and project scopes go in the TITLE because they change what every figure on
+		// the pane means.
+		title += m.scopeSuffix(m.agentScope, m.projectScope)
 		body = m.usageBody()
 	case paneAgents:
 		// The window is in the title because the figures are a day's, not a lifetime's, and
@@ -2627,9 +2701,7 @@ func (m *model) paneView() string {
 		// cursor here (spendScopeAgent), so the row is what every figure on screen describes.
 		// It used to name the committed scope, which put "scoped to claude-code" over a band
 		// and drawer showing bob-shell. Enter still commits the row.
-		if agent := m.spendScopeAgent(); agent != "" {
-			title += " · agent=" + sanitizeLabel(agent)
-		}
+		title += m.scopeSuffix(m.spendScopeAgent(), m.spendScopeProject())
 		hasRows := len(m.pickerRows()) > 0
 		switch {
 		case m.agentsErr != nil && !hasRows:
@@ -2638,38 +2710,33 @@ func (m *model) paneView() string {
 			body = styleHint.Render("(agent breakdown unavailable: " + m.agentsErr.Error() + ")")
 		case !hasRows:
 			body = styleHint.Render("(no agent traffic in this window)")
-		case m.agentsErr != nil:
+		case m.agentsErr != nil || m.agentProjectsErr != nil:
 			// A failed refresh keeps the rows on screen, one line shorter to fit the hint.
+			err := m.agentsErr
+			if err == nil {
+				err = m.agentProjectsErr
+			}
 			tbl := m.agentsTbl
 			if m.bodyHeight > 1 {
 				tbl.SetHeight(m.bodyHeight - 1)
 			}
-			body = tbl.View() + "\n" + styleHint.Render(clipRow("(refresh failed: "+m.agentsErr.Error()+")", m.width))
+			body = tbl.View() + "\n" + styleHint.Render(clipRow("(refresh failed: "+err.Error()+")", m.width))
 		default:
 			body = m.agentsTbl.View()
 		}
 	case paneTimeline:
 		title = m.sessionHeader(m.timeline.session, "timeline")
 		body = m.timelineBody()
-	case paneCatalog:
-		title = fmt.Sprintf("%s · %s · catalog", m.appName(), m.endpoint)
-		if m.catalog == nil {
-			body = styleHint.Render("(loading catalog…)")
-		} else if len(m.catalog.Plugins) == 0 {
-			body = styleHint.Render("(no registered plugins reported by /v1/plugins)")
-		} else {
-			body = m.catalogTbl.View()
-		}
 	}
 
 	// The band above every pane is scoped too, so every pane says so; usage and agents word it
-	// themselves above, and sessionHeader carries it for the events and detail panes.
-	if m.agentScope != "" && m.pane != paneUsage && m.pane != paneAgents && m.pane != paneEvents && m.pane != paneDetail {
-		title += " · agent=" + sanitizeLabel(m.agentScope)
+	// themselves above, and sessionHeader carries it for the events, detail and timeline panes.
+	if m.pane != paneUsage && m.pane != paneAgents && m.pane != paneEvents && m.pane != paneDetail && m.pane != paneTimeline {
+		title += m.scopeSuffix(m.agentScope, m.projectScope)
 	}
-	header := styleTitle.Render(title)
+	header := renderTitle(title)
 	if m.searching && m.searchPane != targetHelp {
-		body = m.searchInput.View() + "\n" + body
+		body = m.searchPromptView() + "\n" + body
 	}
 	// A row slice rather than a fixed JoinVertical, so the strip's row can be absent
 	// without needing a second call site. It sits directly under the title because that
@@ -2712,7 +2779,7 @@ func (m *model) paneView() string {
 			// `styleMuted.Render(band[0]), band[1]` — which is a hierarchy that exists only while
 			// labels and figures live on separate rows. Folded to one row, wrapping the line would
 			// mute the figures with the labels and flatten the contrast into uniform grey, so the
-			// mute moved to where a cell knows which half is which. See bandCell.renderMuting.
+			// mute moved to where a cell knows which half is which. See bandCell.renderInk.
 			//
 			// ONE CALL, because this is bubbletea's per-event render path and spendSummary walks
 			// all four poll chains. `drew` comes back from the renderer rather than being tested
@@ -2734,20 +2801,18 @@ func (m *model) paneView() string {
 				// The axis and span come off the SNAPSHOT, not off what was last requested: see
 				// drawerLabels.
 				axis, window := m.drawerLabels()
-				lines = renderSpendDrawerAxes(m.spend.drawer.snap, m.spend.drawer.err, axis, m.spend.drawerAxis, m.spendAxes(), window, m.width)
+				lines = renderSpendDrawerAxes(m.spend.drawer.snap, m.spend.drawer.err, axis, m.spend.drawerAxis, m.spendAxes(), window, m.spend.drawerProject, m.width)
 			}
 			for len(lines) < spendDrawerLinesFor(m.width) {
 				lines = append(lines, "")
 			}
-			for _, line := range lines {
-				rows = append(rows, styleMuted.Render(line))
-			}
+			rows = append(rows, styleDrawerLines(lines)...)
 		}
 	}
 	// The rule that closes the top block, AFTER the band and its drawer so it always sits
 	// between the whole block and the body rather than inside it. Appended unconditionally,
 	// which is what lets layout() reserve it without asking anything — see renderDivider.
-	rows = append(rows, styleMuted.Render(renderDivider(m.width)))
+	rows = append(rows, styleDim.Render(renderDivider(m.width)))
 	rows = append(rows, body, m.footerView())
 	return lipgloss.JoinVertical(lipgloss.Left, rows...)
 }
@@ -2758,10 +2823,14 @@ func (m *model) paneView() string {
 // is how a report about this TUI usually arrives, and the build is the first thing worth
 // knowing about it.
 func (m *model) appName() string {
-	if m.version == "" {
-		return "agentop"
+	name := "agentop"
+	if m.version != "" {
+		name += " " + m.version
 	}
-	return "agentop " + m.version
+	if m.updateNote != "" {
+		name += " " + m.updateNote
+	}
+	return name
 }
 
 // sessionHeader renders a session-scoped title bar: "agentop · <label>" plus an optional
@@ -2783,9 +2852,16 @@ func (m *model) sessionHeader(id, suffix string) string {
 	if suffix != "" {
 		tail = " · " + suffix
 	}
-	if m.agentScope != "" {
-		tail += " · agent=" + sanitizeLabel(m.agentScope)
+	// The parent is the topmost session above this one, not always the one that started it:
+	// for A → B → C, C shows A. The id comes from a client header, so it is sanitised first.
+	if p := m.parentSessionOf(id); p != "" {
+		p = sanitizeLabel(p)
+		if r := []rune(p); len(r) > 8 {
+			p = string(r[:8])
+		}
+		tail += " · under " + p
 	}
+	tail += m.scopeSuffix(m.agentScope, m.projectScope)
 	// A floor of 12, so a very narrow terminal shows a stub of the label rather than dropping
 	// it: the header is the only thing on screen naming which session these events belong to.
 	//
@@ -2830,162 +2906,9 @@ func (m *model) sessionHeader(id, suffix string) string {
 // Latent rather than observed, which is why the fix is a redirect and not a rewrite: on ASCII
 // this is byte-for-byte what the old rune-counting version returned, so no current caller
 // changes behaviour (there is a probe for that equivalence in the sessions title tests). The
-// column-aware implementation lives in sessions_pane.go beside its left-truncating mirror.
+// column-aware implementation lives in sessions_title.go beside its left-truncating mirror.
 func trunc(s string, n int) string {
 	return truncRight(s, n)
-}
-
-// yankDirRel is the yank output directory, relative to the user's home. It
-// follows the same convention as agentop's other durable state (cmd_claudecode.go's
-// cortexCfgRel / stateRel), so there is one ~/.cortex tree rather than a new one.
-const yankDirRel = ".cortex/agentop-events"
-
-// yankDir returns the absolute directory yank writes into.
-//
-// Not os.TempDir(): on macOS that is /var/folders/<opaque>/T, so a yanked file
-// landed on a 92-character path nobody could find or retype, which is #868.
-//
-// Not a fixed path under /tmp either, which is where this started. /tmp is
-// world-writable, and os.MkdirAll returns nil for a path that already exists
-// whatever its owner or mode — so a fixed /tmp/<name> cannot enforce 0700, can
-// be pre-created as a symlink that redirects where events land, and on a shared
-// host is squatted by whoever yanks first, permanently breaking everyone else.
-// Session events carry identity subjects, raw LLM completions and tool
-// arguments, so none of that is acceptable for a directory holding them.
-//
-// ~/.cortex is the user's own tree and is normally 0700, which makes those cases
-// unreachable — but agentop never creates it, so its mode is whatever an installer
-// or the user left. With a 0755 ~/.cortex, MkdirAll neither tightens the mode nor
-// refuses to follow an agentop-events symlink someone planted, and the event lands
-// in their directory. Verified. So the guarantee is enforced here rather than
-// assumed: yankEventToFile Lstats the directory and refuses to write unless it is
-// a real directory, owned by this user, with no group or world access.
-//
-// Still far shorter than where this started, and a location users already know.
-func yankDir() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("cannot determine your home directory: %w", err)
-	}
-	if home == "" {
-		// Separate branch, not folded into the one above: %w on a nil error
-		// renders as "%!w(<nil>)", which would make this defensive path
-		// unreadable to whoever ever hits it.
-		return "", errors.New("cannot determine your home directory: it is empty")
-	}
-	return filepath.Join(home, yankDirRel), nil
-}
-
-// checkYankDir refuses to write into a directory that does not actually protect
-// its contents. MkdirAll returns nil for a path that already exists whatever its
-// owner or mode, and it happily follows a symlink — so an agentop-events symlink
-// planted by another local user would silently redirect events carrying identity
-// subjects and raw LLM completions into their directory.
-//
-// Checks every component from the home directory down, not just the leaf: a
-// symlinked ~/.cortex redirects the whole subtree just as effectively, and the
-// leaf-only version of this function missed it (verified — the event landed in the
-// attacker's tree). Lstat, not Stat: Stat resolves the link and would report the
-// target's mode.
-//
-// The mode requirement applies only to the directories agentop owns (~/.cortex and
-// agentop-events), not to the home directory itself: a real home is commonly 0750
-// or 0755 — this machine's is 0750 — and demanding 0700 there would refuse to
-// yank on an ordinary account. Every component is still checked for a symlink,
-// which is the redirection risk.
-//
-// A loose mode on a directory agentop owns is tightened rather than refused, which
-// is what the rest of the tree already does for this exact problem:
-// writeBuiltinConfig in cmd/cortex/local.go chmods ~/.cortex to 0700
-// after MkdirAll, and again one level down for the CA directory. Self-healing
-// beats handing the user a chmod to run by hand, and if the chmod fails — someone
-// else owns it — the refusal below still stands. Symlinks and non-directories stay
-// hard refusals; there is no chmod out of those.
-//
-// Ownership is deliberately not checked via syscall.Stat_t: that type does not
-// exist on Windows and would break this package's cross-compile.
-func checkYankDir(dir string) error {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return err
-	}
-	rel, err := filepath.Rel(home, dir)
-	if err != nil {
-		return err
-	}
-
-	// home first (symlink check only), then each component agentop owns.
-	fi, err := os.Lstat(home)
-	if err != nil {
-		return err
-	}
-	if fi.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("%s is a symlink; refusing to write session events "+
-			"through it", home)
-	}
-
-	path := home
-	for _, part := range strings.Split(rel, string(filepath.Separator)) {
-		path = filepath.Join(path, part)
-		fi, err := os.Lstat(path)
-		if err != nil {
-			return err
-		}
-		if fi.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("%s is a symlink; refusing to write session events "+
-				"through it", path)
-		}
-		if !fi.IsDir() {
-			return fmt.Errorf("%s is not a directory", path)
-		}
-		if perm := fi.Mode().Perm(); perm&0o077 != 0 {
-			// Tighten in place; only report if that does not work.
-			if err := os.Chmod(path, 0o700); err != nil {
-				return fmt.Errorf("%s has mode %v and could not be tightened "+
-					"(%v); session events need no group or world access "+
-					"(chmod 700 %s)", path, perm, err, path)
-			}
-		}
-	}
-	return nil
-}
-
-// yankEventToFile writes the currently-focused event to a fresh file in yankDir
-// as pretty JSON and returns the path. Uses os.CreateTemp so the file is
-// created with 0600 perms (session events carry identity subjects, raw
-// LLM completions, and tool arguments — the operator-only default keeps
-// them off shared / CI hosts). CreateTemp also implies O_EXCL, so there is no
-// create-then-chmod window.
-func yankEventToFile(e *pipeline.SessionEvent) (string, error) {
-	dir, err := yankDir()
-	if err != nil {
-		return "", err
-	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", err
-	}
-	if err := checkYankDir(dir); err != nil {
-		return "", err
-	}
-	ts := time.Now().UTC().Format("20060102-150405")
-	// No "agentop-event-" name prefix: inside a directory already called
-	// agentop-events it says nothing. The random tail stays — it is what keeps
-	// two yanks in the same second from clobbering each other.
-	f, err := os.CreateTemp(dir, ts+"-*.json")
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-	data, err := json.MarshalIndent(e, "", "  ")
-	if err != nil {
-		os.Remove(f.Name())
-		return "", err
-	}
-	if _, err := f.Write(data); err != nil {
-		os.Remove(f.Name())
-		return "", err
-	}
-	return f.Name(), nil
 }
 
 // RunOptions selects the entry mode for agentop's TUI.
@@ -3000,7 +2923,7 @@ type RunOptions struct {
 	Endpoint      string
 	Lister        cluster.Lister
 	PortForwarder cluster.PortForwarder
-	// LocalEndpoint overrides where `[l]` connects. Empty means
+	// LocalEndpoint overrides where `[L]` connects. Empty means
 	// defaultLocalEndpoint.
 	LocalEndpoint string
 	// LocalConfigPath and LocalStatsURL describe the Cortex running on this
@@ -3031,6 +2954,10 @@ type RunOptions struct {
 	Harvest HarvestFunc
 	// Version names this build on the title bar. Empty shows the name alone.
 	Version string
+	// UpdateFile is ~/.cortex/update.json. Empty shows no update notice.
+	UpdateFile string
+	// ServiceInstall is true when the laptop service unit exists.
+	ServiceInstall bool
 }
 
 // Run starts the bubbletea program. See RunOptions for mode selection.
@@ -3053,6 +2980,9 @@ func Run(ctx context.Context, opts RunOptions) error {
 	m.save = opts.Save
 	m.harvest = opts.Harvest
 	m.version = opts.Version
+	m.updateFile = opts.UpdateFile
+	m.serviceInstall = opts.ServiceInstall
+	m.readUpdateNotice()
 	defer func() {
 		if m.activePF != nil {
 			_ = m.activePF.Close()
@@ -3091,102 +3021,6 @@ func Run(ctx context.Context, opts RunOptions) error {
 	defer fmt.Fprint(os.Stdout, ansi.SetModeAutoWrap)
 	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithContext(ctx))
 	_, err := p.Run()
-	return err
-}
-
-// wantCursorKeys reports whether agentop is running in Terminal.app, the terminal
-// application cursor-key mode was added for. The mode is not free: terminals that
-// follow xterm (the xterm-256color terminfo says khome=\EOH, kend=\EOF) then send
-// Home and End as ESC O H and ESC O F, and bubbletea v1.3.10 cannot read either —
-// it splits each into alt+O and a bare letter, so the tables' home/end bindings
-// stop working and Home in the search prompt types an H. Terminal.app keeps Home and
-// End for scrolling its own window by default, so it pays nothing for the mode.
-// GNOME Terminal, Konsole, Alacritty and kitty are believed to turn an alt-screen
-// scroll into arrows without it (not verified here), so elsewhere the mode would
-// likely cost those keys and buy nothing.
-//
-// TERM_PROGRAM rather than GOOS, because the cost belongs to the terminal: iTerm2
-// runs on the same Macs and is not known to share Terminal.app's Home/End default.
-// tmux sets its own TERM_PROGRAM, and the scroll is tmux's to handle there anyway.
-func wantCursorKeys() bool {
-	return os.Getenv("TERM_PROGRAM") == "Apple_Terminal"
-}
-
-// openEditorCmd returns a tea.Cmd that suspends bubbletea, runs $EDITOR
-// (vi if unset) on path, and emits editorExitedMsg when the editor exits.
-// gen is captured at call time so the handler can detect a stale exit
-// from an aborted-then-restarted edit.
-func openEditorCmd(gen int, path string) tea.Cmd {
-	editor := os.Getenv("EDITOR")
-	if editor == "" {
-		editor = "vi"
-	}
-	c := exec.Command("sh", "-c", editor+" "+path)
-	exited := func(err error) tea.Msg {
-		return editorExitedMsg{gen: gen, err: err}
-	}
-	if wantCursorKeys() {
-		return tea.Exec(cursorKeysCmd{autowrapCmd{c}}, exited)
-	}
-	return tea.Exec(autowrapCmd{c}, exited)
-}
-
-// autowrapCmd lends the terminal to a command with autowrap on, and turns it off again
-// once the command exits. Run turns it off for agentop's own rows (see there), but an
-// editor drawing its own screen expects the terminal's default, and bubbletea's
-// ReleaseTerminal and RestoreTerminal do not know about the mode.
-//
-// Written to the command's own stdout, before its output and after it, for the reason
-// cursorKeysCmd writes there: bubbletea has released the terminal while Run is called,
-// so the writes cannot land inside a frame.
-type autowrapCmd struct{ *exec.Cmd }
-
-// The setters leave an already-set stream alone, as tea.ExecProcess's own wrapper does.
-func (c autowrapCmd) SetStdin(r io.Reader) {
-	if c.Stdin == nil {
-		c.Stdin = r
-	}
-}
-
-func (c autowrapCmd) SetStdout(w io.Writer) {
-	if c.Stdout == nil {
-		c.Stdout = w
-	}
-}
-
-func (c autowrapCmd) SetStderr(w io.Writer) {
-	if c.Stderr == nil {
-		c.Stderr = w
-	}
-}
-
-func (c autowrapCmd) Run() error {
-	if c.Stdout != nil {
-		_, _ = io.WriteString(c.Stdout, ansi.SetModeAutoWrap)
-	}
-	err := c.Cmd.Run()
-	if c.Stdout != nil {
-		_, _ = io.WriteString(c.Stdout, ansi.ResetModeAutoWrap)
-	}
-	return err
-}
-
-// cursorKeysCmd runs a command that borrows the terminal and sets application
-// cursor-key mode again once it exits, because an editor resets the mode on its
-// way out (vi's rmkx does) and bubbletea's RestoreTerminal does not know to set it.
-// Without this, one `e` would leave the trackpad scrolling the terminal's
-// scrollback for the rest of the session. Run is called while bubbletea has
-// released the terminal, so the write cannot interleave with a frame.
-//
-// It wraps an autowrapCmd because every command agentop lends the terminal to needs
-// that one, and takes its stream setters from it.
-type cursorKeysCmd struct{ autowrapCmd }
-
-func (c cursorKeysCmd) Run() error {
-	err := c.autowrapCmd.Run()
-	if c.Stdout != nil {
-		_, _ = io.WriteString(c.Stdout, ansi.SetModeCursorKeys)
-	}
 	return err
 }
 

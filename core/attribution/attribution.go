@@ -16,7 +16,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/rossoctl/cortex/core/pipeline"
+	"github.com/rossoctl/cortex/core/model"
 	"github.com/rossoctl/cortex/core/session"
 )
 
@@ -61,12 +61,14 @@ type Attribution struct {
 	Session string
 	// Header is the session-id header that named Session when Source is header.
 	Header string
-	// Source says how Session was decided. pipeline.SessionSourcePending means "an agent
+	// Source says how Session was decided. model.SessionSourcePending means "an agent
 	// process that has named no session yet".
-	Source pipeline.SessionSource
+	Source model.SessionSource
 	// ChainSession is the live session the topmost process above the client named; see
 	// pipeline.Context.ChainSession.
 	ChainSession string
+	// ChainProc is the process that holds ChainSession, as Proc.Key. "" when ChainSession is "".
+	ChainProc string
 }
 
 // PluginID is the session handed to plugins: a named session, the pending bucket for a
@@ -75,7 +77,7 @@ func (a Attribution) PluginID() string {
 	switch {
 	case a.Session != "" && a.Session != session.DefaultSessionID:
 		return a.Session
-	case a.Source == pipeline.SessionSourcePending:
+	case a.Source == model.SessionSourcePending:
 		return session.PendingID(a.Agent, a.Proc)
 	}
 	return ""
@@ -87,7 +89,7 @@ func (a Attribution) RecordID() string {
 	if a.Session != "" {
 		return a.Session
 	}
-	if a.Source == pipeline.SessionSourcePending {
+	if a.Source == model.SessionSourcePending {
 		return session.PendingID(a.Agent, a.Proc)
 	}
 	return ""
@@ -135,7 +137,7 @@ func AgentOf(h http.Header) string {
 	if h == nil {
 		return ""
 	}
-	return pipeline.ParseUserAgent(h.Get("User-Agent")).AffinityName()
+	return model.ParseUserAgent(h.Get("User-Agent")).AffinityName()
 }
 
 // Resolve attributes one request. h is the request's headers as the client sent them, nil
@@ -159,7 +161,11 @@ func (a *Attributor) Resolve(h http.Header, chain []Proc) Attribution {
 	now := a.now()
 	out := a.resolveLocked(h, agent, chain, now)
 	if len(chain) > 0 {
-		out.ChainSession = a.chainSessionLocked(chain, now)
+		var i int
+		out.ChainSession, i = a.chainSessionLocked(chain, now)
+		if i >= 0 {
+			out.ChainProc = chain[i].Key()
+		}
 	}
 	return out
 }
@@ -170,7 +176,7 @@ func (a *Attributor) resolveLocked(h http.Header, agent string, chain []Proc, no
 		out.Proc = chain[0].Key()
 	}
 	if sid, header := session.IDHeaderFrom(h, a.cfg.SessionIDHeaders); sid != "" {
-		out.Session, out.Header, out.Source = sid, header, pipeline.SessionSourceHeader
+		out.Session, out.Header, out.Source = sid, header, model.SessionSourceHeader
 		if len(chain) > 0 {
 			out.Proc = a.claimProcessLocked(sid, agent, chain, now)
 			if self := chain[0].Key(); self != out.Proc {
@@ -185,24 +191,24 @@ func (a *Attributor) resolveLocked(h http.Header, agent string, chain []Proc, no
 	if len(chain) > 0 {
 		switch sid, pending := a.sessionForProcessLocked(chain, agent, now); {
 		case pending != nil:
-			out.Agent, out.Proc, out.Source = pending.agent, pending.proc, pipeline.SessionSourcePending
+			out.Agent, out.Proc, out.Source = pending.agent, pending.proc, model.SessionSourcePending
 			return out
 		case sid == session.DefaultSessionID:
 			out.Session = sid
 			return out
 		case sid != "":
-			out.Session, out.Source = sid, pipeline.SessionSourceProcess
+			out.Session, out.Source = sid, model.SessionSourceProcess
 			return out
 		}
 	}
 	if a.cfg.ClientAffinity {
 		switch sid := a.sessionForClientLocked(agent, now); {
 		case sid == pendingAnswer:
-			out.Proc, out.Source = "", pipeline.SessionSourcePending
+			out.Proc, out.Source = "", model.SessionSourcePending
 		case sid == session.DefaultSessionID:
 			out.Session = sid
 		case sid != "":
-			out.Session, out.Source = sid, pipeline.SessionSourceAffinity
+			out.Session, out.Source = sid, model.SessionSourceAffinity
 		}
 	}
 	return out
@@ -221,7 +227,7 @@ func (a *Attributor) Touch(sessionID string, chain []Proc) {
 }
 
 // Record implements session.Recorder: a session the store appended to exists.
-func (a *Attributor) Record(sessionID string, _ *pipeline.SessionEvent) {
+func (a *Attributor) Record(sessionID string, _ *model.SessionEvent) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.seeLocked(sessionID, a.now())

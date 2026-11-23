@@ -5,11 +5,13 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 
 	"github.com/rossoctl/cortex/cmd/agentop/servers"
 	"github.com/rossoctl/cortex/core/pipeline"
 	"github.com/rossoctl/cortex/core/plugins/inferencerouter/routerconfig"
+	"github.com/rossoctl/cortex/core/session"
 )
 
 // activeRouter is the config of the inference-router the proxy runs, read off /v1/pipeline, and
@@ -64,7 +66,7 @@ func (m *model) routerStatus() (c routerconfig.Config, why string) {
 	}
 	// NOT CONFIGURED, OR OFF, AND THIS SIDE CANNOT TELL WHICH: the proxy does not build an
 	// on_error: off plugin, so /v1/pipeline lists neither. Both fixes, then.
-	return routerconfig.Config{}, "this Cortex runs no inference-router: add a server with agentop server add <name> <url>, " +
+	return routerconfig.Config{}, "this Cortex runs no inference-router: add a server with agentop server add <name> <url> --main WORD --helper WORD, " +
 		"or, if " + homeTilde(m.localConfigPath) + " has one under on_error: off, remove on_error to route"
 }
 
@@ -88,7 +90,9 @@ func homeTilde(path string) string {
 // sameRouter reports whether two router configs route alike, so a pipeline refetch repaints the
 // SERVER columns only when what they show has changed.
 func sameRouter(a, b routerconfig.Config) bool {
-	return maps.Equal(a.Servers, b.Servers) && maps.Equal(a.Agents, b.Agents)
+	// DeepEqual: a Server holds maps (api, headers), so it is not comparable.
+	return maps.EqualFunc(a.Servers, b.Servers, func(x, y routerconfig.Server) bool { return reflect.DeepEqual(x, y) }) &&
+		maps.Equal(a.Agents, b.Agents)
 }
 
 // localCortexTarget is the config file and stats URL of the Cortex on this machine, when the
@@ -105,12 +109,13 @@ func (m *model) localCortexTarget() (path, statsURL string, ok bool) {
 	return "", "", false
 }
 
-// agentOwnChoice is the AGENTS pane's SERVER cell for an agent the router does not route.
+// agentOwnChoice is the AGENTS pane's SERVER cell for an agent the router does not route:
+// each of its sessions goes where its key sends it (key_routes:, else the key's server).
 //
 // THE WORDING IS THE DIMMING. The spec draws it dimmed, and a table cell can carry no ANSI —
 // the table truncates escapes as text (TestSessionsRows_CarryNoANSIUnderAForcedColourProfile).
 // No server can be named this, since a server name has no space, so it never reads as one.
-const agentOwnChoice = "own choice"
+const agentOwnChoice = "by key"
 
 // agentsServerWidth fits agentOwnChoice and every server name worth typing.
 const agentsServerWidth = 12
@@ -119,7 +124,7 @@ const agentsServerWidth = 12
 // new sessions go to, or agentOwnChoice. A row no server can be chosen for shows nothing: Other,
 // which pools every agent Cortex does not recognise, so there is no one agent for the router to
 // name, and any agent the router refuses to route — the no-User-Agent row, whose requests belong
-// to no one agent. "own choice" there would offer a choice S then refuses.
+// to no one agent. "by key" there would offer a choice S then refuses.
 //
 // SANITISED AT RENDER TIME, as every served label is: the proxy only runs server names its rule
 // allows, but the name arrives over an unauthenticated API, and nothing here assumes the producer
@@ -144,9 +149,10 @@ const sessionsServerWidth = 12
 // reading as a host called that, as agentOwnChoice's does for a server.
 const sessionsNotAHost = "(not a host)"
 
-// sessionServerCell is the sessions table's SERVER cell for a session whose inference traffic
-// last went to host: the server on that host; a host no server has, in parentheses; or emptyCell
-// when the session has no inference traffic.
+// sessionServerCell is the sessions table's SERVER cell for session s: the session's server,
+// from the server name when the proxy sent one, else from the host its inference traffic last
+// went to (servers.ForSession); a host no server has, in parentheses; or emptyCell when the
+// session has no inference traffic.
 //
 // PARENTHESES ARE THE DIMMING, for agentOwnChoice's reason. They are not in a server name's
 // alphabet, so "(api.anthropic.com)" cannot read as a server called that.
@@ -159,11 +165,12 @@ const sessionsNotAHost = "(not a host)"
 // so "sk-…:x@evil.example" comes back as "sk-…", the key (servers.Host refuses a URL whole for
 // the same reason). That alphabet is
 // stricter than sanitizeLabel, so what passes it needs no sanitising; a server name does.
-func sessionServerCell(router routerconfig.Config, host string, w int) string {
+func sessionServerCell(router routerconfig.Config, s session.SessionSummary, w int) string {
+	host := s.InferenceHost
 	if host == "" {
 		return emptyCell
 	}
-	if name, ok := servers.ForHost(router, host); ok {
+	if name, ok := servers.ForSession(router, s); ok {
 		return trunc(sanitizeLabel(name), w)
 	}
 	h := routerconfig.Hostname(host)

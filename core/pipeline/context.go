@@ -5,7 +5,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
-	"encoding/json"
 	"log/slog"
 	"net/http"
 	"slices"
@@ -13,6 +12,7 @@ import (
 	"time"
 
 	"github.com/rossoctl/cortex/core/capabilities"
+	"github.com/rossoctl/cortex/core/model"
 )
 
 // Identity carries the subject identity established by whichever auth
@@ -38,56 +38,6 @@ type SharedStore interface {
 	Put(key string, val any, ttl time.Duration)
 	Get(key string) (any, bool)
 	Delete(key string)
-}
-
-// Direction indicates whether a request is inbound (caller → this agent) or
-// outbound (this agent → target service).
-type Direction int
-
-const (
-	Inbound Direction = iota
-	Outbound
-)
-
-// String returns "inbound" / "outbound". Used for structured logs and the
-// wire format of SessionEvent.
-func (d Direction) String() string {
-	switch d {
-	case Inbound:
-		return "inbound"
-	case Outbound:
-		return "outbound"
-	default:
-		return "unknown"
-	}
-}
-
-// MarshalJSON emits the string form ("inbound"/"outbound") so the wire
-// format is human-readable without an enum→int lookup.
-func (d Direction) MarshalJSON() ([]byte, error) {
-	return json.Marshal(d.String())
-}
-
-// UnmarshalJSON decodes a Direction from the string form emitted by
-// MarshalJSON. Unknown strings decode to Inbound (zero value) without
-// error so downstream consumers stay tolerant of forward-compatible
-// additions. A Debug-level log fires on unknown input so wire-format
-// drift is at least observable in a verbose test run.
-func (d *Direction) UnmarshalJSON(data []byte) error {
-	var s string
-	if err := json.Unmarshal(data, &s); err != nil {
-		return err
-	}
-	switch s {
-	case "inbound":
-		*d = Inbound
-	case "outbound":
-		*d = Outbound
-	default:
-		slog.Debug("pipeline: unknown Direction, defaulting to inbound", "value", s)
-		*d = Inbound
-	}
-	return nil
 }
 
 // Context is the shared state passed through the plugin pipeline.
@@ -218,12 +168,34 @@ type Context struct {
 	subagent       string
 	parentSubagent string
 	subagentParsed bool
+	// bobChild is true when subagent came from Bob's X-Task-Id, not Claude Code's header.
+	bobChild bool
+
+	// noRecord and noRecordParsed memoize NoRecord's answer, on the same terms as client
+	// and clientParsed: filled by ResolveClient before any plugin runs.
+	noRecord       bool
+	noRecordParsed bool
+	// recordHeaderSeen is true when the client sent model.RecordHeader with any value, so a
+	// listener that forwards by explicit mutation (ext_proc) knows to remove it.
+	recordHeaderSeen bool
 
 	// attributedProc, namingHeader and attributed hold SetAttribution's pin.
 	attributedProc string
 	clientProc     string
 	namingHeader   string
 	attributed     bool
+	// namedSession and namedSet hold SetNamedSession's pin.
+	namedSession string
+	namedSet     bool
+
+	// project and projectSet hold SetProject's pin.
+	project    string
+	projectSet bool
+
+	// parentSession, parentProject and parentSet hold SetParent's pin.
+	parentSession string
+	parentProject string
+	parentSet     bool
 
 	Agent    *AgentIdentity
 	Identity Identity // nil before an auth plugin runs
@@ -240,14 +212,22 @@ type Context struct {
 	//     bucket instead would silently pool unrelated traffic under one key.
 	//   - Events may be empty while ID is set. A session's first request is
 	//     hydrated before its first event is recorded, so an empty view means
-	//     "this session, nothing recorded yet". Key on ID regardless; treating an
-	//     empty view as absent skips the first request of every session.
+	//     "this session, nothing recorded yet". Key on the ID regardless (read
+	//     SessionID); treating an empty view as absent skips the first request of
+	//     every session.
 	//   - ID may be CLIENT-ASSERTED. Listeners resolve it from a client-supplied
 	//     header where one is configured (see session.IDFromHeaders), falling
 	//     back to the most recently active session and then, for recording only,
 	//     a shared default bucket. It is validated but not authenticated, so it
 	//     is an observability and correlation key, not an authorization subject.
 	Session *SessionView
+
+	// SessionID is Session.ID: the id of the session handed to plugins. It is
+	// empty when there is no Session. A listener that sets Session must also set
+	// SessionID. Pipeline.Run fills it from Session when it is empty. A plugin
+	// that keys state on the session and reads no events reads this field,
+	// because it needs no nil check. The same rules as Session.ID apply to it.
+	SessionID string
 
 	// SessionSource says how the listener resolved Session, so a plugin that
 	// keys security state on it can tell a session the request named from one
@@ -256,6 +236,11 @@ type Context struct {
 	// SessionSource is SessionSourceHeader.
 	SessionSource SessionSource
 	SessionHeader string
+
+	// facts are the store's facts for Session, set by SetSessionFacts. factsSet tells
+	// LastIntent and LastInference to return them instead of reading Session.
+	facts    SessionFacts
+	factsSet bool
 
 	// ChainSession is the session a process above the sender in its process
 	// chain named, when the listener can see the chain: the session of the
@@ -330,9 +315,18 @@ type Context struct {
 	// body was empty. Consumers render that as unknown rather than as 0 B; see
 	// SessionEvent.BytesDown.
 	//
-	// Written only by the listener, on the one goroutine serving the request,
-	// before the response row is recorded. Plugins do not write to it.
+	// Another goroutine reads it while the body streams: the Timeline's live
+	// token estimate (#1861) reads forwardproxy's count through
+	// session.Store.StreamBytes, with atomic.LoadInt64. So every write must be
+	// atomic (atomic.AddInt64 or atomic.StoreInt64). Extproc's write is still
+	// plain, and is safe only because no live stream is tracked for it. Plugins
+	// do not write to it.
 	ResponseBytes int64
+
+	// ResponseCapture is the response body as the listener read it off the wire, for the
+	// session archive's lossless capture (#1494): up to MaxResponseCapture bytes, set by the
+	// listener and read when the response row is recorded. Plugins do not use it.
+	ResponseCapture *ResponseCapture
 
 	Extensions Extensions
 
@@ -381,6 +375,11 @@ type Context struct {
 	redirectHost   string
 	// redirectPath is the path SetRedirectPath set, "" to keep the client's.
 	redirectPath string
+	// translateSource, translateTarget and translatePath are what Translate set;
+	// translateTarget is "" when no Translate was accepted.
+	translateSource, translateTarget, translatePath string
+	// upstreamHeaders is the clone SetUpstreamHeaders kept. See UpstreamHeaders.
+	upstreamHeaders http.Header
 
 	// bodyMutated / responseBodyMutated flag that some plugin's
 	// SetBody / SetResponseBody took effect on this context. Listeners read
@@ -420,8 +419,9 @@ type Context struct {
 	// stay open for minutes), and pctx.dispatched holds indexes into the
 	// OLD pipeline's plugin slice — indexing the new one with them panics
 	// when the new chain is shorter and otherwise runs hooks on plugins
-	// that never saw OnRequest. Direct *Pipeline calls (not via a Holder)
-	// never reload under a live request and leave this nil.
+	// that never saw OnRequest. Set by Holder.Run and Holder.Pin, which also
+	// hold the pipeline until RunFinish so a reload does not Stop it under
+	// the request.
 	pinned *Pipeline
 
 	// outcome is populated exactly once by Pipeline.RunFinish immediately
@@ -568,10 +568,76 @@ func (c *Context) ClientInfo() *EventClient {
 // X-Claude-Code-Agent-Id a plugin rewrote must not re-file a row under another subagent,
 // and recorders reading the memo must not be the ones filling it.
 //
+// It pins NoRecord too, which also removes model.RecordHeader from Headers, so no plugin
+// sees it and the forwarded request does not carry it.
+//
 // Idempotent: the second call is the memo's own no-op.
 func (c *Context) ResolveClient() {
 	_ = c.ClientInfo()
 	_ = c.Subagent()
+	_ = c.NoRecord()
+}
+
+// SetSessionFacts is for listeners: pass what session.Store.ViewFacts returned. A zero
+// SessionFacts reads as FactNone.
+func (c *Context) SetSessionFacts(f SessionFacts) {
+	c.facts, c.factsSet = f, true
+}
+
+// LastIntent is the newest user intent (model.IsIntent) of the request's session. The rules,
+// in order:
+//  1. Session is nil: FactNoSession, also when the listener set facts.
+//  2. The listener called SetSessionFacts: the fact it set.
+//  3. Else from Session.Events: FactPresent with Event in Session.Events, or FactNone.
+//
+// A plugin reads this, not Session.Events.
+func (c *Context) LastIntent() SessionFact {
+	if c.Session == nil {
+		return SessionFact{State: FactNoSession}
+	}
+	if c.factsSet {
+		return c.facts.LastIntent
+	}
+	return factOf(c.Session.LastIntent())
+}
+
+// LastInference is the newest outbound inference request (model.IsInferenceRequest) of the
+// request's session, by the same rules as LastIntent.
+func (c *Context) LastInference() SessionFact {
+	if c.Session == nil {
+		return SessionFact{State: FactNoSession}
+	}
+	if c.factsSet {
+		return c.facts.LastInference
+	}
+	for i := len(c.Session.Events) - 1; i >= 0; i-- {
+		if model.IsInferenceRequest(&c.Session.Events[i]) {
+			return factOf(&c.Session.Events[i])
+		}
+	}
+	return factOf(nil)
+}
+
+// InferenceHosts is the InferenceHosts table of the request's session, and SessionFacts.HostsKnown:
+// false means "do not use the table". The rules, in order:
+//  1. Session is nil: (nil, false), also when the listener set facts.
+//  2. The listener called SetSessionFacts: the table and HostsKnown it set.
+//  3. Else (nil, false). A view cannot vouch for a table: it can be a trimmed part of the session.
+//
+// Do not change the returned slice: every plugin of the request gets the same one.
+func (c *Context) InferenceHosts() (InferenceHosts, bool) {
+	if c.Session == nil || !c.factsSet {
+		return nil, false
+	}
+	return c.facts.InferenceHosts, c.facts.HostsKnown
+}
+
+// factOf is a fact from a view: FactPresent for an event, FactNone for nil.
+func factOf(e *SessionEvent) SessionFact {
+	if e == nil {
+		return SessionFact{State: FactNone}
+	}
+	return SessionFact{Event: e, State: FactPresent}
 }
 
 // PeerCertificate returns the verified peer leaf certificate from

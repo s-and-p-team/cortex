@@ -6,6 +6,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
+	"github.com/muesli/termenv"
+
 	"github.com/rossoctl/cortex/core/cost/event"
 	"github.com/rossoctl/cortex/core/pipeline"
 )
@@ -169,23 +173,6 @@ func TestFilterForDetail_KeepsALoneLegacyRecord(t *testing.T) {
 	}
 }
 
-func TestRedirectHeader_EmptyWithoutARedirect(t *testing.T) {
-	if got := redirectHeader(&pipeline.SessionEvent{Host: "ete-litellm.example.com"}); got != "" {
-		t.Errorf("redirectHeader = %q for an event nothing redirected, want empty", got)
-	}
-}
-
-func TestRedirectHeader_NamesBothHosts(t *testing.T) {
-	got := redirectHeader(&pipeline.SessionEvent{
-		Host:          "glm-litellm.example.com",
-		RequestedHost: "ete-litellm.example.com",
-	})
-	want := "redirected:  ete-litellm.example.com → glm-litellm.example.com"
-	if got != want {
-		t.Errorf("redirectHeader = %q, want %q", got, want)
-	}
-}
-
 func TestModelHeader_EmptyUnlessAPluginChangedTheModel(t *testing.T) {
 	for _, e := range []*pipeline.SessionEvent{
 		{Host: "glm-litellm.example.com"},
@@ -194,15 +181,6 @@ func TestModelHeader_EmptyUnlessAPluginChangedTheModel(t *testing.T) {
 		if got := modelHeader(e); got != "" {
 			t.Errorf("modelHeader = %q for %+v, want empty", got, e)
 		}
-	}
-}
-
-func TestModelHeader_NamesBothModels(t *testing.T) {
-	got := modelHeader(&pipeline.SessionEvent{Inference: &pipeline.InferenceExtension{
-		Model: "glm-5.3", RequestedModel: "claude-opus-5-5",
-	}})
-	if want := "model:       claude-opus-5-5 → glm-5.3"; got != want {
-		t.Errorf("modelHeader = %q, want %q", got, want)
 	}
 }
 
@@ -371,5 +349,52 @@ func TestRewriteHeader_IncludesTheUpgradeLine(t *testing.T) {
 	})
 	if !strings.Contains(got, "websocket") {
 		t.Errorf("rewriteHeader = %q, want the upgrade line composed in", got)
+	}
+}
+
+// The REQUEST │ line keeps its text and width under color: the section name is a segment,
+// the bar dim, the status in its STATUS ink and the cost bold, and the cut stays after them.
+func TestDetailFixedLine_Styles(t *testing.T) {
+	restore := lipgloss.ColorProfile()
+	t.Cleanup(func() { lipgloss.SetColorProfile(restore) })
+	m := exchangeDetail(t)
+	m.detailSummary = "#1 · POST /v1/messages · 503 · 1.2s · $0.12 · " + strings.Repeat("120 tok · ", 12) + "end"
+	for _, w := range []int{80, 100, 140} {
+		m.width = w
+		lipgloss.SetColorProfile(termenv.Ascii)
+		plain := m.detailFixedLine()
+		lipgloss.SetColorProfile(termenv.TrueColor)
+		color := m.detailFixedLine()
+		if got := ansi.Strip(color); got != plain {
+			t.Errorf("width %d: color text\n  %q\nAscii text\n  %q", w, got, plain)
+		}
+		if lipgloss.Width(color) != lipgloss.Width(plain) {
+			t.Errorf("width %d: color width %d, Ascii %d", w, lipgloss.Width(color), lipgloss.Width(plain))
+		}
+		for _, want := range []string{styleSeg.Render("REQUEST"), styleDim.Render(" │ "), styleError.Render("503"), styleBold.Render("$0.12"), styleDim.Render(" · ")} {
+			if !strings.Contains(color, want) {
+				t.Errorf("width %d: fixed line %q lacks %q", w, color, want)
+			}
+		}
+	}
+	if w := lipgloss.Width(m.detailFixedLine()); w != 140 {
+		t.Errorf("a cut summary is %d wide, want 140", w)
+	}
+}
+
+// Fold marks and the section line are accent under color, and text does not change.
+func TestDetailTree_FoldMarksAccent(t *testing.T) {
+	restore := lipgloss.ColorProfile()
+	t.Cleanup(func() { lipgloss.SetColorProfile(restore) })
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	m := exchangeDetail(t)
+	var section bool
+	for _, l := range m.detailLines {
+		if strings.HasPrefix(ansi.Strip(l.text), "▾ ") && strings.Contains(l.text, styleAccentBold.Render("▾ ")) {
+			section = true
+		}
+	}
+	if !section {
+		t.Error("no section line draws its ▾ in accent bold")
 	}
 }

@@ -89,6 +89,19 @@ updates:
     schedule:
       interval: weekly
 
+  # Rust - praxis workspace
+  - package-ecosystem: cargo
+    directory: /praxis
+    schedule:
+      interval: weekly
+    # openssl-src is transitive (openssl, vendored), so the default skips it. Its bump
+    # is how cortex-gateway gets OpenSSL CVE fixes (praxis/README.md). With an allow
+    # list, only listed dependencies update, so direct must stay.
+    allow:
+      - dependency-type: direct
+      - dependency-name: openssl-src
+        dependency-type: indirect
+
   # Python - root (tests)
   - package-ecosystem: pip
     directory: /

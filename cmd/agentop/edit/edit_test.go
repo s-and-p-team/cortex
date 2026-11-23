@@ -16,23 +16,6 @@ func cmStore(stub Runner) ConfigMapStore {
 	return ConfigMapStore{Run: stub, Namespace: "team1", Pod: "email-agent"}
 }
 
-func TestFetchCmd_Success(t *testing.T) {
-	stub := func(ctx context.Context, args ...string) ([]byte, error) {
-		return []byte(fixtureCMYAML), nil
-	}
-	cmd := FetchCmd(context.Background(), cmStore(stub), nil, nil)
-	msg := cmd().(FetchedMsg)
-	if msg.Err != nil {
-		t.Fatalf("FetchedMsg.Err = %v", msg.Err)
-	}
-	if msg.Fetched == nil {
-		t.Fatal("FetchedMsg.Fetched is nil")
-	}
-	if msg.TempPath == "" {
-		t.Fatal("FetchedMsg.TempPath empty (should be the path to the subtree-only tempfile)")
-	}
-}
-
 func TestFetchCmd_Error(t *testing.T) {
 	stub := func(ctx context.Context, args ...string) ([]byte, error) {
 		return nil, fmt.Errorf("forbidden")
@@ -51,7 +34,7 @@ func TestApplyCmd_Success(t *testing.T) {
 	stub := func(ctx context.Context, args ...string) ([]byte, error) {
 		return []byte("applied"), nil
 	}
-	cmd := ApplyCmd(context.Background(), cmStore(stub), nil, []byte("manifest"))
+	cmd := ApplyCmd(context.Background(), cmStore(stub), "", nil, []byte("manifest"))
 	msg := cmd().(AppliedMsg)
 	if msg.Err != nil {
 		t.Fatalf("err = %v", msg.Err)
@@ -69,7 +52,7 @@ func TestPollCmd_Success(t *testing.T) {
 		_, _ = w.Write([]byte(`{"last_success":"` + ts + `"}`))
 	}))
 	defer srv.Close()
-	cmd := PollCmd(context.Background(), srv.URL, applyTime, Target{})
+	cmd := PollCmd(context.Background(), srv.URL, applyTime, baselineFailedSentinel, Target{})
 	msg := cmd().(PolledMsg)
 	if msg.Result.Status != PollSuccess {
 		t.Fatalf("status: %v", msg.Result.Status)

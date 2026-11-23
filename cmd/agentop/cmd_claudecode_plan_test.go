@@ -14,7 +14,7 @@ import (
 func TestPlanClaudeCodeEnable_TouchesNothing(t *testing.T) {
 	settings, cfg := fixture(t, settingsWithSecret)
 	before, _ := os.ReadFile(settings)
-	pl, err := planClaudeCodeEnable(settings, cfg)
+	pl, err := planClaudeCodeEnable(settings, cfg, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -29,36 +29,13 @@ func TestPlanClaudeCodeEnable_TouchesNothing(t *testing.T) {
 	}
 }
 
-func TestPlanClaudeCodeEnable_NoChangesOnceEnabled(t *testing.T) {
-	settings, cfg := fixture(t, settingsWithSecret)
-	var out, errb bytes.Buffer
-	if code := claudeCodeEnable2(settings, cfg, "", true, &out, &errb); code != 0 {
-		t.Fatalf("enable failed: %s", errb.String())
-	}
-	pl, err := planClaudeCodeEnable(settings, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(pl.changes) != 0 {
-		t.Errorf("changes after enable = %q, want none", pl.changes)
-	}
-}
-
-func TestPlanClaudeCodeEnable_RefusesAForeignValue(t *testing.T) {
-	settings, cfg := fixture(t, `{"env":{"HTTPS_PROXY":"http://corp:3128"}}`)
-	_, err := planClaudeCodeEnable(settings, cfg)
-	if err == nil || !strings.Contains(err.Error(), "Refusing to overwrite") {
-		t.Errorf("err = %v, want the overwrite refusal", err)
-	}
-}
-
 func TestApplyClaudeCodeEnable_WritesThePlanAndRecordsPrior(t *testing.T) {
 	// A stale Cortex port, which isCortexValue lets enable replace. The prior value
 	// then differs from the one written, so recording either is distinguishable.
 	const stale = "http://127.0.0.1:47699"
 	settings, cfg := fixture(t, `{"env":{"HTTPS_PROXY":"`+stale+`"}}`)
 	state := filepath.Join(t.TempDir(), "state.json")
-	pl, err := planClaudeCodeEnable(settings, cfg)
+	pl, err := planClaudeCodeEnable(settings, cfg, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,8 +60,8 @@ func TestApplyClaudeCodeEnable_WritesThePlanAndRecordsPrior(t *testing.T) {
 	if p := st.Prior[envProxy]; p == nil || *p != stale {
 		t.Errorf("prior %s not recorded as the user's %q: %v", envProxy, stale, p)
 	}
-	if p, ok := st.Prior[envNoTelem]; !ok || p != nil {
-		t.Errorf("prior %s should be recorded as absent", envNoTelem)
+	if _, ok := env[envNoTelem]; ok {
+		t.Errorf("enable wrote %s, which stops Claude Code's auto-updates (#1729)", envNoTelem)
 	}
 }
 

@@ -41,7 +41,7 @@ func (r *rec) turn(agent string, start, dur float64, msgs []pipeline.InferenceMe
 	}
 	id := r.id()
 	r.add(pipeline.SessionEvent{At: at(start), Phase: pipeline.SessionRequest, RequestID: id, Host: "llm.example", Subagent: agent,
-		Inference: &pipeline.InferenceExtension{AgentRole: role, Tools: tools, Messages: msgs, ToolResults: results}})
+		Inference: &pipeline.InferenceExtension{AgentRole: role, Tools: tools, Messages: msgs, ToolResults: results, Stream: true}})
 	r.add(pipeline.SessionEvent{At: at(start + dur), Phase: pipeline.SessionResponse, RequestID: id, Host: "llm.example", Subagent: agent,
 		StatusCode: 200, Duration: time.Duration(dur * float64(time.Second)),
 		Inference: &pipeline.InferenceExtension{FinishReason: finish, ToolCalls: calls}})
@@ -194,6 +194,103 @@ func TestTaskNotificationIsAReturn(t *testing.T) {
 	tl := Build("s", r.events, time.Time{})
 	if len(tl.Returns) != 1 || tl.Returns[0].Agent != "b2" {
 		t.Errorf("returns = %+v", tl.Returns)
+	}
+}
+
+// A subagent's tool that never got a result ends, lost, when the notification says the run
+// ended: a tool asked for beside the hand-back, or one running when the agent was stopped. Left
+// open, it drew to now, and a laptop closed overnight drew as 8.8 hours of tool time.
+func TestToolOfAnEndedSubagentIsLost(t *testing.T) {
+	for _, status := range []string{"completed", "killed"} {
+		var r rec
+		r.turn("", 0, 1, []pipeline.InferenceMessage{user("go")}, nil, "tool_use", pipeline.InferenceToolCall{ID: "s1", Name: "Agent"})
+		r.turn("b2", 1, 1, []pipeline.InferenceMessage{user("p")}, nil, "tool_use",
+			pipeline.InferenceToolCall{ID: "edit", Name: "Edit"}, pipeline.InferenceToolCall{ID: "hb", Name: "SubagentHandback"})
+		r.turn("", 5, 1, []pipeline.InferenceMessage{user("go"),
+			user("<task-notification>\n<task-id>b2</task-id>\n<status>" + status + "</status>")}, nil, "end_turn")
+		if x := findTool(t, Build("s", r.events, time.Time{}), "edit"); !x.Lost || x.End == nil || !x.End.Equal(x.Start) {
+			t.Errorf("%s: edit = %+v, want lost at its start", status, x)
+		}
+	}
+}
+
+// A workflow agent ends at its StructuredOutput call: the workflow takes the call's input as the
+// agent's answer, and no request carries a result for it. No Agent call spawned it and no
+// notification names it, so before this the call stayed open for good, and agentop drew every
+// finished workflow agent as still running a tool. A tool asked for beside it gets no result
+// either, and no notification closes it as one closes a sibling of a hand-back.
+func TestStructuredOutputOfAWorkflowAgentIsLost(t *testing.T) {
+	var r rec
+	r.turn("", 0, 1, []pipeline.InferenceMessage{user("go")}, nil, "tool_use", pipeline.InferenceToolCall{ID: "wf", Name: "Workflow"})
+	r.turn("", 2, 1, []pipeline.InferenceMessage{user("go"), user("started")}, nil, "end_turn")
+	r.turn("w1", 3, 1, []pipeline.InferenceMessage{user("review")}, nil, "tool_use",
+		pipeline.InferenceToolCall{ID: "read", Name: "Read"},
+		pipeline.InferenceToolCall{ID: "so", Name: "StructuredOutput", Arguments: `{"findings":[]}`})
+	tl := Build("s", r.events, time.Time{})
+	for _, id := range []string{"so", "read"} {
+		if x := findTool(t, tl, id); !x.Lost || x.End == nil || !x.End.Equal(x.Start) {
+			t.Errorf("%s = %+v, want lost at its start", id, x)
+		}
+	}
+}
+
+// A StructuredOutput call that fails the schema gets a result, and the agent tries again. That
+// call ends at its result, as any tool does, not as lost.
+func TestStructuredOutputWithAResultEndsThere(t *testing.T) {
+	var r rec
+	r.turn("w1", 0, 1, []pipeline.InferenceMessage{user("review")}, nil, "tool_use",
+		pipeline.InferenceToolCall{ID: "so1", Name: "StructuredOutput", Arguments: `{}`})
+	r.turn("w1", 3, 1, []pipeline.InferenceMessage{user("review")}, []pipeline.InferenceToolResult{result("so1", "missing findings")}, "tool_use",
+		pipeline.InferenceToolCall{ID: "so2", Name: "StructuredOutput", Arguments: `{"findings":[]}`})
+	tl := Build("s", r.events, time.Time{})
+	if x := findTool(t, tl, "so1"); x.Lost || x.End == nil || !x.End.Equal(at(3)) {
+		t.Errorf("rejected StructuredOutput = %+v, want it to end at its result", x)
+	}
+}
+
+// A tool starts when the response that asked for it ends, but Claude Code runs the hand-back
+// while that response streams. So the notification can arrive before the tool's start.
+func TestToolOfASubagentEndedMidStreamIsLost(t *testing.T) {
+	var r rec
+	r.turn("", 0, 1, []pipeline.InferenceMessage{user("go")}, nil, "tool_use", pipeline.InferenceToolCall{ID: "s1", Name: "Agent"})
+	r.turn("b2", 1, 4, []pipeline.InferenceMessage{user("p")}, nil, "tool_use",
+		pipeline.InferenceToolCall{ID: "edit", Name: "Edit"}, pipeline.InferenceToolCall{ID: "hb", Name: "SubagentHandback"})
+	r.turn("", 4, 1, []pipeline.InferenceMessage{user("go"),
+		user("<task-notification>\n<task-id>b2</task-id>\n<status>completed</status>")}, nil, "end_turn")
+	if x := findTool(t, Build("s", r.events, time.Time{}), "edit"); !x.Lost || x.End == nil || !x.End.Equal(x.Start) {
+		t.Errorf("edit = %+v, want lost at its start", x)
+	}
+}
+
+// Only the notification ends a run. An <agent-message> arrives while the agent works, and a
+// SendMessage resume starts a new run whose tools the earlier notification does not end.
+func TestToolOfARunningSubagentStaysOpen(t *testing.T) {
+	var r rec
+	r.turn("", 0, 1, []pipeline.InferenceMessage{user("go")}, nil, "tool_use", pipeline.InferenceToolCall{ID: "s1", Name: "Agent"})
+	r.turn("b2", 1, 1, []pipeline.InferenceMessage{user("p")}, nil, "end_turn")
+	h := []pipeline.InferenceMessage{user("go"), user("<task-notification>\n<task-id>b2</task-id>\n<status>completed</status>")}
+	r.turn("", 5, 1, h, nil, "end_turn")
+	r.turn("b2", 10, 1, []pipeline.InferenceMessage{user("p"), user("more")}, nil, "tool_use", pipeline.InferenceToolCall{ID: "test", Name: "Bash"})
+	r.turn("", 20, 1, append(h, user(`<agent-message from="b2"> still testing`)), nil, "end_turn")
+	if x := findTool(t, Build("s", r.events, time.Time{}), "test"); x.Lost || x.End != nil {
+		t.Errorf("test = %+v, want still in flight", x)
+	}
+}
+
+// The latest notification ends a run, not the first: a run that SendMessage resumed ends at its
+// own notification, and its tools without a result are lost there too.
+func TestToolOfAResumedSubagentIsLostAtItsEnd(t *testing.T) {
+	var r rec
+	r.turn("", 0, 1, []pipeline.InferenceMessage{user("go")}, nil, "tool_use", pipeline.InferenceToolCall{ID: "s1", Name: "Agent"})
+	r.turn("b2", 1, 1, []pipeline.InferenceMessage{user("p")}, nil, "end_turn")
+	note := user("<task-notification>\n<task-id>b2</task-id>\n<status>completed</status>")
+	h := []pipeline.InferenceMessage{user("go"), note}
+	r.turn("", 5, 1, h, nil, "end_turn")
+	r.turn("b2", 10, 1, []pipeline.InferenceMessage{user("p"), user("more")}, nil, "tool_use",
+		pipeline.InferenceToolCall{ID: "edit", Name: "Edit"}, pipeline.InferenceToolCall{ID: "hb", Name: "SubagentHandback"})
+	r.turn("", 30, 1, append(h, note), nil, "end_turn")
+	if x := findTool(t, Build("s", r.events, time.Time{}), "edit"); !x.Lost || x.End == nil || !x.End.Equal(x.Start) {
+		t.Errorf("edit = %+v, want lost at its start", x)
 	}
 }
 
@@ -487,6 +584,50 @@ func TestReturnedAtIsTheLastReturn(t *testing.T) {
 	}
 }
 
+// A run that ends with SubagentHandback returns at its <agent-message>. Claude Code sends the
+// <task-notification> later, here with the user's next prompt, and as a return it made the
+// user's 3 minutes read as waiting on the subagent (session 27737d97, seq 611).
+func TestNotificationAfterADeliveredHandBackIsNotAReturn(t *testing.T) {
+	note := user("<task-notification>\n<task-id>c3</task-id>\n<status>completed</status>")
+	var r rec
+	r.turn("", 0, 1, []pipeline.InferenceMessage{user("go")}, nil, "tool_use", pipeline.InferenceToolCall{ID: "s1", Name: "Agent"})
+	r.turn("c3", 1, 1, []pipeline.InferenceMessage{user("p")}, nil, "tool_use", pipeline.InferenceToolCall{ID: "hb", Name: "SubagentHandback"})
+	h := []pipeline.InferenceMessage{user("go"), user(`<agent-message from="c3"> report`)}
+	r.turn("", 5, 1, h, nil, "end_turn")
+	r.turn("", 200, 1, append(h, user("next question"), note), nil, "end_turn")
+	tl := Build("s", r.events, time.Time{})
+	if len(tl.Returns) != 1 || !tl.Returns[0].At.Equal(at(5)) {
+		t.Errorf("returns = %+v, want one at 5s", tl.Returns)
+	}
+	if a := findAgent(t, tl, "c3"); a.ReturnedAt == nil || !a.ReturnedAt.Equal(at(5)) {
+		t.Errorf("returnedAt = %v, want 5s", a.ReturnedAt)
+	}
+
+	// Without a hand-back call, an <agent-message> is a message sent mid-run, and the
+	// notification is still the return.
+	r = rec{}
+	r.turn("", 0, 1, []pipeline.InferenceMessage{user("go")}, nil, "tool_use", pipeline.InferenceToolCall{ID: "s1", Name: "Agent"})
+	r.turn("c3", 1, 1, []pipeline.InferenceMessage{user("p")}, nil, "end_turn")
+	r.turn("", 5, 1, h, nil, "end_turn")
+	r.turn("", 200, 1, append(h, note), nil, "end_turn")
+	if a := findAgent(t, Build("s", r.events, time.Time{}), "c3"); a.ReturnedAt == nil || !a.ReturnedAt.Equal(at(200)) {
+		t.Errorf("no hand-back: returnedAt = %v, want 200s", a.ReturnedAt)
+	}
+
+	// A resumed run that hands back again returns again, at its second <agent-message>.
+	r = rec{}
+	r.turn("", 0, 1, []pipeline.InferenceMessage{user("go")}, nil, "tool_use", pipeline.InferenceToolCall{ID: "s1", Name: "Agent"})
+	r.turn("c3", 1, 1, []pipeline.InferenceMessage{user("p")}, nil, "tool_use", pipeline.InferenceToolCall{ID: "hb", Name: "SubagentHandback"})
+	r.turn("", 5, 1, h, nil, "end_turn")
+	r.turn("c3", 10, 1, []pipeline.InferenceMessage{user("p"), user("more")}, nil, "tool_use", pipeline.InferenceToolCall{ID: "hb2", Name: "SubagentHandback"})
+	h2 := append(h, note, user(`<agent-message from="c3"> second report`))
+	r.turn("", 20, 1, h2, nil, "end_turn")
+	r.turn("", 300, 1, append(h2, user("thanks"), note), nil, "end_turn")
+	if a := findAgent(t, Build("s", r.events, time.Time{}), "c3"); a.ReturnedAt == nil || !a.ReturnedAt.Equal(at(20)) {
+		t.Errorf("resumed: returnedAt = %v, want 20s", a.ReturnedAt)
+	}
+}
+
 // Clip moves spans within their slices; a lost span's End must not point into one.
 func TestLostSpansSurviveClip(t *testing.T) {
 	var r rec
@@ -619,6 +760,48 @@ func TestReplyWithoutAFinishIsAnError(t *testing.T) {
 	}
 }
 
+// Bob's router call is not a stream, and its complete reply names a model and has no choice, so
+// it has no finish reason. Only a stream can stop mid-reply as a 200, so the router turn is not
+// an error. A reply with no finish that was a stream still is: the request asked for one, or a
+// gateway answered a buffered request with one.
+func TestBufferedReplyWithoutAFinishIsNotAnError(t *testing.T) {
+	var r rec
+	client := &pipeline.EventClient{Name: "bob"}
+	cases := []struct{ asked, streamed, wantErr bool }{{false, false, false}, {true, false, true}, {false, true, true}}
+	for i, c := range cases {
+		id := r.id()
+		r.add(pipeline.SessionEvent{At: at(float64(i * 2)), Phase: pipeline.SessionRequest, RequestID: id, Host: "api.us-east.bob.ibm.com", Client: client,
+			Inference: &pipeline.InferenceExtension{Model: "router", Messages: []pipeline.InferenceMessage{user("go")}, Stream: c.asked}})
+		r.add(pipeline.SessionEvent{At: at(float64(i*2 + 1)), Phase: pipeline.SessionResponse, RequestID: id, Host: "api.us-east.bob.ibm.com", Client: client,
+			StatusCode: 200, Inference: &pipeline.InferenceExtension{Model: "router", ServedModel: "explorer", StreamedResponse: c.streamed}})
+	}
+	tl := Build("s", r.events, time.Time{})
+	if len(tl.Turns) != len(cases) {
+		t.Fatalf("turns = %+v, want %d", tl.Turns, len(cases))
+	}
+	for i, c := range cases {
+		if tl.Turns[i].Error != c.wantErr {
+			t.Errorf("asked stream %v, streamed %v: error = %v, want %v", c.asked, c.streamed, tl.Turns[i].Error, c.wantErr)
+		}
+	}
+}
+
+// A Bob subtask stops at its end_subtask call, and no request of the subtask carries its result.
+// Before, the call and its sibling stayed open, and agentop drew the subtask as still running a
+// tool.
+func TestEndSubtaskOfABobSubtaskIsLost(t *testing.T) {
+	var r rec
+	r.turn("st", 0, 1, []pipeline.InferenceMessage{user("count")}, nil, "tool_calls",
+		pipeline.InferenceToolCall{ID: "todo", Name: "update_todo_list"},
+		pipeline.InferenceToolCall{ID: "end", Name: "end_subtask"})
+	tl := Build("s", r.events, time.Time{})
+	for _, id := range []string{"end", "todo"} {
+		if x := findTool(t, tl, id); !x.Lost || x.End == nil || !x.End.Equal(x.Start) {
+			t.Errorf("%s = %+v, want lost at its start", id, x)
+		}
+	}
+}
+
 // A call that sends its predecessor's conversation unchanged is a retry; one that adds a message
 // is not, nor is an agent's first call.
 func TestResentMarksARetry(t *testing.T) {
@@ -647,8 +830,28 @@ func TestBackgroundJobRunsUntilItsNotification(t *testing.T) {
 	r.turn("", 30, 1, h2, nil, "end_turn")
 	r.turn("", 60, 1, append(h2, pipeline.InferenceMessage{Role: "user", Content: "<task-notification>\n<task-id>bk42</task-id>\n<status>completed</status>"}), nil, "end_turn")
 	tl := Build("s", r.events, time.Time{})
-	if len(tl.Jobs) != 1 || tl.Jobs[0].ID != "bk42" || !tl.Jobs[0].Start.Equal(at(2)) || tl.Jobs[0].End == nil || !tl.Jobs[0].End.Equal(at(60)) {
-		t.Fatalf("jobs = %+v, want bk42 from 2s to 60s", tl.Jobs)
+	if len(tl.Jobs) != 1 || tl.Jobs[0].ID != "bk42" || tl.Jobs[0].ToolUseID != "t1" || !tl.Jobs[0].Start.Equal(at(2)) || tl.Jobs[0].End == nil || !tl.Jobs[0].End.Equal(at(60)) {
+		t.Fatalf("jobs = %+v, want bk42 of t1 from 2s to 60s", tl.Jobs)
+	}
+}
+
+// A job that TaskStop stops gets no notification: it ends at the TaskStop result. A shell on
+// another host has its own result text.
+func TestBackgroundJobEndsAtTaskStop(t *testing.T) {
+	for _, stopped := range []string{
+		`{"message":"Successfully stopped task: bk42 (llama-server --port 18090)","task_id":"bk42"}`,
+		`{"message":"Successfully stopped background command bk42 on devbox","task_id":"bk42","task_type":"local_bash"}`,
+	} {
+		var r rec
+		h := []pipeline.InferenceMessage{user("go")}
+		r.turn("", 0, 1, h, nil, "tool_use", pipeline.InferenceToolCall{ID: "t1", Name: "Bash"})
+		r.turn("", 2, 1, h, []pipeline.InferenceToolResult{result("t1", "Command running in background with ID: bk42.")}, "tool_use", pipeline.InferenceToolCall{ID: "t2", Name: "TaskStop"})
+		r.turn("", 26, 1, h, []pipeline.InferenceToolResult{result("t2", stopped)}, "end_turn")
+		r.turn("", 600, 1, h, nil, "end_turn")
+		tl := Build("s", r.events, at(900))
+		if len(tl.Jobs) != 1 || tl.Jobs[0].End == nil || !tl.Jobs[0].End.Equal(at(26)) {
+			t.Fatalf("%s: jobs = %+v, want bk42 to end at 26s", stopped, tl.Jobs)
+		}
 	}
 }
 
@@ -953,5 +1156,155 @@ func TestPreMarkerRecapIsNotATurn(t *testing.T) {
 	tl := Build("s", r.events, at(4))
 	if len(tl.Turns) != 1 || !tl.Turns[0].Start.Equal(at(2)) {
 		t.Errorf("turns = %+v, want only the real call at 2s", tl.Turns)
+	}
+}
+
+// Bob child tasks are agent rows by their subagent id, all under main: a subtask is labeled
+// and typed "subtask", a subagent keeps the default label. A header-less call is main's.
+func TestTimeline_BobChildTasks(t *testing.T) {
+	var r rec
+	child := func(id, kind string, start, dur float64) {
+		r.bobTurn("premium-ide", start, dur, []pipeline.InferenceMessage{user(id)}, nil)
+		for i := len(r.events) - 2; i < len(r.events); i++ {
+			r.events[i].Subagent, r.events[i].SubagentKind = id, kind
+		}
+	}
+	r.bobTurn("premium-ide", 0, 2, []pipeline.InferenceMessage{user("root")}, nil)
+	child("c-sub", pipeline.SubagentKindSubtask, 3, 2)
+	child("c-a", pipeline.SubagentKindSubagent, 6, 3)
+	child("c-b", pipeline.SubagentKindSubagent, 7, 3)
+	child("c-a", pipeline.SubagentKindSubagent, 10, 1)
+	r.bobTurn("router", 12, 1, []pipeline.InferenceMessage{user("route")}, nil)
+	r.bobTurn("premium-ide", 14, 2, []pipeline.InferenceMessage{user("root again")}, nil)
+	tl := Build("s", r.events, at(30))
+
+	if len(tl.Agents) != 4 {
+		t.Fatalf("Agents = %+v, want 4", tl.Agents)
+	}
+	if sub := findAgent(t, tl, "c-sub"); sub.Parent != MainAgent || sub.Type != "subtask" || !strings.HasPrefix(sub.Label, "subtask ") {
+		t.Fatalf("subtask agent = %+v", sub)
+	}
+	for _, id := range []string{"c-a", "c-b"} {
+		if a := findAgent(t, tl, id); a.Parent != MainAgent || a.Type != "" || !strings.HasPrefix(a.Label, "subagent ") {
+			t.Fatalf("subagent %s = %+v", id, a)
+		}
+	}
+	want := []string{MainAgent, "c-sub", "c-a", "c-b", "c-a", MainAgent, MainAgent}
+	if len(tl.Turns) != len(want) {
+		t.Fatalf("Turns = %d, want %d", len(tl.Turns), len(want))
+	}
+	for i, tu := range tl.Turns {
+		if tu.Agent != want[i] {
+			t.Fatalf("turn %d agent = %q, want %q", i, tu.Agent, want[i])
+		}
+	}
+}
+
+// streamed records a finished main turn with its stream timing, body size and output tokens.
+func (r *rec) streamed(start, dur, ttfb float64, bytesDown int64, outTokens int) {
+	r.turn("", start, dur, []pipeline.InferenceMessage{user(r.id())}, nil, "end_turn")
+	resp := &r.events[len(r.events)-1]
+	resp.Ttfb = time.Duration(ttfb * float64(time.Second))
+	resp.BytesDown = bytesDown
+	resp.Inference.OutputTokens = outTokens
+	resp.Inference.StreamedResponse = true
+}
+
+// open records a main request that has no response yet.
+func (r *rec) open(start float64, id string) {
+	r.add(pipeline.SessionEvent{At: at(start), Phase: pipeline.SessionRequest, RequestID: id, Host: "llm.example",
+		Inference: &pipeline.InferenceExtension{AgentRole: pipeline.AgentRoleMain, Tools: tools, Messages: []pipeline.InferenceMessage{user(id)}, Stream: true}})
+}
+
+func TestBuild_TurnCarriesOutputTokens(t *testing.T) {
+	var r rec
+	r.streamed(0, 2, 1, 500, 120)
+	tl := Build("s", r.events, at(10))
+	if len(tl.Turns) != 1 || tl.Turns[0].OutputTokens != 120 {
+		t.Fatalf("turns = %+v, want one turn with 120 output tokens", tl.Turns)
+	}
+}
+
+// calibrated is turn A (streamed 7 s, 39 bytes per token) and turn B (streamed 2 s, too short
+// to count).
+func calibrated() *rec {
+	var r rec
+	r.streamed(0, 8, 1, 39000, 1000)
+	r.streamed(10, 3, 1, 999999, 10)
+	return &r
+}
+
+func TestBuild_BytesPerTokenFromLongTurnsOnly(t *testing.T) {
+	tl := Build("s", calibrated().events, at(20))
+	if tl.bytesPerToken != 39 {
+		t.Fatalf("bytesPerToken = %v, want 39", tl.bytesPerToken)
+	}
+}
+
+// The ratio estimates the tokens behind a streamed body, so a buffered reply must not set it: its
+// JSON carries the whole message, not the SSE framing the estimate is read against. A gateway
+// answers a streaming request this way routinely.
+func TestBuild_BufferedResponseDoesNotCalibrate(t *testing.T) {
+	var r rec
+	r.streamed(0, 8, 1, 39000, 1000)                             // the request asked for a stream...
+	r.events[len(r.events)-1].Inference.StreamedResponse = false // ...and the reply was buffered
+	tl := Build("s", r.events, at(20))
+	if tl.bytesPerToken != 0 {
+		t.Fatalf("bytesPerToken = %v from a buffered response, want 0", tl.bytesPerToken)
+	}
+}
+
+// The request's stream flag says nothing about the response: a WebSocket turn carries no stream
+// field, and the per-frame parser is what marks its response streamed.
+func TestBuild_StreamedResponseAloneCalibrates(t *testing.T) {
+	var r rec
+	r.streamed(0, 8, 1, 39000, 1000)
+	r.events[len(r.events)-2].Inference.Stream = false
+	tl := Build("s", r.events, at(20))
+	if tl.bytesPerToken != 39 {
+		t.Fatalf("bytesPerToken = %v, want 39 from a response marked streamed", tl.bytesPerToken)
+	}
+}
+
+func TestFillLive_FillsOnlyOpenTurns(t *testing.T) {
+	r := calibrated()
+	r.open(20, "open")
+	tl := Build("s", r.events, at(30))
+	tl.FillLive(func(string) (int64, bool) { return 3900, true })
+	if len(tl.Turns) != 3 {
+		t.Fatalf("turns = %+v", tl.Turns)
+	}
+	for i, tu := range tl.Turns {
+		want := 0
+		if tu.End == nil {
+			want = 100
+		}
+		if tu.LiveTokens != want {
+			t.Errorf("turn %d LiveTokens = %d, want %d", i, tu.LiveTokens, want)
+		}
+	}
+	if tl.Turns[2].End != nil {
+		t.Errorf("turn 2 is not open: %+v", tl.Turns[2])
+	}
+}
+
+func TestFillLive_NoRatioDoesNothing(t *testing.T) {
+	var r rec
+	r.streamed(0, 3, 1, 999999, 10)
+	r.open(10, "open")
+	tl := Build("s", r.events, at(20))
+	tl.FillLive(func(string) (int64, bool) { return 3900, true })
+	if tl.Turns[1].LiveTokens != 0 {
+		t.Fatalf("LiveTokens = %d, want 0 with no calibration turn", tl.Turns[1].LiveTokens)
+	}
+}
+
+func TestFillLive_UnknownStreamLeavesZero(t *testing.T) {
+	r := calibrated()
+	r.open(20, "open")
+	tl := Build("s", r.events, at(30))
+	tl.FillLive(func(string) (int64, bool) { return 0, false })
+	if tl.Turns[2].LiveTokens != 0 {
+		t.Fatalf("LiveTokens = %d, want 0 for an unknown stream", tl.Turns[2].LiveTokens)
 	}
 }

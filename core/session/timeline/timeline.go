@@ -7,7 +7,7 @@
 // fold has: a subagent's first request routinely lands before the response that spawned it is
 // recorded, because Claude Code starts a tool while the response is still streaming.
 //
-// Build depends only on pipeline.SessionEvent, so it works on events from the store, the
+// Build depends only on model.SessionEvent, so it works on events from the store, the
 // archive, or any other producer that fills the same fields.
 package timeline
 
@@ -17,7 +17,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/rossoctl/cortex/core/pipeline"
+	"github.com/rossoctl/cortex/core/model"
 )
 
 // MainAgent is the agent id of the main conversation.
@@ -58,6 +58,9 @@ type Timeline struct {
 	// scanned counts the message bytes searched for returns, so a test can pin that only
 	// messages new to an agent are read.
 	scanned int
+	// bytesPerToken converts an open stream's bytes to tokens for FillLive. It comes from the
+	// finished turns that streamed calibrateMinStream or longer. Zero when there is no such turn.
+	bytesPerToken float64
 }
 
 // Agent is one row of the agent tree.
@@ -89,6 +92,35 @@ type Turn struct {
 	// Model is the model the call asked for, so a client that runs several models side by
 	// side (Bob's premium-ide turns beside its security classifier) reads apart.
 	Model string `json:"model,omitempty"`
+	// OutputTokens is the number of tokens the response generated, as its usage reports it.
+	OutputTokens int `json:"outputTokens,omitempty"`
+	// LiveTokens is an estimate of the tokens an open response has streamed until now. Only
+	// FillLive sets it.
+	LiveTokens int `json:"liveTokens,omitempty"`
+
+	requestID string // pairs an open turn with its live stream in FillLive
+}
+
+// calibrateMinStream is the shortest stream time (Duration − Ttfb) of a turn that sets
+// bytesPerToken. In a shorter stream, the fixed bytes of the stream framing are too large a part.
+const calibrateMinStream = 5 * time.Second
+
+// FillLive sets LiveTokens on each open turn for which bytes gives the stream size. It uses the
+// bytes-per-token ratio of the long finished turns of the session. With no ratio, it does nothing.
+// It writes the turns, so a cache runs it on a copy whose Turns it owns.
+func (t *Timeline) FillLive(bytes func(requestID string) (int64, bool)) {
+	if t.bytesPerToken == 0 {
+		return
+	}
+	for i := range t.Turns {
+		tu := &t.Turns[i]
+		if tu.End != nil || tu.Lost {
+			continue
+		}
+		if b, ok := bytes(tu.requestID); ok {
+			tu.LiveTokens = int(float64(b) / t.bytesPerToken)
+		}
+	}
 }
 
 // Tool is one tool call: from the response that requested it to the agent's first request
@@ -106,14 +138,17 @@ type Tool struct {
 }
 
 // Job is a background shell command: from the tool result that acknowledged it ("Command
-// running in background with ID: …") to the <task-notification> naming that id. Its tool call
+// running in background with ID: …") to the <task-notification> naming that id, or to the
+// TaskStop result that stopped it. Its tool call
 // ends at the acknowledgement, so without this the agent looks idle while the job runs.
 type Job struct {
-	Agent string     `json:"agent"`
-	ID    string     `json:"id"`
-	Start time.Time  `json:"start"`
-	End   *time.Time `json:"end,omitempty"`
-	Seq   uint64     `json:"seq"`
+	Agent string `json:"agent"`
+	ID    string `json:"id"`
+	// ToolUseID is the Bash call whose result started the job. Empty from an older proxy.
+	ToolUseID string     `json:"toolUseId,omitempty"`
+	Start     time.Time  `json:"start"`
+	End       *time.Time `json:"end,omitempty"`
+	Seq       uint64     `json:"seq"`
 }
 
 // Return is a subagent's result reaching another agent's context.
@@ -140,7 +175,7 @@ type Host struct {
 
 // Build computes the timeline of events, which must be one session's events in Seq order.
 // now ages out requests that never got an answer; see LoseUnanswered.
-func Build(id string, events []pipeline.SessionEvent, now time.Time) *Timeline {
+func Build(id string, events []model.SessionEvent, now time.Time) *Timeline {
 	t := &Timeline{ID: id, Agents: []Agent{}, Turns: []Turn{}, Tools: []Tool{}, Returns: []Return{}, Hosts: []Host{}}
 	if len(events) == 0 {
 		return t
@@ -255,7 +290,7 @@ func endStrandedTools(t *Timeline) {
 	}
 }
 
-// LoseUnanswered ends, as lost, each request still unanswered hostLostAfter before the later
+// LoseUnanswered ends, as lost, each request still unanswered HostLostAfter before the later
 // of now and the session's newest event. The one part of a timeline that depends on the clock,
 // so a cache can keep the rest until the session records something new and run this on each
 // read. It writes h.End, so a cache runs it on a copy whose Hosts it owns.
@@ -265,7 +300,7 @@ func (t *Timeline) LoseUnanswered(now time.Time) {
 		ref = now
 	}
 	for i := range t.Hosts {
-		if h := &t.Hosts[i]; h.End == nil && ref.Sub(h.Start) > hostLostAfter {
+		if h := &t.Hosts[i]; h.End == nil && ref.Sub(h.Start) > HostLostAfter {
 			loseHost(h)
 		}
 	}
