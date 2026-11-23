@@ -21,14 +21,15 @@ func servicePathsFixture(t *testing.T) servicePaths {
 		t.Fatal(err)
 	}
 	return servicePaths{
-		unitFile:   filepath.Join(dir, "unit"),
-		binary:     bin,
-		configFile: filepath.Join(dir, "config.yaml"),
-		logFile:    filepath.Join(dir, "proxy.log"),
-		pidFile:    filepath.Join(dir, "proxy.pid"),
-		stampFile:  filepath.Join(dir, "proxy.sha256"),
-		healthURL:  "http://127.0.0.1:1/healthz",
-		home:       dir,
+		unitFile:    filepath.Join(dir, "unit"),
+		updaterFile: filepath.Join(dir, "updater"),
+		binary:      bin,
+		configFile:  filepath.Join(dir, "config.yaml"),
+		logFile:     filepath.Join(dir, "proxy.log"),
+		pidFile:     filepath.Join(dir, "proxy.pid"),
+		stampFile:   filepath.Join(dir, "proxy.sha256"),
+		healthURL:   "http://127.0.0.1:1/healthz",
+		home:        dir,
 	}
 }
 
@@ -800,5 +801,71 @@ func TestReportNotAnswering_LeadsWithTheHolder(t *testing.T) {
 		t.Fatalf("the holder is not named at all:\n%s", s)
 	case holder < notAnswering || holder > willFail:
 		t.Errorf("the holder line is not between those two:\n%s", s)
+	}
+}
+
+// TestRenderUnit_LinuxPraxisSupervises: in praxis mode the supervisor must start the
+// gateway and write gateway.token, so the systemd unit runs cortex --supervise. The
+// unit reads praxis.enabled from the config file: no caller sets it.
+func TestRenderUnit_LinuxPraxisSupervises(t *testing.T) {
+	p := servicePathsFixture(t)
+	if err := os.WriteFile(p.configFile, []byte("praxis:\n  enabled: true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	u := renderUnitFor("linux", p)
+	want := "ExecStart=" + shQuote(p.binary) + " --supervise --config " + shQuote(p.configFile) + "\n"
+	if !strings.Contains(u, want) {
+		t.Errorf("ExecStart is not %q:\n%s", want, u)
+	}
+}
+
+// TestRenderUnit_LinuxDirectUnchanged: direct mode keeps the unit it had before
+// praxis mode, byte for byte.
+func TestRenderUnit_LinuxDirectUnchanged(t *testing.T) {
+	p := servicePathsFixture(t)
+	want := `[Unit]
+Description=Cortex local proxy (cortex)
+Documentation=https://github.com/rossoctl/cortex
+X-AgentopVersion=` + version + `
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=` + shQuote(p.binary) + ` --config ` + shQuote(p.configFile) + `
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=5
+StandardOutput=append:` + p.logFile + `
+StandardError=append:` + p.logFile + `
+
+[Install]
+WantedBy=default.target
+`
+	if got := renderUnitFor("linux", p); got != want {
+		t.Errorf("direct-mode unit changed:\ngot:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestConfigPraxisEnabled(t *testing.T) {
+	dir := t.TempDir()
+	for _, tc := range []struct {
+		name, body string
+		want       bool
+	}{
+		{"on", "praxis:\n  enabled: true\n", true},
+		{"off", "praxis:\n  enabled: false\n", false},
+		{"broken", "praxis: [\n", false},
+	} {
+		path := filepath.Join(dir, tc.name+".yaml")
+		if err := os.WriteFile(path, []byte(tc.body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if got := configPraxisEnabled(path); got != tc.want {
+			t.Errorf("%s: configPraxisEnabled = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+	if configPraxisEnabled(filepath.Join(dir, "missing.yaml")) {
+		t.Error("missing file: configPraxisEnabled = true, want false")
 	}
 }

@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -286,7 +287,7 @@ func spendDrawerHostPane(pane paneID) (bool, string) {
 		// its key handler runs before this one and returns, so the drawer's own keys could never
 		// reach it. A drawer whose hint line advertises [w] on the one pane where `w` belongs to
 		// something else is a lie printed on screen.
-		return false, "spend: the usage pane is the breakdown — use its own [b] and [w]"
+		return false, "spend: the usage pane is the breakdown — use its own [o] and [w]"
 	case paneTimeline:
 		// Its own [w] picks the time window, and runs before the drawer's.
 		return false, "spend: the timeline's [w] is its window — open the drawer from the events pane"
@@ -310,18 +311,15 @@ func spendDrawerHostPane(pane paneID) (bool, string) {
 // spendDrawerReservesRows reports whether layout() must hold spendDrawerLinesFor(width)
 // back.
 //
-// THE FLAG AND THE HEIGHT, deliberately blind to the pane — the same asymmetry
-// spendStripReservesRow has, for the same reason: layout() runs on resizes, drawer
-// toggles and pane transitions alike, and there is no setPane choke point to hook (the
-// pane is assigned in twenty-odd places), so a pane-aware reservation would go stale on
-// the next transition — and stale in the dangerous direction, because a drawer that DRAWS
-// against an unreserved body overflows the terminal.
-//
-// The cost is larger than the strip's: while the drawer is open, a pane that cannot host it
-// renders its reservation shorter than it could. That is a visible loss where the strip's was
-// one invisible row, and it is still the right trade — the alternative is a footer pushed off
-// the bottom, and the state is transient and user-initiated.
+// ONLY ON A PANE THAT CAN HOST THE DRAWER. The flag survives a move to the timeline or the usage
+// pane, and a reservation that ignored the pane left the drawer's rows there as blank lines
+// under the band. A pane-aware reservation can go stale on a pane change, so Update re-runs
+// layout() when this answer changes: a drawer that draws against an unreserved body pushes the
+// footer off the bottom.
 func (m *model) spendDrawerReservesRows() bool {
+	if ok, _ := m.spendDrawerHost(); !ok {
+		return false
+	}
 	return m.spend.expanded && m.height >= spendDrawerMinHeight
 }
 
@@ -421,14 +419,15 @@ func (m *model) toggleSpendDrawer() tea.Cmd {
 // on screen until the new one lands is the behaviour cycleSpendAxis already chose for its
 // axis change. The caption comes from the snapshot, so rows and caption lag together.
 func (m *model) syncSpendScope() tea.Cmd {
-	if m.client != nil && m.spendScopeAgent() != m.spend.bandAgent {
+	if m.client != nil && (m.spendScopeAgent() != m.spend.bandAgent || m.spendScopeProject() != m.spend.bandProject) {
 		// startSpendPolling refetches an open drawer too, under the same agent.
 		return m.startSpendPolling()
 	}
 	if !m.spend.expanded {
 		return nil
 	}
-	if m.spendScopeAgent() == m.spend.drawerAgent && m.spendDrawerSpan() == m.spend.drawerSpan {
+	if m.spendScopeAgent() == m.spend.drawerAgent && m.spendScopeProject() == m.spend.drawerProject &&
+		m.spendDrawerSpan() == m.spend.drawerSpan {
 		return nil
 	}
 	return m.fetchSpendDrawer()
@@ -451,6 +450,10 @@ func (m *model) syncSpendScope() tea.Cmd {
 // does not blink through an empty frame — it is a breakdown of the same traffic either way.
 func (m *model) cycleSpendAxis() tea.Cmd {
 	axes := m.spendAxes()
+	// A project scope has no axes, and `a` does nothing.
+	if len(axes) == 0 {
+		return nil
+	}
 	next := axes[(slices.Index(axes, m.spendAxis())+1)%len(axes)]
 	m.spend.groupIdx = slices.Index(spendDrawerAxes, next)
 	// THE PREVIOUS SPAN'S ERROR IS DROPPED HERE, and it has to be dropped rather than left to
@@ -829,12 +832,13 @@ func drawerScopeLabel(snap *usage.Snapshot) string {
 // exactly the silence applySpendLoaded's doc forbids for the band — the chain clears snap on
 // failure, so without this a broken endpoint rendered as headers over blank rows forever.
 func renderSpendDrawer(snap *usage.Snapshot, err error, axis usage.Group, windowLabel string, width int) []string {
-	return renderSpendDrawerAxes(snap, err, axis, axis, spendDrawerAxes, windowLabel, width)
+	return renderSpendDrawerAxes(snap, err, axis, axis, spendDrawerAxes, windowLabel, "", width)
 }
 
-// renderSpendDrawerAxes is renderSpendDrawer with the axis cycle its hint line spells, and the axis
-// snap was asked for.
-func renderSpendDrawerAxes(snap *usage.Snapshot, err error, axis, asked usage.Group, axes []usage.Group, windowLabel string, width int) []string {
+// renderSpendDrawerAxes is renderSpendDrawer with the axis cycle its hint line spells, the axis
+// snap was asked for, and the project scope snap was narrowed to. With no axes, the hint line
+// has no `[a]` figure.
+func renderSpendDrawerAxes(snap *usage.Snapshot, err error, axis, asked usage.Group, axes []usage.Group, windowLabel, project string, width int) []string {
 	if err != nil {
 		// The reservation still has to be filled, so this is spendDrawerLinesFor(width) rows with the
 		// diagnostic on the first and the hint line last — the hints stay because `w` and `$`
@@ -845,17 +849,13 @@ func renderSpendDrawerAxes(snap *usage.Snapshot, err error, axis, asked usage.Gr
 		for len(out) < spendDrawerLinesFor(width)-1 {
 			out = append(out, "")
 		}
-		return append(out, fitStripFigures(" ", plainFigures(
-			"[a] "+axisHintOf(axis, axes),
-			"[w] "+windowLabel,
-			"[$] closes",
-		), width))
+		return append(out, fitStripFigures(" ", plainFigures(drawerHints(axis, axes, windowLabel)...), width))
 	}
 	rows := spendDrawerRows(snap, spendDrawerSeries)
 	if snap != nil {
 		drawerRowUnits(snap, rows)
 	}
-	note := drawerScopeNote(snap, asked, windowLabel)
+	note := drawerScopeNote(snap, asked, windowLabel, project)
 	hintAxis := axis
 	if note != "" {
 		hintAxis = asked
@@ -940,11 +940,7 @@ func renderSpendDrawerAxes(snap *usage.Snapshot, err error, axis, asked usage.Gr
 	// The hint line is LAST and always present: it is the only place the two keys and the
 	// current axis are written down, and a drawer whose controls are undiscoverable is a
 	// drawer nobody changes the axis of.
-	out = append(out, fitStripFigures(" ", plainFigures(
-		"[a] "+axisHintOf(hintAxis, axes),
-		"[w] "+windowLabel,
-		"[$] closes",
-	), width))
+	out = append(out, fitStripFigures(" ", plainFigures(drawerHints(hintAxis, axes, windowLabel)...), width))
 
 	// PADDED OUT TO THE RESERVATION. layout() holds back spendDrawerLinesFor(width), and it
 	// has to: a poll can land between the layout and the render, so sizing the body to the rows
@@ -1153,9 +1149,21 @@ func gapOf(c usage.Counts) int64 {
 	return 0
 }
 
+// drawerHints is the drawer's hint line: `[a]` and its axes when there are some, then `[w]` and `[$]`.
+func drawerHints(axis usage.Group, axes []usage.Group, windowLabel string) []string {
+	hints := []string{"[w] " + windowLabel, "[$] closes"}
+	if len(axes) == 0 {
+		return hints
+	}
+	return append([]string{"[a] " + axisHintOf(axis, axes)}, hints...)
+}
+
 // drawerScopeNote is the series column's line when a scoped reply came back without the breakdown
-// it was asked for, or "".
-func drawerScopeNote(snap *usage.Snapshot, asked usage.Group, windowLabel string) string {
+// it was asked for, or "". A reply narrowed to a project never has a breakdown.
+func drawerScopeNote(snap *usage.Snapshot, asked usage.Group, windowLabel, project string) string {
+	if project != "" && snap != nil {
+		return "no breakdown for this scope in " + windowLabel
+	}
 	if snap == nil || snap.Agent == "" || snap.Group != usage.GroupNone || asked == "" || asked == usage.GroupNone {
 		return ""
 	}
@@ -1219,4 +1227,73 @@ func rankSeriesByCost(buckets []usage.Bucket) []seriesKey {
 		return out[i].label < out[j].label
 	})
 	return out
+}
+
+// drawerMarkRe finds the runs of a drawer line that are not muted, in the order they win at one
+// position: headings, bar glyphs, a saving up to the next two spaces, a (…) caveat, an amount, a
+// [bracket].
+var drawerMarkRe = regexp.MustCompile(`WHERE IT WENT|BY [A-Z]+|[█▉▊▋▌▍▎▏]+|saved (?:[^ ]| [^ ])+|\([^()]*\)|[<~!]*\$[0-9.,]+\+?|\[[^\[\]\s]+\]`)
+
+// drawerKeys are the drawer's key hints, the only brackets that become chips.
+var drawerKeys = map[string]bool{"[a]": true, "[w]": true, "[$]": true}
+
+// styleDrawerLines dresses the drawer's lines, each already cut to width. The hint line is the
+// last line that is not empty (renderSpendDrawerAxes writes it last, then pads), and only it
+// gets key chips: a diagnostic or a server label that holds "[w]" keeps its text.
+func styleDrawerLines(lines []string) []string {
+	hint := -1
+	for i, l := range lines {
+		if l != "" {
+			hint = i
+		}
+	}
+	out := make([]string, len(lines))
+	for i, l := range lines {
+		out[i] = styleDrawerLine(l, i == hint)
+	}
+	return out
+}
+
+// styleDrawerLine dresses one drawer line. Under Ascii it is styleMuted.Render(line), as before.
+// With color the text stays the same except that, on the controls line, [a], [w] and [$] become
+// chips and the bracketed axis keeps its brackets in styleSeg.
+func styleDrawerLine(line string, controls bool) string {
+	if !colorOn() {
+		return styleMuted.Render(line)
+	}
+	var b strings.Builder
+	last := 0
+	for _, loc := range drawerMarkRe.FindAllStringIndex(line, -1) {
+		if loc[0] > last {
+			b.WriteString(styleMuted.Render(line[last:loc[0]]))
+		}
+		b.WriteString(styleDrawerMark(line[loc[0]:loc[1]], controls))
+		last = loc[1]
+	}
+	if last < len(line) {
+		b.WriteString(styleMuted.Render(line[last:]))
+	}
+	return b.String()
+}
+
+// styleDrawerMark is one drawerMarkRe match in its own ink.
+func styleDrawerMark(m string, controls bool) string {
+	switch {
+	case controls && drawerKeys[m]:
+		return styleChip.Render(" " + m[1:len(m)-1] + " ")
+	case m[0] == '[':
+		if controls {
+			return styleSeg.Render(m)
+		}
+		return styleMuted.Render(m)
+	case m == "WHERE IT WENT" || strings.HasPrefix(m, "BY "):
+		return styleMutedBold.Render(m)
+	case strings.HasPrefix(m, "saved "):
+		return styleOK.Render(m)
+	case m[0] == '(':
+		return styleDim.Render(m)
+	case strings.Contains(m, "$"):
+		return styleBold.Render(m)
+	}
+	return styleAccent.Render(m)
 }

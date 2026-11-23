@@ -1,0 +1,588 @@
+package inference
+
+import (
+	"bytes"
+	"encoding/json"
+	"log/slog"
+	"strings"
+
+	"github.com/rossoctl/cortex/core/internal/parsercommon"
+	"github.com/rossoctl/cortex/core/model"
+)
+
+// --- request ---
+
+// responsesRequest is the subset of an OpenAI Responses API request we
+// surface. Unlike Chat Completions and Anthropic Messages, the conversation
+// lives under `input`, not `messages`, and a tool manifest can arrive as its
+// own input item (type "additional_tools") rather than a top-level `tools`
+// field — see responsesInputItem.
+//
+// Input is json.RawMessage rather than []responsesInputItem directly: the
+// documented API accepts input as EITHER that array OR a bare string (a
+// shorthand for one user message, the common one-shot usage shown in
+// OpenAI's own docs). Codex always sends the array form — this is a real
+// gap for the public endpoint that our one live sample never exercised, not
+// something confirmed on live traffic the way the rest of this file is. See
+// parseResponsesRequest for where the two shapes are told apart.
+type responsesRequest struct {
+	Model           string          `json:"model"`
+	Input           json.RawMessage `json:"input"`
+	Stream          bool            `json:"stream"`
+	ToolChoice      any             `json:"tool_choice"`
+	Temperature     *float64        `json:"temperature"`
+	MaxOutputTokens *int            `json:"max_output_tokens"`
+	TopP            *float64        `json:"top_p"`
+	// Raw for the reason anthropicRequest.Thinking is.
+	Reasoning json.RawMessage `json:"reasoning"`
+}
+
+// responsesInputItem is one entry of a Responses API request's `input`
+// array. Three shapes are read, the first two confirmed on live Codex traffic:
+//
+//   - "message": the conversation itself — role + content, where content is
+//     an array of parts tagged input_text/output_text/... (not Chat
+//     Completions' or Anthropic's "text") carrying a `text` field.
+//     flattenResponsesContent keeps any part with non-empty text regardless
+//     of its type label, since Codex alone uses more than one and the
+//     public API documents others still.
+//   - "additional_tools": Codex's own tool-manifest convention — a
+//     namespace wrapper (type "namespace", confirmed named "functions" on
+//     the traffic this was built from) one level deep, each with its own
+//     nested `tools` array holding the real definitions. An unwrapped flat
+//     `tools` array from some other Responses API caller is not modeled
+//     here and yields no tools for that request, the same outcome this
+//     parser already has for any tool definition it cannot read.
+//   - "function_call_output": what an earlier tool call returned, keyed by
+//     its call_id — the Responses dialect's counterpart of Anthropic's
+//     tool_result block. Goes to InferenceExtension.ToolResults, never into
+//     Messages, for the same reason the Anthropic one does: tool output
+//     must not reach the plugins that read Messages. The output value is
+//     read with flattenResponsesContent, which accepts the string form this
+//     API documents and a text-part array should one arrive.
+//   - "custom_tool_call_output": the same thing for a custom (freeform)
+//     tool, with the same call_id and output fields. Codex declares its
+//     tools this way (one "exec" tool taking a script), so every tool result
+//     it sends arrives as this type, with the output as input_text parts.
+//
+// Every other item type (reasoning echoes, function_call round-trips) is
+// skipped — this parser surfaces conversation text, the tool manifest, and
+// tool output, not the rest of the agent-loop bookkeeping. The function_call
+// item itself needs no capture here: the model's request for a tool arrives
+// on the RESPONSE side, whole, as a response.output_item.done event.
+type responsesInputItem struct {
+	Type         string
+	Role         string
+	Content      string
+	ContentBytes int
+	Tools        []model.InferenceTool
+	ToolResults  []model.InferenceToolResult
+}
+
+func (it *responsesInputItem) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Type    string                   `json:"type"`
+		Role    string                   `json:"role"`
+		Content json.RawMessage          `json:"content"`
+		Tools   []responsesToolNamespace `json:"tools"`
+		CallID  string                   `json:"call_id"`
+		Output  json.RawMessage          `json:"output"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	it.Type = raw.Type
+	it.Role = raw.Role
+	if raw.Type == "message" {
+		it.Content = flattenResponsesContent(raw.Content)
+		it.ContentBytes = contentBytes(raw.Content)
+	}
+	for _, ns := range raw.Tools {
+		for _, t := range ns.Tools {
+			if t.Name == "" {
+				continue
+			}
+			it.Tools = append(it.Tools, model.InferenceTool{
+				Name:        t.Name,
+				Description: t.Description,
+				Parameters:  schemaObject(t.Parameters),
+			})
+		}
+	}
+	if raw.Type == "function_call_output" || raw.Type == "custom_tool_call_output" {
+		it.ToolResults = append(it.ToolResults, model.InferenceToolResult{
+			ToolUseID: raw.CallID,
+			Content:   flattenResponsesContent(raw.Output),
+		})
+	}
+	return nil
+}
+
+// responsesToolNamespace is the "namespace" wrapper Codex sends around its
+// tool manifest, one level of grouping around the real tool definitions.
+type responsesToolNamespace struct {
+	Type  string             `json:"type"`
+	Name  string             `json:"name"`
+	Tools []responsesToolDef `json:"tools"`
+}
+
+// responsesToolDef is one real tool definition inside a namespace. Parameters
+// is a json.RawMessage for the same reason as inferenceFunction's field of
+// the same name: a non-object value must not fail the whole decode. Confirmed
+// absent (null) for at least one real tool (a custom code-exec tool with no
+// JSON-schema arguments) and present as a real object for others —
+// schemaObject already drops the former and keeps the latter.
+type responsesToolDef struct {
+	Type        string          `json:"type"`
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	Parameters  json.RawMessage `json:"parameters"`
+}
+
+// flattenResponsesContent returns the text representation of a Responses API
+// `input` message's content value.
+//
+// Unlike flattenContent (Chat Completions / Anthropic, which gate on
+// type=="text"), this keeps any content part with a non-empty text field
+// regardless of its type label — confirmed on live Codex traffic to be
+// "input_text", and the Responses API documents "output_text" and "refusal"
+// for the assistant side. Gating on one label would silently drop every part
+// tagged something else, which is exactly the failure flattenContent's own
+// doc comment warns about for a provider that adds a new one.
+func flattenResponsesContent(raw json.RawMessage) string {
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s
+	}
+	var parts []struct {
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(raw, &parts); err == nil {
+		var b strings.Builder
+		for _, p := range parts {
+			if p.Text == "" {
+				continue
+			}
+			if b.Len() > 0 {
+				b.WriteByte('\n')
+			}
+			b.WriteString(p.Text)
+		}
+		return b.String()
+	}
+	return ""
+}
+
+// parseResponsesRequest builds an InferenceExtension from an OpenAI Responses
+// API request body. Returns nil for an empty or non-JSON body, or one
+// without a supported input value — the one thing every Responses API
+// request carries (see parseOpenAIRequest for why dialectFor's loose suffix
+// match needs this kind of body check as a backstop).
+func parseResponsesRequest(body []byte) *model.InferenceExtension {
+	if len(body) == 0 {
+		return nil
+	}
+	var req responsesRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		return nil
+	}
+	// Input is either the documented array, or a bare string shorthand for one user
+	// message. Try the array first — the shape every live sample this file was built
+	// from actually sends — and fall back to the string form before giving up.
+	var input []responsesInputItem
+	if err := json.Unmarshal(req.Input, &input); err != nil {
+		var text string
+		if err := json.Unmarshal(req.Input, &text); err != nil {
+			return nil
+		}
+		input = []responsesInputItem{{
+			Type:         "message",
+			Role:         "user",
+			Content:      text,
+			ContentBytes: contentBytes(req.Input),
+		}}
+	}
+	if input == nil {
+		return nil
+	}
+	ext := &model.InferenceExtension{
+		Model:       req.Model,
+		Temperature: req.Temperature,
+		MaxTokens:   req.MaxOutputTokens,
+		TopP:        req.TopP,
+		Stream:      req.Stream,
+		ToolChoice:  req.ToolChoice,
+		IsAction:    true,
+		Effort:      stringField(req.Reasoning, "effort"),
+	}
+	for _, item := range input {
+		if item.Type == "message" {
+			ext.Messages = append(ext.Messages, model.InferenceMessage{
+				Role:         item.Role,
+				Content:      item.Content,
+				ContentBytes: item.ContentBytes,
+			})
+		}
+		ext.Tools = append(ext.Tools, item.Tools...)
+		// Tool results ride whichever item carried them, message or not — the same
+		// append-everything shape the Anthropic loop uses for its per-message blocks.
+		ext.ToolResults = append(ext.ToolResults, item.ToolResults...)
+	}
+	return ext
+}
+
+// --- usage (shared by response + streaming) ---
+
+// responsesUsage mirrors the Responses API's usage block, confirmed from a
+// live response.completed event. Pointer fields let an absent nested details
+// object stay absent in Present rather than asserting a reported zero — the
+// same convention the other two dialects use.
+//
+// usage.attribution (a per-prior-message token breakdown, richer than either
+// other dialect's usage block) is not modeled: nothing downstream reads a
+// per-item breakdown today, and it is Codex's own addition rather than
+// something the published Responses API schema documents. A later consumer
+// that wants it can decode it separately as model.RawJSON without
+// touching this struct.
+type responsesUsage struct {
+	InputTokens  *int `json:"input_tokens"`
+	OutputTokens *int `json:"output_tokens"`
+	TotalTokens  *int `json:"total_tokens"`
+
+	InputTokensDetails *struct {
+		CachedTokens     int `json:"cached_tokens"`
+		CacheWriteTokens int `json:"cache_write_tokens"`
+	} `json:"input_tokens_details"`
+	OutputTokensDetails *struct {
+		ReasoningTokens int `json:"reasoning_tokens"`
+	} `json:"output_tokens_details"`
+}
+
+func (u responsesUsage) hasAny() bool {
+	return u.InputTokens != nil || u.OutputTokens != nil || u.TotalTokens != nil ||
+		u.InputTokensDetails != nil || u.OutputTokensDetails != nil
+}
+
+// toNeutral maps the Responses API's usage onto TokenUsage. input_tokens is
+// a TOTAL that includes both cached_tokens and cache_write_tokens as
+// subsets, not three independent counts — verified by summing a live
+// response's usage.attribution.items (a per-prior-message breakdown not
+// otherwise modeled here): every item's own input_tokens included its own
+// cached_tokens as a subset, and both columns summed across items to
+// exactly the top-level input_tokens (12862) and cached_tokens (11008)
+// totals on that sample. So both sub-fields are subtracted out here, the
+// same shape inferenceUsage.toNeutral uses for Chat Completions'
+// prompt_tokens/cached_tokens, extended to the one additional sub-field this
+// API reports that Chat Completions doesn't.
+func (u responsesUsage) toNeutral() parsercommon.TokenUsage {
+	usage := parsercommon.TokenUsage{}
+	if u.TotalTokens != nil {
+		usage.ReportedTotal = *u.TotalTokens
+	}
+	if u.InputTokens != nil {
+		usage.Input = *u.InputTokens
+		usage.Present |= parsercommon.KindInput
+	}
+	if u.OutputTokens != nil {
+		usage.Output = *u.OutputTokens
+		usage.Present |= parsercommon.KindOutput
+	}
+	if u.InputTokensDetails != nil {
+		cached := u.InputTokensDetails.CachedTokens
+		cacheWrite := u.InputTokensDetails.CacheWriteTokens
+		usage.Input -= cached + cacheWrite
+		if usage.Input < 0 {
+			usage.Input = 0
+		}
+		usage.CacheRead = cached
+		usage.Present |= parsercommon.KindCacheRead
+		usage.CacheWrite = cacheWrite
+		usage.Present |= parsercommon.KindCacheWrite
+	}
+	if u.OutputTokensDetails != nil {
+		usage.Reasoning = u.OutputTokensDetails.ReasoningTokens
+		usage.Present |= parsercommon.KindReasoning
+	}
+	return usage
+}
+
+// --- non-streaming response ---
+
+// responsesNonStreaming is a non-streaming (stream:false) Responses API
+// response body: the same "response" object the streamed response's
+// terminal response.completed event wraps (see responsesStreamEvent), but
+// delivered directly as the whole body with no SSE framing or event
+// envelope. Modeled from the published Responses API schema — unlike the
+// streamed shape below, this one wasn't exercised by the live traffic this
+// file was built from (Codex always sends stream:true).
+type responsesNonStreaming struct {
+	Model  string                `json:"model"`
+	Status string                `json:"status"`
+	Usage  responsesUsage        `json:"usage"`
+	Output []responsesOutputItem `json:"output"`
+}
+
+// parseResponsesJSON parses a non-streaming (stream:false) Responses API
+// response: output items' text parts -> completion, tool-call items ->
+// ToolCalls (same two shapes as foldResponsesFrame's response.output_item.done
+// case — there's no streaming here to tell "added" from "done", the item
+// just arrives complete), usage -> token counts, status -> a best-effort
+// finish reason (see foldResponsesFrame for why this API has no direct
+// finish_reason/stop_reason equivalent).
+func parseResponsesJSON(body []byte, ext *model.InferenceExtension) {
+	var resp responsesNonStreaming
+	if err := json.Unmarshal(body, &resp); err != nil {
+		slog.Debug("inference-parser: invalid Responses API JSON", "error", err)
+		return
+	}
+	noteBodyModel(ext, resp.Model)
+	var b strings.Builder
+	var calls []model.InferenceToolCall
+	for _, item := range resp.Output {
+		for _, part := range item.Content {
+			if part.Text == "" {
+				continue
+			}
+			if b.Len() > 0 {
+				b.WriteByte('\n')
+			}
+			b.WriteString(part.Text)
+		}
+		switch item.Type {
+		case "custom_tool_call":
+			calls = append(calls, model.InferenceToolCall{ID: item.CallID, Name: item.Name, Arguments: item.Input})
+		case "function_call":
+			calls = append(calls, model.InferenceToolCall{ID: item.CallID, Name: item.Name, Arguments: item.Arguments})
+		}
+	}
+	ext.Completion = b.String()
+	ext.ToolCalls = calls
+	if resp.Status != "" {
+		ext.FinishReason = resp.Status
+	}
+	if resp.Usage.hasAny() {
+		resp.Usage.toNeutral().Fill(ext)
+	}
+}
+
+// --- streaming ---
+
+// responsesStreamEvent is one SSE event's data payload. The Responses API
+// stream is a sequence of typed events (vs OpenAI Chat Completions' uniform
+// chunk): response.created, response.in_progress,
+// response.output_item.added, response.content_part.added,
+// response.output_text.delta (repeated), response.output_text.done,
+// response.content_part.done, response.output_item.done, response.completed
+// — the full sequence confirmed on live Codex traffic. A tool call adds two
+// more, confirmed on a live Codex turn that ran its `exec` tool:
+// response.custom_tool_call_input.delta (repeated, mirrors output_text.delta
+// for the tool's input text) and response.custom_tool_call_input.done. The
+// done events need no modeling: the SAME information arrives complete on
+// response.output_item.done's own item field once the call finishes. The deltas
+// are folded only so a call cut before its done keeps the arguments it had; see
+// Item below. The event types this parser extracts something from are: the
+// repeated text delta, a tool-call item opening and completing, a tool call's
+// argument deltas, and the terminal event's full response snapshot (status + usage).
+type responsesStreamEvent struct {
+	Type     string  `json:"type"`
+	Delta    *string `json:"delta"` // response.output_text.delta's text fragment
+	Response *struct {
+		Model  string         `json:"model"`
+		Status string         `json:"status"`
+		Usage  responsesUsage `json:"usage"`
+	} `json:"response"` // the full snapshot on response.completed/incomplete/failed
+	Item *responsesOutputItem `json:"item"` // the item on response.output_item.added and .done
+	// ItemID and OutputIndex say which item a delta belongs to; an item carries its own id.
+	ItemID      string `json:"item_id"`
+	OutputIndex *int   `json:"output_index"`
+}
+
+// responsesCallState is one tool call of a Responses API stream: opened by
+// response.output_item.added, grown by its argument deltas, and replaced whole by
+// response.output_item.done. A call whose done never arrives keeps what it had.
+type responsesCallState struct {
+	toolCallState
+	itemID string
+	index  *int
+	done   bool
+}
+
+// responsesCall finds the open call an event concerns, by the item id or the output
+// index it carries; a backend that sends only one of them, or differs between events,
+// still matches. An event carrying neither is matched to the oldest call that has no
+// done yet, which is right for calls that arrive one at a time.
+func (s *inferenceStreamState) responsesCall(ev *responsesStreamEvent) *responsesCallState {
+	id, callID := ev.ItemID, ""
+	if ev.Item != nil {
+		callID = ev.Item.CallID
+		if ev.Item.ID != "" {
+			id = ev.Item.ID
+		}
+	}
+	for _, c := range s.responsesToolCalls {
+		switch {
+		case id != "" && c.itemID == id, ev.OutputIndex != nil && c.index != nil && *c.index == *ev.OutputIndex:
+			return c
+		case callID != "" && c.id == callID:
+			return c
+		case id == "" && ev.OutputIndex == nil && c.itemID == "" && c.index == nil && !c.done:
+			return c
+		}
+	}
+	return nil
+}
+
+// responsesToolItem reports whether item is one of the two types that carry a tool call,
+// and the arguments it carries so far.
+func responsesToolItem(item *responsesOutputItem) (args string, ok bool) {
+	switch item.Type {
+	case "custom_tool_call":
+		return item.Input, true
+	case "function_call":
+		return item.Arguments, true
+	}
+	return "", false
+}
+
+// responsesOutputItem is one item of a response's output — the completed
+// item on a streamed response.output_item.done event, or one entry of a
+// non-streaming response's top-level "output" array (responsesNonStreaming);
+// both wrap the same shape. Two item types carry a tool call, confirmed and
+// inferred respectively:
+//
+//   - "custom_tool_call" (confirmed on live Codex traffic: its own `exec`
+//     tool is this type) — a freeform-text tool, arguments carried in Input.
+//   - "function_call" (NOT confirmed on live traffic — Codex's own tool
+//     manifest declares both "custom" and "function" type tools, but the one
+//     real tool call this file was built from happened to use a custom one.
+//     Modeled from the publicly documented function_call item shape:
+//     JSON-schema arguments carried in Arguments, as a string, same as
+//     OpenAI Chat Completions' tool_calls[].function.arguments) — a
+//     JSON-schema tool, arguments carried in Arguments.
+//
+// A "message" item carries Content instead — its text parts. On the
+// streaming path this struct's Content is never populated: output_text.delta
+// events accumulate that text instead, and parsing the same text twice would
+// double it. Content exists on this struct only for the non-streaming path
+// (parseResponsesJSON), which has no deltas to accumulate from and reads the
+// item whole.
+type responsesOutputItem struct {
+	ID        string `json:"id"`
+	Type      string `json:"type"`
+	CallID    string `json:"call_id"`
+	Name      string `json:"name"`
+	Input     string `json:"input"`     // custom_tool_call's freeform argument text
+	Arguments string `json:"arguments"` // function_call's JSON-schema arguments
+	Content   []struct {
+		Text string `json:"text"`
+	} `json:"content"` // "message" item's text parts — non-streaming path only
+}
+
+// foldResponsesFrame folds one Responses API SSE event into the running
+// stream state. The completion accumulates from response.output_text.delta
+// events; a tool call opens on response.output_item.added and a completed one
+// arrives whole on response.output_item.done, which restates the full call_id,
+// name, and input/arguments in one event (confirmed on a live Codex turn that
+// ran its `exec` tool) and so replaces whatever the deltas built. A turn
+// cancelled before the done leaves the call as it stood, truncated arguments
+// included, as the Anthropic dialect does; usage
+// and a best-effort finish reason arrive together on whichever terminal
+// event ends the stream — response.completed on the one live sample this
+// file was built from, plus the two other terminal events the published
+// schema documents: response.incomplete (hit a limit, was cancelled) and
+// response.failed (an upstream error). All three carry the same response
+// snapshot shape, so one case handles them identically; OpenAI's own
+// documented example for response.failed shows usage: null, so the
+// hasAny() guard below is what keeps a failure from asserting a zero usage
+// that was never reported. Every other event type in the sequence carries
+// nothing this parser extracts and is silently ignored — not unrecognized,
+// just uninteresting. Unlike foldAnthropicFrame, an unknown type is not
+// logged here: the full event vocabulary was confirmed on live traffic
+// rather than inferred from docs, so anything outside it is more likely a
+// wire change worth its own look than routine.
+func foldResponsesFrame(frame []byte, state *inferenceStreamState, ext *model.InferenceExtension) {
+	var ev responsesStreamEvent
+	if err := json.Unmarshal(frame, &ev); err != nil {
+		slog.Debug("inference-parser: malformed Responses API streaming frame, skipping",
+			"error", err, "frameLen", len(frame))
+		return
+	}
+	if ev.Response != nil {
+		noteBodyModel(ext, ev.Response.Model)
+	}
+	switch ev.Type {
+	case "response.output_text.delta":
+		if ev.Delta != nil {
+			state.completion.WriteString(*ev.Delta)
+		}
+	case "response.output_item.added", "response.output_item.done":
+		if ev.Item == nil {
+			return
+		}
+		args, ok := responsesToolItem(ev.Item)
+		if !ok {
+			return
+		}
+		call := state.responsesCall(&ev)
+		if call == nil || ev.Type == "response.output_item.added" && call.itemID == "" && call.index == nil && ev.Item.CallID == "" {
+			call = &responsesCallState{itemID: ev.Item.ID, index: ev.OutputIndex}
+			state.responsesToolCalls = append(state.responsesToolCalls, call)
+		}
+		call.done = ev.Type == "response.output_item.done"
+		if call.itemID == "" {
+			call.itemID = ev.Item.ID
+		}
+		if call.index == nil {
+			call.index = ev.OutputIndex
+		}
+		call.id, call.name = ev.Item.CallID, ev.Item.Name
+		// Only a done restates the whole call, so only it replaces what the deltas built.
+		if call.done {
+			call.args.Reset()
+			call.args.WriteString(args)
+		} else if call.args.Len() == 0 {
+			call.args.WriteString(args)
+		}
+	case "response.function_call_arguments.delta", "response.custom_tool_call_input.delta":
+		if ev.Delta == nil {
+			return
+		}
+		if call := state.responsesCall(&ev); call != nil {
+			call.args.WriteString(*ev.Delta)
+		}
+	case "response.completed", "response.incomplete", "response.failed":
+		if ev.Response == nil {
+			return
+		}
+		if ev.Response.Status != "" {
+			ext.FinishReason = ev.Response.Status
+		}
+		if ev.Response.Usage.hasAny() {
+			state.usage = ev.Response.Usage.toNeutral()
+			state.hasUsage = true
+		}
+	}
+}
+
+// parseResponsesSSE folds a fully-buffered Responses API SSE body. Mirrors
+// parseAnthropicSSE/parseInferenceSSE for the legacy OnResponse path; the
+// live listener uses foldResponsesFrame via OnResponseFrame instead.
+func parseResponsesSSE(body []byte, ext *model.InferenceExtension) {
+	markStreamedResponse(body, ext)
+	state := &inferenceStreamState{}
+	for _, line := range bytes.Split(parsercommon.NormalizeSSE(body), []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		data := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+		if len(data) == 0 {
+			continue
+		}
+		foldResponsesFrame(data, state, ext)
+	}
+	state.finalize(ext)
+}

@@ -19,6 +19,7 @@ type setupOptions struct {
 	installOnly    bool
 	noModifyPath   bool
 	restart        bool
+	praxis         bool // add praxis: {enabled: true} to the config
 	handoffBytes   int64
 	handoffSeconds int
 }
@@ -44,7 +45,7 @@ type setupEnv struct {
 	binOnPathNewTerms bool     // binDir is, or will be, on PATH in new terminals
 	pathProfile       string   // the profile the PATH step edits
 	configFresh       bool     // no config.yaml before this run
-	configPinsPending bool     // the migration adds listener pins, which a running proxy takes only on a restart
+	configPinsPending bool     // the config step adds listener pins or the praxis block, which a running proxy takes only on a restart
 	unsupervised      bool     // the proxy runs without launchd/systemd
 	priorService      bool     // a supervised Cortex was serving before this run
 
@@ -54,7 +55,7 @@ type setupEnv struct {
 	priorManual  string   // what to run if restorePrior fails, which it may set as it fails; "" is agentop service restart
 	onSuccess    []func() // run once every step has applied
 
-	configPinsChanged bool // the config step added listener pins, so the service must restart
+	configPinsChanged bool // the config step added listener pins or the praxis block, so the service must restart
 	startedBackground bool // the service step started a background proxy, so the ending says how to stop it
 }
 
@@ -177,7 +178,7 @@ type stepPlan struct {
 	where   string   //
 	done    bool     // nothing to change: a dim "·" line, or "!" when advice is set
 	doneMsg string   //
-	advice  *problem // a non-fatal note shown in place of the "·" line
+	advice  *problem // a non-fatal note shown in place of the "·" line; on a plan with changes, doctor shows it in place of the ✗
 	hidden  bool     // nothing to change and nothing worth a line; set done too, as allDone and consentItems read only done
 }
 

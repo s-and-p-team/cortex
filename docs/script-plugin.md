@@ -6,7 +6,9 @@ each request the agent sends and each response it gets back, and keeps its own
 state between them.
 
 Go plugins remain the way to build anything permanent, shared, or on the hot
-path. Script plugins are for the quick, personal customization.
+path. To write one, read [`plugin-tutorial.md`](plugin-tutorial.md) first,
+then [`plugin-reference.md`](plugin-reference.md). Script plugins are for the
+quick, personal customization.
 
 ## Write one
 
@@ -171,9 +173,10 @@ not part of the name. Each sees the request as the one before it left it. A
 script in shadow mode changes nothing, so the next one sees what it saw.
 
 All of `~/.cortex/plugins/` is one slot, which Cortex appends to the end of the
-outbound pipeline. A folder inside it is a slot of its own once the config names
-it. To put scripts somewhere else — between two Go plugins, for example — list
-the slot yourself and give it a folder of its own:
+outbound pipeline (but not in praxis mode, which runs no outbound plugin). A
+folder inside it is a slot of its own once the config names it. To put scripts
+somewhere else — between two Go plugins, for example — list the slot yourself
+and give it a folder of its own:
 
 ```yaml
 pipeline:
@@ -288,6 +291,76 @@ What it costs, and what it does not cover:
   prompt writes `.claude/settings.local.json` in the repo. Headless runs need
   `--allowedTools 'mcp__sandbox__*'`.
 
+### thinking-fill: keep Claude's earlier reasoning through LiteLLM
+
+LiteLLM 1.100.0 to 1.105.1, and 1.106.0, delete every thinking block in a
+request's history whose text is empty
+([BerriAI/litellm#41361](https://github.com/BerriAI/litellm/issues/41361), fixed
+in 1.105.2 and 1.106.1). Claude Opus 5.x and Fable return their reasoning in that
+shape by default: no text, and an encrypted `signature` that holds the reasoning.
+So behind such a gateway, Claude sees none of its earlier reasoning after a tool
+call, and works its plan out again.
+
+This script gives each such block one character of text (`"."`). The gateway
+then forwards the block, and the provider reads the reasoning from its signature,
+which the script does not change.
+
+Measured on 10 real multi-file bug fixes in this repository (Claude Code, Opus
+5.5 at effort high, 64 runs, through LiteLLM 1.105.1): with the script, output
+was 47% lower. On the 5 longest tasks, 40 or more turns, cost was 38% lower. On
+shorter tasks, cost did not change. No task showed a difference in the result.
+
+**Do you need it?** Your gateway names its version in the `x-litellm-version`
+header of a model response. Send one small request:
+
+```sh
+curl -s -D - -o /dev/null "$ANTHROPIC_BASE_URL/v1/messages" \
+  -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" \
+  -H 'content-type: application/json' -H 'anthropic-version: 2023-06-01' \
+  -d '{"model":"claude-haiku-4-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}' \
+  | grep -i x-litellm-version
+```
+
+Cortex also records what your requests carry: in the session API, a request
+row's `inference.historyThinking` (see [session-api.md](session-api.md)) counts
+the thinking blocks the client sent back. Blocks with `signatureBytes` and no
+`textBytes` are the ones an affected gateway drops.
+
+1. Install it:
+
+   ```sh
+   agentop script install thinking-fill
+   ```
+
+   It adds this slot as the last outbound entry, or ahead of a slot that
+   rewrites responses, such as `moca-sandbox`:
+
+   ```yaml
+         - name: script
+           config:
+             dir: thinking-fill
+   ```
+
+2. Nothing else. The script reads the `x-litellm-version` header of each
+   response, and changes requests only to a host whose latest response named an
+   affected version. It does nothing for other hosts, and stops by itself when
+   the gateway is upgraded.
+
+To check that it works, open the slot's plugin detail in agentop (pipeline pane,
+Enter on the `thinking-fill` script slot): `edits` under Metrics counts the
+requests it changed. Each changed row also prints `thinking-fill:
+kept N earlier thinking block(s)`.
+
+What it costs, and what it does not cover:
+
+- **The first request to a host is not changed.** The script learns the version
+  from that host's first response.
+- **More input tokens.** The reasoning comes back into the conversation, as the
+  provider intends. Most of it is served from the prompt cache.
+- **Only Anthropic Messages requests** (`/v1/messages`). LiteLLM's other
+  endpoints are not changed.
+- **Not a fix.** Upgrade the gateway to LiteLLM 1.105.2 or later, but not
+  1.106.0, when you can. Then `agentop script remove thinking-fill`.
 
 ### Adding a bundled script
 
@@ -298,7 +371,11 @@ the scripts, any `_`-prefixed helpers, and an `entry.yaml`:
 description: One line, shown by agentop script list
 fail_closed: false      # optional; the slot's setting
 timeout: 2s             # optional; the slot's setting
+rewrite_response: false # set it when a script declares @on.response(rewrite=True)
 ```
+
+`agentop script install` puts a slot that does not rewrite responses ahead of
+one that does. The pipeline refuses a response reader after a response writer.
 
 The folder's name is the slot's `dir`. A test in that package checks every
 entry, so adding one is adding the folder.
@@ -312,17 +389,27 @@ each message with the `id` it carried:
 ```sh
 #!/bin/sh
 # ~/.cortex/plugins/tag.sh — needs jq
-echo '{"cortex":1,"hooks":["request"],"enforce":true}'
+echo '{"cortex":2,"hooks":["request"],"enforce":true}'
 while IFS= read -r line; do
   printf '%s' "$line" | jq -c '{id: .id, request: {set_headers: {"X-Tagged": "yes"}}}'
 done
 ```
 
 A message carries `hook` (`request` or `response`), `session` and `request`
-(`method`, `host`, `path`, `headers`, `body` or `body_base64`, and the parsers'
-`inference` / `mcp` / `a2a`). A response hook's message also carries `response`
-(`status`, `headers`, `body` or `body_base64`, `streamed`, and for a stream
-`frames`). The handshake lists the hooks the script implements in `hooks`, and
+(`method`, `host`, `path`, `headers`, and the parsers' `mcp` / `a2a`). A
+response hook's message also carries `response` (`status`, `headers`, `body` or
+`body_base64`, `streamed`, and for a stream `frames`).
+
+The request body and the parsers' `inference` are not in the message. On a long
+conversation each is the size of the request, so Cortex sends one only when the
+script asks. `more` lists what it holds for the message: `body` (request hooks
+only) and `inference`. To get one, write `{"id": N, "fetch": "body"}` before the
+reply. Cortex then writes `{"id": N, "fetch": "body", "value": ...}` on stdin. The
+value of `body` is an object with `body` or `body_base64`. A name that Cortex
+does not hold gets `null`. The SDK does this when a hook first reads `flow.body`,
+`flow.json` or `flow.inference`.
+
+The handshake lists the hooks the script implements in `hooks`, and
 says `"rewrite_response": true` if it may change responses. A reply may carry
 `deny` (`reason`, `status`, `code`), `request` or `response` (`body` or
 `body_base64`, and for a request `set_headers`, `remove_headers`), and

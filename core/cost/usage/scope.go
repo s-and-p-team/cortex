@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/rossoctl/cortex/core/pipeline"
+	"github.com/rossoctl/cortex/core/model"
 )
 
 // BucketScope says whether ScopeToAgent narrows the per-bucket series as well as the
@@ -177,7 +177,7 @@ func narrowBucketsToAgent(buckets []Bucket, agent string) []Bucket {
 // other label, and any agent within a session, is narrowed from the agent axis instead, read
 // uncapped so an agent past MaxSeriesInResponse is still found, and served as group none.
 func (a *Aggregator) AgentSnapshot(window, resolution time.Duration, sessionID, agent string, group Group) Snapshot {
-	if sessionID == "" && pipeline.IsKnownAgent(agent) {
+	if sessionID == "" && model.IsKnownAgent(agent) {
 		snap := a.snapshot(window, resolution, "", agent, group, MaxSeriesInResponse)
 		snap.Agent = agent
 		return snap
@@ -190,17 +190,25 @@ func (a *Aggregator) AgentSnapshot(window, resolution time.Duration, sessionID, 
 // rather than an error. The narrowed buckets carry no series, so any grouping is served as none,
 // and Group says so.
 func NarrowToAgent(snap Snapshot, agent string) Snapshot {
-	scoped, err := ScopeToAgent(&snap, agent, NarrowBuckets)
+	s := NarrowToLabel(snap, agent)
+	s.Agent = agent
+	return s
+}
+
+// NarrowToLabel is NarrowToAgent for any series axis: a grouped snapshot becomes one series's,
+// served as group none. It KEEPS snap.Agent, so a group=project read for one agent narrowed to one
+// project still says which agent it is. A label with no series gets zeroed buckets, not an error.
+func NarrowToLabel(snap Snapshot, label string) Snapshot {
+	scoped, err := ScopeToAgent(&snap, label, NarrowBuckets)
 	if err != nil {
 		idle := snap
 		idle.Totals, idle.Priced = Counts{}, false
 		idle.PricedBy, idle.UnpricedBy, idle.IncompleteBy = nil, nil, nil
 		idle.Currencies, idle.SeriesCurrencies = nil, nil
-		idle.Buckets = narrowBucketsToAgent(snap.Buckets, agent)
+		idle.Buckets = narrowBucketsToAgent(snap.Buckets, label)
 		scoped = &idle
 	}
 	scoped.UngroupedCostMicros, scoped.UngroupedAvoidedMicros = nil, nil
 	scoped.Group = GroupNone
-	scoped.Agent = agent
 	return *scoped
 }

@@ -6,8 +6,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -29,7 +31,11 @@ type fakeBuilder struct {
 	// `next` at call time.
 	next atomic.Value // holds builderResult
 	cfg  atomic.Value // holds *config.Config
+	// gate, when set, makes build signal entered and wait for release.
+	gate atomic.Pointer[buildGate]
 }
+
+type buildGate struct{ entered, release chan struct{} }
 
 type builderResult struct {
 	inbound  *pipeline.Pipeline
@@ -46,6 +52,10 @@ func (b *fakeBuilder) set(r builderResult) {
 }
 
 func (b *fakeBuilder) build() (*pipeline.Pipeline, *pipeline.Pipeline, *config.Config, error) {
+	if g := b.gate.Load(); g != nil {
+		close(g.entered)
+		<-g.release
+	}
 	r := b.next.Load().(builderResult)
 	return r.inbound, r.outbound, r.cfg, r.err
 }
@@ -74,18 +84,29 @@ func writeConfig(t *testing.T, path string, content string) {
 	}
 }
 
-// waitFor polls `cond` up to `timeout` at 10ms intervals. Used to
-// observe async reload completion without baked-in sleeps.
-func waitFor(t *testing.T, timeout time.Duration, cond func() bool, msg string) {
+// waitFor checks cond after each of r's reload attempts until it holds.
+func waitFor(t *testing.T, r *Reloader, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if cond() {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
+	for !cond() {
+		<-r.attempts
 	}
-	t.Fatalf("timed out waiting for %s", msg)
+}
+
+// start starts r, and on cleanup stops its watch loop and waits for it to
+// close its watcher, so the watcher's descriptors close before the next test
+// opens its own. Each reload attempt signals r.attempts.
+func start(t *testing.T, r *Reloader) {
+	t.Helper()
+	r.attempts = make(chan struct{}, 64)
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := r.Start(ctx); err != nil {
+		cancel()
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() {
+		cancel()
+		<-r.loopDone
+	})
 }
 
 func setup(t *testing.T) (*Reloader, *fakeBuilder, string, *pipeline.Holder, *pipeline.Holder) {
@@ -98,8 +119,13 @@ func setup(t *testing.T) (*Reloader, *fakeBuilder, string, *pipeline.Holder, *pi
 // setupWith is setup with extra options, for the tests that need to observe a hook.
 func setupWith(t *testing.T, extra ...Option) (*Reloader, *fakeBuilder, string, *pipeline.Holder, *pipeline.Holder) {
 	t.Helper()
+	return setupIn(t, t.TempDir(), extra...)
+}
 
-	dir := t.TempDir()
+// setupIn is setupWith with the config in dir.
+func setupIn(t *testing.T, dir string, extra ...Option) (*Reloader, *fakeBuilder, string, *pipeline.Holder, *pipeline.Holder) {
+	t.Helper()
+
 	cfgPath := filepath.Join(dir, "config.yaml")
 	if err := os.WriteFile(cfgPath, []byte("mode: envoy-sidecar\n"), 0o600); err != nil {
 		t.Fatalf("initial WriteFile: %v", err)
@@ -118,16 +144,11 @@ func setupWith(t *testing.T, extra ...Option) (*Reloader, *fakeBuilder, string, 
 
 	r := New(cfgPath, inH, outH, b.build, initialCfg,
 		append([]Option{
-			WithDebounce(20 * time.Millisecond),
+			WithDebounce(0),
 			WithDrainWindow(0),
-			WithStartTimeout(5 * time.Second),
 		}, extra...)...,
 	)
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	if err := r.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
+	start(t, r)
 
 	return r, b, cfgPath, inH, outH
 }
@@ -143,7 +164,7 @@ func TestReloader_PlainRewrite(t *testing.T) {
 
 	writeConfig(t, cfgPath, "mode: envoy-sidecar\n# edited\n")
 
-	waitFor(t, 2*time.Second, func() bool { return r.Status().ReloadsOK >= 1 }, "reload to succeed")
+	waitFor(t, r, func() bool { return r.Status().ReloadsOK >= 1 })
 	if inH.Load() != newIn {
 		t.Errorf("inbound holder: not swapped")
 	}
@@ -152,20 +173,65 @@ func TestReloader_PlainRewrite(t *testing.T) {
 	}
 }
 
-// Two writes within the debounce window coalesce into a single reload.
+// manualTimer is a debounce timer that only the test fires. Each Reset runs
+// onReset.
+type manualTimer struct{ onReset func() }
+
+func (m manualTimer) Reset(time.Duration) bool { m.onReset(); return true }
+func (manualTimer) Stop() bool                 { return true }
+
+// fireOnce arms a debounce timer that fires at once for the first event, and
+// never again.
+func fireOnce(r *Reloader) {
+	r.afterFunc = func(_ time.Duration, fire func()) debounceTimer {
+		fire()
+		return manualTimer{onReset: func() {}}
+	}
+}
+
+// A burst of writes lands on one debounce timer, which the last write resets,
+// and its one firing reloads the last write.
 func TestReloader_DebouncesBurst(t *testing.T) {
-	r, b, cfgPath, _, _ := setup(t)
+	var arms atomic.Int32
+	armed := make(chan func(), 1)
+	last := "mode: envoy-sidecar\n# edit 2\n"
+	reset := make(chan struct{}, 1)
+	manual := func(r *Reloader) {
+		// One write can raise several events, so a reset counts once the file
+		// holds the last write.
+		onReset := func() {
+			if b, _ := os.ReadFile(r.configPath); string(b) == last {
+				select {
+				case reset <- struct{}{}:
+				default:
+				}
+			}
+		}
+		r.afterFunc = func(_ time.Duration, fire func()) debounceTimer {
+			if arms.Add(1) == 1 {
+				armed <- fire
+			}
+			return manualTimer{onReset: onReset}
+		}
+	}
+	committed := make(chan struct{}, 2)
+	r, b, cfgPath, _, _ := setupWith(t, manual, WithOnCommit(func(*config.Config) { committed <- struct{}{} }))
 	b.set(builderResult{inbound: emptyPipeline(t), outbound: emptyPipeline(t), cfg: &config.Config{Mode: "envoy-sidecar"}})
 
 	writeConfig(t, cfgPath, "mode: envoy-sidecar\n# edit 1\n")
-	writeConfig(t, cfgPath, "mode: envoy-sidecar\n# edit 2\n")
+	fire := <-armed
+	writeConfig(t, cfgPath, last)
+	<-reset
 
-	waitFor(t, 2*time.Second, func() bool { return r.Status().ReloadsOK >= 1 }, "first reload")
-	// Give the debounce a chance to fire a second time if it's going to.
-	time.Sleep(100 * time.Millisecond)
-
-	if got := r.Status().ReloadsOK; got > 1 {
-		t.Errorf("expected coalesced single reload, got %d", got)
+	fire()
+	<-committed
+	r.Close(context.Background()) // returns once the watch loop has, so Status is final
+	st := r.Status()
+	if st.ReloadsOK != 1 || st.ActiveConfigSHA256 != r.hash([]byte(last)) {
+		t.Errorf("ReloadsOK = %d, active %s; want 1 reload of the last edit", st.ReloadsOK, st.ActiveConfigSHA256)
+	}
+	if n := arms.Load(); n != 1 {
+		t.Errorf("the burst armed %d debounce timers, want 1", n)
 	}
 }
 
@@ -181,32 +247,11 @@ func TestReloader_ContentHashDedup(t *testing.T) {
 		t.Fatalf("ReadFile: %v", err)
 	}
 	writeConfig(t, cfgPath, string(data))
-
-	time.Sleep(200 * time.Millisecond)
+	<-r.attempts
 
 	after := r.Status()
 	if after.ReloadsOK != before.ReloadsOK || after.ReloadsFailed != before.ReloadsFailed {
 		t.Errorf("counters changed on no-op write: before=%+v after=%+v", before, after)
-	}
-}
-
-// Mode change is unreloadable; reload is refused; holders unchanged.
-func TestReloader_RefusesModeChange(t *testing.T) {
-	r, b, cfgPath, inH, _ := setup(t)
-
-	oldInPipeline := inH.Load()
-	newIn := emptyPipeline(t)
-	newOut := emptyPipeline(t)
-	b.set(builderResult{inbound: newIn, outbound: newOut, cfg: &config.Config{Mode: "proxy-sidecar"}})
-
-	writeConfig(t, cfgPath, "mode: proxy-sidecar\n")
-
-	waitFor(t, 2*time.Second, func() bool { return r.Status().ReloadsFailed >= 1 }, "reload to fail")
-	if inH.Load() != oldInPipeline {
-		t.Errorf("inbound holder mutated despite refused reload")
-	}
-	if r.Status().LastError == "" || !contains(r.Status().LastError, "mode") {
-		t.Errorf("error should mention mode, got %q", r.Status().LastError)
 	}
 }
 
@@ -223,7 +268,7 @@ func TestReloader_RefusesListenerChange(t *testing.T) {
 
 	writeConfig(t, cfgPath, "mode: envoy-sidecar\nlistener: {ext_proc_addr: :19090}\n")
 
-	waitFor(t, 2*time.Second, func() bool { return r.Status().ReloadsFailed >= 1 }, "reload to fail")
+	waitFor(t, r, func() bool { return r.Status().ReloadsFailed >= 1 })
 	if inH.Load() != oldInPipeline {
 		t.Errorf("inbound holder mutated despite refused reload")
 	}
@@ -279,18 +324,14 @@ func TestReloader_RefusesCostLedgerChange(t *testing.T) {
 	oldIn, oldOut := inH.Load(), outH.Load()
 
 	r := New(cfgPath, inH, outH, build, initialCfg,
-		WithDebounce(20*time.Millisecond), WithDrainWindow(0), WithStartTimeout(5*time.Second))
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	if err := r.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
+		WithDebounce(0), WithDrainWindow(0))
+	start(t, r)
 	shaBefore := r.Status().ActiveConfigSHA256
 
 	// The edit an operator makes to stop writing cost history.
 	writeConfig(t, cfgPath, "mode: envoy-sidecar\ncost_ledger:\n  enabled: false\n  retention_days: 9\n")
 
-	waitFor(t, 2*time.Second, func() bool { return r.Status().ReloadsFailed >= 1 }, "reload to be refused")
+	waitFor(t, r, func() bool { return r.Status().ReloadsFailed >= 1 })
 
 	st := r.Status()
 	if !contains(st.LastError, "cost_ledger") {
@@ -322,7 +363,7 @@ func TestReloader_BuilderError(t *testing.T) {
 	b.set(builderResult{err: &fakeErr{"synthetic build error"}})
 	writeConfig(t, cfgPath, "mode: envoy-sidecar\n# any edit\n")
 
-	waitFor(t, 2*time.Second, func() bool { return r.Status().ReloadsFailed >= 1 }, "reload to fail")
+	waitFor(t, r, func() bool { return r.Status().ReloadsFailed >= 1 })
 	if inH.Load() != oldInPipeline {
 		t.Errorf("holder mutated despite failed build")
 	}
@@ -350,7 +391,7 @@ func TestReloader_ConfigProviderReflectsSwap(t *testing.T) {
 	b.set(builderResult{inbound: emptyPipeline(t), outbound: emptyPipeline(t), cfg: newCfg})
 
 	writeConfig(t, cfgPath, "mode: envoy-sidecar\npipeline: {outbound: {plugins: [{name: inference-parser}]}}\n")
-	waitFor(t, 2*time.Second, func() bool { return r.Status().ReloadsOK >= 1 }, "reload to succeed")
+	waitFor(t, r, func() bool { return r.Status().ReloadsOK >= 1 })
 
 	got := provider()
 	if len(got.Pipeline.Outbound.Plugins) != 1 || got.Pipeline.Outbound.Plugins[0].Name != "inference-parser" {
@@ -400,7 +441,7 @@ func TestReloader_RefusesSessionChange(t *testing.T) {
 			})
 			writeConfig(t, cfgPath, "mode: envoy-sidecar\n"+tc.yaml)
 
-			waitFor(t, 2*time.Second, func() bool { return r.Status().ReloadsFailed >= 1 }, "reload to be refused")
+			waitFor(t, r, func() bool { return r.Status().ReloadsFailed >= 1 })
 
 			st := r.Status()
 			if !contains(st.LastError, "session") {
@@ -451,15 +492,10 @@ func setupAt(t *testing.T, cfgPath string) (*Reloader, *fakeBuilder, *pipeline.H
 	b.set(builderResult{inbound: emptyPipeline(t), outbound: emptyPipeline(t), cfg: initialCfg})
 
 	r := New(cfgPath, inH, outH, b.build, initialCfg,
-		WithDebounce(20*time.Millisecond),
+		WithDebounce(0),
 		WithDrainWindow(0),
-		WithStartTimeout(5*time.Second),
 	)
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	if err := r.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
+	start(t, r)
 	return r, b, inH, outH
 }
 
@@ -505,8 +541,7 @@ func TestReloader_SymlinkedConfigWrittenThroughTheLink(t *testing.T) {
 	// edit.FileStore.Apply does.
 	writeConfig(t, realPath, "mode: envoy-sidecar\n# edited through the link\n")
 
-	waitFor(t, 3*time.Second, func() bool { return r.Status().ReloadsOK >= 1 },
-		"a reload after the symlink target was replaced")
+	waitFor(t, r, func() bool { return r.Status().ReloadsOK >= 1 })
 	if inH.Load() != newIn {
 		t.Error("inbound holder was not swapped")
 	}
@@ -562,8 +597,7 @@ func TestReloader_ConfigMapDataSymlinkSwapStillReloads(t *testing.T) {
 	}
 	_ = os.RemoveAll(gen1)
 
-	waitFor(t, 3*time.Second, func() bool { return r.Status().ReloadsOK >= 1 },
-		"a reload after the ..data symlink swap")
+	waitFor(t, r, func() bool { return r.Status().ReloadsOK >= 1 })
 	if inH.Load() != newIn {
 		t.Error("inbound holder was not swapped")
 	}
@@ -612,7 +646,7 @@ func TestReloader_ARefusedReloadCommitsNothing(t *testing.T) {
 			})
 			writeConfig(t, cfgPath, "mode: "+tc.newCfg.Mode+"\n# refused\n")
 
-			waitFor(t, 2*time.Second, func() bool { return r.Status().ReloadsFailed >= 1 }, "reload to fail")
+			waitFor(t, r, func() bool { return r.Status().ReloadsFailed >= 1 })
 
 			if commits != 0 {
 				t.Errorf("commit hook ran %d times on a refused reload: whatever it applies is now live from a config this reloader rejected", commits)
@@ -642,7 +676,7 @@ func TestReloader_AnAcceptedReloadCommitsOnce(t *testing.T) {
 		cfg: &config.Config{Mode: "envoy-sidecar"}})
 	writeConfig(t, cfgPath, "mode: envoy-sidecar\n# accepted\n")
 
-	waitFor(t, 2*time.Second, func() bool { return r.Status().ReloadsOK >= 1 }, "reload to succeed")
+	waitFor(t, r, func() bool { return r.Status().ReloadsOK >= 1 })
 	if commits != 1 {
 		t.Errorf("commit hook ran %d times, want 1", commits)
 	}
@@ -730,7 +764,7 @@ func TestReloader_ExtraWatchFolderReloads(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(extra, "scratch"), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(150 * time.Millisecond)
+	<-r.attempts
 	if got := r.Status().ReloadsOK; got != 0 {
 		t.Fatalf("an unchanged fingerprint reloaded %d times", got)
 	}
@@ -739,7 +773,7 @@ func TestReloader_ExtraWatchFolderReloads(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(extra, "mask.py"), []byte("x"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, 2*time.Second, func() bool { return r.Status().ReloadsOK >= 1 }, "a folder change to reload")
+	waitFor(t, r, func() bool { return r.Status().ReloadsOK >= 1 })
 }
 
 // A folder named by a config that a reload accepted is watched from then on: an
@@ -755,39 +789,79 @@ func TestReloader_WatchesAFolderAReloadAdds(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(late, "guard.py"), []byte("v1"), 0o700); err != nil {
 		t.Fatal(err)
 	}
+	// The folders are watched before the reload reports success, so an edit made as
+	// soon as it does lands in a watched folder: each call for the late slot finds
+	// only the reloads before it counted.
+	var rel atomic.Pointer[Reloader]
+	var lateCalls atomic.Int64
+	var watchedAfterSuccess atomic.Bool
 	dirs := func(c *config.Config) []string {
 		if c != nil && len(c.Pipeline.Outbound.Plugins) > 0 {
-			// Slow, so an edit made as soon as the reload reports success would
-			// land before the folder is watched if success came first.
-			time.Sleep(100 * time.Millisecond)
+			if rel.Load().Status().ReloadsOK != lateCalls.Add(1)-1 {
+				watchedAfterSuccess.Store(true)
+			}
 			return []string{early, late}
 		}
 		return []string{early}
 	}
 	// Each folder's fingerprint is the content of the file in it, as the script
-	// plugin's is.
+	// plugin's is, past the v1 that is there from the start. The fingerprint is
+	// then the same before and after the reload that adds the late folder, so
+	// the rest of that reload's event burst finds nothing new.
 	fingerprint := func(ds []string) string {
 		var s string
 		for _, d := range ds {
-			b, _ := os.ReadFile(filepath.Join(d, "guard.py"))
-			s += d + "=" + string(b) + ";"
+			if b, _ := os.ReadFile(filepath.Join(d, "guard.py")); string(b) != "v1" {
+				s += d + "=" + string(b) + ";"
+			}
 		}
 		return s
 	}
-	r, b, cfgPath, _, _ := setupWith(t, WithExtraWatch(dirs, fingerprint))
+	// The config folder by its resolved path: a temp dir under a symlink (macOS's
+	// /var) is watched under both names, and fsnotify's kqueue backend can then
+	// lose events in a folder watched later.
+	cfgDir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, b, cfgPath, _, _ := setupIn(t, cfgDir, WithExtraWatch(dirs, fingerprint))
+	rel.Store(r)
 
 	// The config edit that adds the slot: a reload the builder accepts. mode stays,
-	// since a mode change is refused.
+	// since a mode change is refused. It is renamed in from an unwatched folder, so
+	// no temporary file comes and goes in a watched one.
 	b.set(builderResult{inbound: emptyPipeline(t), outbound: emptyPipeline(t), cfg: withLateSlot()})
-	writeConfig(t, cfgPath, "mode: envoy-sidecar\n# with the late slot\n")
-	waitFor(t, 2*time.Second, func() bool { return r.Status().ReloadsOK == 1 }, "the config edit to reload")
+	next := filepath.Join(root, "config.yaml")
+	if err := os.WriteFile(next, []byte("mode: envoy-sidecar\n# with the late slot\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(next, cfgPath); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, r, func() bool { return r.Status().ReloadsOK >= 1 })
+	if n := r.Status().ReloadsOK; n != 1 {
+		t.Fatalf("the config edit reloaded %d times, want 1", n)
+	}
+	before := r.Status().ActiveConfigSHA256
 
-	// An edit in the folder that reload added.
+	// An edit in the folder that reload added. A write can land in two events, so
+	// the wait is for the hash of the finished edit.
 	b.set(builderResult{inbound: emptyPipeline(t), outbound: emptyPipeline(t), cfg: withLateSlot()})
 	if err := os.WriteFile(filepath.Join(late, "guard.py"), []byte("v2"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, 2*time.Second, func() bool { return r.Status().ReloadsOK == 2 }, "an edit in the added folder to reload")
+	data, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := r.hash(data)
+	if want == before {
+		t.Fatal("the late folder's edit leaves the config hash unchanged: the folder is not watched")
+	}
+	waitFor(t, r, func() bool { return r.Status().ActiveConfigSHA256 == want })
+	if watchedAfterSuccess.Load() {
+		t.Error("a reload reported success before it watched the folders its config names")
+	}
 }
 
 // A folder watched from startup counts in the startup hash: an event that changes
@@ -817,7 +891,7 @@ func TestReloader_StartupHashCoversTheWatchedFolders(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(extra, "scratch"), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(150 * time.Millisecond)
+	<-r.attempts
 	if got := r.Status().ReloadsOK; got != 0 {
 		t.Fatalf("an event that changed nothing reloaded %d times", got)
 	}
@@ -838,8 +912,7 @@ func TestReloader_ARefusedReloadWatchesNothingNew(t *testing.T) {
 	r, b, cfgPath, _, _ := setupWith(t, WithExtraWatch(dirs, func([]string) string { return "" }))
 	b.set(builderResult{err: errBuildRefused, cfg: withLateSlot()})
 	writeConfig(t, cfgPath, "mode: envoy-sidecar\n# with the late slot\n")
-	waitFor(t, 2*time.Second, func() bool { return r.Status().ReloadsFailed >= 1 }, "the refused reload to run")
-	time.Sleep(50 * time.Millisecond)
+	waitFor(t, r, func() bool { return r.Status().ReloadsFailed >= 1 })
 	if asked.Load() != 0 {
 		t.Fatal("a refused reload asked for the new config's folders")
 	}
@@ -887,14 +960,13 @@ func TestReloader_AnEditDuringStartIsReloaded(t *testing.T) {
 	b := &fakeBuilder{}
 	b.set(builderResult{inbound: emptyPipeline(t), outbound: emptyPipeline(t), cfg: initialCfg})
 	r := New(cfgPath, pipeline.NewHolder(emptyPipeline(t)), pipeline.NewHolder(emptyPipeline(t)), b.build, initialCfg,
-		WithDebounce(20*time.Millisecond), WithDrainWindow(0), WithStartTimeout(5*time.Second),
+		WithDebounce(0), WithDrainWindow(0),
 		WithExtraWatch(dirs, func([]string) string { return "" }))
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	if err := r.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
+	start(t, r)
+	waitFor(t, r, func() bool { return r.Status().ReloadsOK >= 1 })
+	if n := r.Status().ReloadsOK; n != 1 {
+		t.Errorf("the edit made during Start reloaded %d times, want 1", n)
 	}
-	waitFor(t, 2*time.Second, func() bool { return r.Status().ReloadsOK == 1 }, "the edit made during Start to reload")
 }
 
 // tls_bridge.* and spiffe.* are built once at boot — the bridge engine in each
@@ -966,5 +1038,325 @@ func TestValidateReloadable_RefusesMemoryEdit(t *testing.T) {
 	next = &config.Config{Memory: &config.MemoryConfig{LimitMB: 1024}}
 	if err := validateReloadable(active, next); err != nil {
 		t.Errorf("unchanged memory block was refused: %v", err)
+	}
+}
+
+// update.check_every is read once at boot. update.auto and update.wait reload.
+func TestValidateReloadable_UpdateCheckEveryNeedsRestart(t *testing.T) {
+	off := false
+	active := &config.Config{}
+	next := &config.Config{Update: &config.UpdateConfig{CheckEvery: "12h"}}
+	if err := validateReloadable(active, next); err == nil || !strings.Contains(err.Error(), "update.check_every") {
+		t.Fatalf("adding check_every: %v, want an update.check_every refusal", err)
+	}
+	next = &config.Config{Update: &config.UpdateConfig{Auto: &off, Wait: "1h"}}
+	if err := validateReloadable(active, next); err != nil {
+		t.Errorf("auto and wait edits were refused: %v", err)
+	}
+}
+
+// stats.* is boot-only: the stats listener binds stats.address once at startup.
+// Before the guard, a stats.address edit incremented ReloadsOK and /config served
+// the new address, while the listener stayed on the old one. agentop reads the
+// address from the file, so it then probed a port where nothing listened.
+// A real config.Load builder proves the yaml key reaches the comparison.
+func TestReloader_RefusesStatsAddressChange(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(cfgPath, []byte("mode: envoy-sidecar\nstats:\n  address: 127.0.0.1:19093\n"), 0o600); err != nil {
+		t.Fatalf("initial WriteFile: %v", err)
+	}
+	initialCfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	newIn, newOut := emptyPipeline(t), emptyPipeline(t)
+	build := func() (*pipeline.Pipeline, *pipeline.Pipeline, *config.Config, error) {
+		c, lerr := config.Load(cfgPath)
+		if lerr != nil {
+			return nil, nil, nil, lerr
+		}
+		return newIn, newOut, c, nil
+	}
+	inH := pipeline.NewHolder(emptyPipeline(t))
+	outH := pipeline.NewHolder(emptyPipeline(t))
+	r := New(cfgPath, inH, outH, build, initialCfg,
+		WithDebounce(0), WithDrainWindow(0))
+	start(t, r)
+
+	writeConfig(t, cfgPath, "mode: envoy-sidecar\nstats:\n  address: 127.0.0.1:19094\n")
+
+	waitFor(t, r, func() bool {
+		st := r.Status()
+		return st.ReloadsFailed >= 1 || st.ReloadsOK >= 1
+	})
+	st := r.Status()
+	if st.ReloadsOK != 0 || !contains(st.LastError, "stats.*") {
+		t.Errorf("a stats.address edit must be refused with stats.* in the error; ReloadsOK=%d LastError=%q",
+			st.ReloadsOK, st.LastError)
+	}
+	if got := r.ConfigProvider()().Stats.StatsAddress; got != "127.0.0.1:19093" {
+		t.Errorf("/config serves stats.address %q; the listener is still on 127.0.0.1:19093", got)
+	}
+}
+
+// shutdownPlugin records how many requests held its pipeline when it was stopped
+// and whether its ctx was already done, and with block set, stays in Shutdown
+// until block is closed.
+type shutdownPlugin struct {
+	p       *pipeline.Pipeline
+	held    int64
+	ctxErr  error
+	stopped chan struct{}
+	block   chan struct{}
+}
+
+func (*shutdownPlugin) Name() string { return "shutdown" }
+func (*shutdownPlugin) Capabilities() pipeline.PluginCapabilities {
+	return pipeline.PluginCapabilities{}
+}
+func (*shutdownPlugin) OnRequest(context.Context, *pipeline.Context) pipeline.Action {
+	return pipeline.Action{Type: pipeline.Continue}
+}
+func (*shutdownPlugin) OnResponse(context.Context, *pipeline.Context) pipeline.Action {
+	return pipeline.Action{Type: pipeline.Continue}
+}
+func (s *shutdownPlugin) Shutdown(ctx context.Context) error {
+	s.held, s.ctxErr = s.p.Held(), ctx.Err()
+	close(s.stopped)
+	if s.block != nil {
+		<-s.block
+	}
+	return nil
+}
+
+// storeShutdownPipeline Stores a pipeline of one shutdownPlugin in h.
+func storeShutdownPipeline(t *testing.T, h *pipeline.Holder, block chan struct{}) *shutdownPlugin {
+	t.Helper()
+	sp := &shutdownPlugin{stopped: make(chan struct{}), block: block}
+	p, err := pipeline.New([]pipeline.Plugin{sp})
+	if err != nil {
+		t.Fatalf("pipeline.New: %v", err)
+	}
+	sp.p = p
+	h.Store(p)
+	return sp
+}
+
+// drainLog passes on the reloader's closing record for the old pipelines of the
+// reload whose config hashes to sha, ignoring other reloads still draining.
+type drainLog struct {
+	sha     string
+	records chan slog.Record
+}
+
+func (drainLog) Enabled(context.Context, slog.Level) bool { return true }
+func (d drainLog) Handle(_ context.Context, r slog.Record) error {
+	ours := false
+	r.Attrs(func(a slog.Attr) bool {
+		ours = ours || (a.Key == "sha256" && a.Value.String() == d.sha)
+		return true
+	})
+	if ours && strings.Contains(r.Message, "old pipelines") {
+		d.records <- r.Clone()
+	}
+	return nil
+}
+func (d drainLog) WithAttrs([]slog.Attr) slog.Handler { return d }
+func (d drainLog) WithGroup(string) slog.Handler      { return d }
+
+// Each old pipeline is stopped once its own last request finishes, and the drain
+// window stops it anyway under a request that outlasts it, warning how many it cut off.
+func TestReloader_StopsAnOldPipelineWhenNoRequestHoldsIt(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		window   time.Duration
+		finish   bool
+		wantHeld int64
+		wantLog  string
+	}{
+		{name: "the request's finish releases it", window: time.Hour, finish: true, wantHeld: 0,
+			wantLog: "reloader: drained old pipelines"},
+		{name: "the window stops it under an open request", window: 0, wantHeld: 1,
+			wantLog: "reloader: stopped old pipelines with requests still on them"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			content := "mode: envoy-sidecar\n# " + tc.name + "\n"
+			sum := sha256.Sum256([]byte(content))
+			logs := drainLog{sha: hex.EncodeToString(sum[:])[:12], records: make(chan slog.Record, 1)}
+			prev := slog.Default()
+			slog.SetDefault(slog.New(logs))
+			t.Cleanup(func() { slog.SetDefault(prev) })
+
+			committed := make(chan struct{}, 1)
+			_, b, cfgPath, inH, outH := setupWith(t, WithDrainWindow(tc.window),
+				WithOnCommit(func(*config.Config) { committed <- struct{}{} }))
+			idle, busy := storeShutdownPipeline(t, inH, nil), storeShutdownPipeline(t, outH, nil)
+
+			pctx := &pipeline.Context{Direction: pipeline.Outbound}
+			outH.Run(context.Background(), pctx)
+
+			b.set(builderResult{inbound: emptyPipeline(t), outbound: emptyPipeline(t), cfg: &config.Config{Mode: "envoy-sidecar"}})
+			writeConfig(t, cfgPath, content)
+			<-committed
+			// The idle inbound pipeline stops while the outbound one is still held.
+			<-idle.stopped
+			if tc.finish {
+				outH.RunFinish(context.Background(), pctx, pipeline.Outcome{})
+				// Checked before the wait below, so a hold RunFinish keeps fails here
+				// rather than leaving the reloader nothing to stop on.
+				select {
+				case <-busy.p.Drained():
+				default:
+					t.Fatalf("the old pipeline is still held %d times after the request finished", busy.p.Held())
+				}
+			}
+			<-busy.stopped
+			if busy.held != tc.wantHeld {
+				t.Errorf("stopped with %d requests holding it, want %d", busy.held, tc.wantHeld)
+			}
+			rec := <-logs.records
+			requests := int64(0)
+			rec.Attrs(func(a slog.Attr) bool {
+				if a.Key == "requests" {
+					requests = a.Value.Int64()
+				}
+				return true
+			})
+			if rec.Message != tc.wantLog || requests != tc.wantHeld {
+				t.Errorf("logged %q with requests=%d, want %q with requests=%d",
+					rec.Message, requests, tc.wantLog, tc.wantHeld)
+			}
+		})
+	}
+}
+
+// Close stops the live pipelines and an old one still draining under an open
+// request, each once, before it returns.
+func TestReloader_CloseStopsLiveAndDrainingPipelines(t *testing.T) {
+	committed := make(chan struct{}, 1)
+	r, b, cfgPath, _, outH := setupWith(t, WithDrainWindow(time.Hour),
+		WithOnCommit(func(*config.Config) { committed <- struct{}{} }))
+	draining := storeShutdownPipeline(t, outH, nil)
+	outH.Run(context.Background(), &pipeline.Context{Direction: pipeline.Outbound})
+
+	liveIn, liveOut := pipeline.NewHolder(emptyPipeline(t)), pipeline.NewHolder(emptyPipeline(t))
+	in, out := storeShutdownPipeline(t, liveIn, nil), storeShutdownPipeline(t, liveOut, nil)
+	b.set(builderResult{inbound: liveIn.Load(), outbound: liveOut.Load(), cfg: &config.Config{Mode: "envoy-sidecar"}})
+	writeConfig(t, cfgPath, "mode: envoy-sidecar\n# reloaded\n")
+	<-committed
+
+	// A second Stop of any of them would panic closing its stopped channel.
+	r.Close(context.Background())
+	for name, sp := range map[string]*shutdownPlugin{"inbound": in, "outbound": out, "draining": draining} {
+		select {
+		case <-sp.stopped:
+		default:
+			t.Errorf("the %s pipeline was not stopped by Close", name)
+		}
+	}
+	if draining.held != 1 {
+		t.Errorf("the draining pipeline stopped with %d requests holding it, want 1", draining.held)
+	}
+}
+
+// Close returns by its ctx even while a live pipeline's plugin is still shutting
+// down, and that plugin does not keep the other live pipeline from stopping.
+func TestReloader_CloseDoesNotOutwaitItsContext(t *testing.T) {
+	r, _, _, inH, outH := setup(t)
+	block := make(chan struct{})
+	t.Cleanup(func() { close(block) })
+	storeShutdownPipeline(t, outH, block)
+	in := storeShutdownPipeline(t, inH, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r.Close(ctx)
+	<-in.stopped
+}
+
+// Close stops the live pipelines without waiting for a reload still building, and
+// that reload stops its own pipelines instead of committing them.
+func TestReloader_CloseDuringABuildStopsLiveAndBuiltPipelines(t *testing.T) {
+	r, b, cfgPath, inH, outH := setupWith(t, fireOnce) // one build, which the gate holds
+	live := storeShutdownPipeline(t, outH, nil)
+	g := &buildGate{entered: make(chan struct{}), release: make(chan struct{})}
+	b.gate.Store(g)
+	builtIn := storeShutdownPipeline(t, pipeline.NewHolder(emptyPipeline(t)), nil)
+	builtOut := storeShutdownPipeline(t, pipeline.NewHolder(emptyPipeline(t)), nil)
+	b.set(builderResult{inbound: builtIn.p, outbound: builtOut.p, cfg: &config.Config{Mode: "envoy-sidecar"}})
+	writeConfig(t, cfgPath, "mode: envoy-sidecar\n# building\n")
+	<-g.entered
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r.Close(ctx)
+	<-live.stopped // while the build is still blocked
+
+	close(g.release)
+	<-builtIn.stopped
+	<-builtOut.stopped
+	if inH.Load() == builtIn.p || outH.Load() == builtOut.p {
+		t.Error("a reload committed its pipelines after Close began")
+	}
+}
+
+// Once Close has begun, an old pipeline is stopped on Close's ctx, even when its
+// drain is what woke it.
+func TestReloader_StopsOnTheCloseContextOnceClosing(t *testing.T) {
+	r, _, _, _, _ := setup(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r.Close(ctx)
+	// Repeated because select picks among the ready drain and close cases at random.
+	for range 20 {
+		sp := storeShutdownPipeline(t, pipeline.NewHolder(emptyPipeline(t)), nil)
+		r.stopWhenUnheld(sp.p, time.Now().Add(time.Hour))
+		if sp.ctxErr == nil {
+			t.Fatal("stopped on a fresh budget after Close began")
+		}
+	}
+}
+
+// Without WithDrainWindow, an old pipeline waits up to 10 minutes for its requests.
+func TestNew_DrainWindowDefaultsToTenMinutes(t *testing.T) {
+	r := New("config.yaml", pipeline.NewHolder(emptyPipeline(t)), pipeline.NewHolder(emptyPipeline(t)),
+		(&fakeBuilder{}).build, &config.Config{Mode: "envoy-sidecar"})
+	if r.drainWindow != 10*time.Minute {
+		t.Errorf("drainWindow = %v, want 10m", r.drainWindow)
+	}
+}
+
+func TestValidateReloadable_PraxisNeedsRestart(t *testing.T) {
+	active := &config.Config{}
+	next := &config.Config{Praxis: &config.PraxisConfig{Enabled: true}}
+	if err := validateReloadable(active, next); err == nil || !strings.Contains(err.Error(), "praxis.*") {
+		t.Fatalf("validateReloadable = %v, want an error naming praxis.*", err)
+	}
+	active = &config.Config{Praxis: &config.PraxisConfig{Enabled: true}}
+	if err := validateReloadable(active, next); err != nil {
+		t.Errorf("unchanged praxis block was refused: %v", err)
+	}
+}
+
+func TestValidateReloadable_PraxisPolicyPathNeedsRestart(t *testing.T) {
+	praxis := func(path string) *config.Config {
+		p := &config.PraxisConfig{Enabled: true}
+		if path != "" {
+			p.Policy = &config.PraxisPolicyConfig{ConfigPath: path}
+		}
+		return &config.Config{Praxis: p}
+	}
+	for _, tc := range []struct{ name, from, to string }{
+		{"add", "", "/a.yaml"},
+		{"change", "/a.yaml", "/b.yaml"},
+		{"remove", "/a.yaml", ""},
+	} {
+		if err := validateReloadable(praxis(tc.from), praxis(tc.to)); err == nil || !strings.Contains(err.Error(), "praxis.*") {
+			t.Errorf("%s: validateReloadable = %v, want an error naming praxis.*", tc.name, err)
+		}
+	}
+	if err := validateReloadable(praxis("/a.yaml"), praxis("/a.yaml")); err != nil {
+		t.Errorf("unchanged policy was refused: %v", err)
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/rossoctl/cortex/cmd/agentop/checklist"
+	"github.com/rossoctl/cortex/cmd/agentop/updatestatus"
 	"github.com/rossoctl/cortex/core/config"
 )
 
@@ -24,16 +25,17 @@ import (
 // service plan reads it as not started, and its fix would put a service in place
 // of the mode the user chose.
 func backgroundOnly(env *setupEnv) bool {
-	sp, err := resolveServicePaths(env.configPath(), "", filepath.Join(env.binDir, "cortex"))
+	sp, err := resolveServicePaths(env.configPath(), "", filepath.Join(env.binDir, proxyBinary))
 	if err != nil || serviceInstalled(sp) {
 		return false
 	}
-	return fileExists(filepath.Join(env.cortexDir, "proxy.pid"))
+	return fileExists(filepath.Join(env.cortexDir, proxyPIDFile))
 }
 
 // doctorRefine adds those checks to a step's done plan: a failed one makes the
 // plan a problem, and a doubtful one gives it advice, unless it has its own. A
-// plan with changes or a problem is left as it is, as setup is its fix either way;
+// plan with changes or a problem is left as it is, as setup is its fix either way,
+// except a change that carries advice, which is still checked;
 // but the PATH lines setup would add get a second fix, the line to add by hand,
 // for whoever set up with --no-modify-path to keep setup out of their dotfiles.
 func doctorRefine(env *setupEnv, s step, p stepPlan, prob *problem, fix string) (stepPlan, *problem) {
@@ -41,7 +43,7 @@ func doctorRefine(env *setupEnv, s step, p stepPlan, prob *problem, fix string) 
 		return p, &problem{reason: wouldChange(p), fix: []string{fix,
 			"or add it yourself, in " + env.tilde(env.pathProfile) + ":  " + exportLine(env.binDir)}}
 	}
-	if prob != nil || !p.done || p.hidden {
+	if prob != nil || (!p.done && p.advice == nil) || p.hidden {
 		return p, prob
 	}
 	var bad, doubt *problem
@@ -71,7 +73,7 @@ func doctorRefine(env *setupEnv, s step, p stepPlan, prob *problem, fix string) 
 // checkBinaries asks agentop and cortex for their versions, which must agree, as
 // one install puts both there; and which agentop this shell runs.
 func checkBinaries(env *setupEnv) (bad, doubt *problem) {
-	cortex := filepath.Join(env.binDir, "cortex")
+	cortex := filepath.Join(env.binDir, proxyBinary)
 	a, c := env.installedVersion, installedVersion(cortex)
 	switch {
 	case a == "":
@@ -82,13 +84,7 @@ func checkBinaries(env *setupEnv) (bad, doubt *problem) {
 		bad = &problem{reason: "agentop is " + a + ", cortex is " + c}
 	}
 	if bad != nil {
-		// The plain one-liner installs the default build, so it would take a
-		// cpex install off cpex.
-		fix := installerOneLiner
-		if installedIsCpex(cortex) {
-			fix += " -s -- --cpex"
-		}
-		bad.fix = []string{fix}
+		bad.fix = []string{installerOneLiner}
 		return bad, nil
 	}
 	// Found nowhere is the PATH step's to report.
@@ -202,4 +198,51 @@ func checkPython(env *setupEnv, ui *checklist.UI) {
 		return
 	}
 	ui.Advise("python3", "cortex-session-dump needs python3, which is not on PATH")
+}
+
+// checkUpdates draws the row for automatic updates from ~/.cortex/update.json.
+// Only a failed install is a failure.
+func checkUpdates(env *setupEnv, ui *checklist.UI) (failed bool) {
+	const label, fix = "updates", "see ~/.cortex/update.log"
+	// Check the times first: the proxy refuses a bad value also when auto is off.
+	u, err := readUpdateConfig(env.configPath())
+	if err == nil {
+		_, _, err = u.Times()
+	}
+	if err != nil {
+		ui.Advise(label, err.Error(), "edit "+env.tilde(env.configPath()))
+		return false
+	}
+	if autoUpdateOff(env.configPath()) {
+		ui.Already(label, "automatic updates off (update.auto: false)")
+		return false
+	}
+	if sp, err := resolveServicePaths(env.configPath(), "", filepath.Join(env.binDir, proxyBinary)); err != nil || !serviceInstalled(sp) {
+		ui.Already(label, "not automatic without the service; agentop update installs a release")
+		return false
+	}
+	at := func(t time.Time) string { return t.Local().Format("2006-01-02 15:04") }
+	st, err := updatestatus.Read(filepath.Join(env.cortexDir, updatestatus.FileName))
+	switch {
+	case err != nil:
+		ui.Advise(label, "no update check yet", fix)
+	case st.Result == updatestatus.ResultNotARelease:
+		ui.Already(label, "not automatic for a build that is not a release or release candidate; agentop update installs the newest release")
+	case st.Result == updatestatus.ResultFailed:
+		ui.Fail(label, "update to "+st.Latest+" failed at "+at(st.CheckedAt), strings.Split(st.Error, "\n")...)
+		ui.Remedy("fix: ", fix)
+		return true
+	case doctorNow().Sub(st.CheckedAt) > 72*time.Hour:
+		ui.Advise(label, "no update check since "+at(st.CheckedAt), fix)
+	case st.Result == updatestatus.ResultCheckFailed:
+		first, _, _ := strings.Cut(st.Error, "\n")
+		ui.Advise(label, "the last check failed at "+at(st.CheckedAt)+": "+first, fix)
+	default:
+		detail := "auto on · " + st.Result + " at " + at(st.CheckedAt)
+		if st.Result == updatestatus.ResultWaiting {
+			detail += " · installs " + st.Latest + " after " + at(st.InstallAfter)
+		}
+		ui.Already(label, detail)
+	}
+	return false
 }

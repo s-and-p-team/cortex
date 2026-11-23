@@ -1,9 +1,9 @@
-# AuthBridge Binaries
+# Cortex binaries
 
-Three authbridge binaries (proxy, envoy, praxis) plus the
-`agentop` TUI — see the table below for which are published and which are paused.
+Two sidecar binaries, `cortex` and `cortex-envoy`, plus the `agentop` TUI.
+The table below shows which are published.
 Proxy and envoy each pin one deployment shape and refuse a mismatching
-`mode:` at boot; praxis pins none. Mode is selected at
+`mode:` at boot. Mode is selected at
 build time by which binary you run, not at runtime via a flag. The `authbridge-lite`
 and `authbridge-cpex` images are build variants of the proxy binary, not
 separate binaries: `lite` is the proxy Dockerfile with the `lite` profile's
@@ -18,7 +18,6 @@ tags, `cpex` is `cortex` built with cgo and the `cpex` tag (see
 | [`cortex-envoy/`](cortex-envoy/) | `envoy-sidecar` | gRPC ext_proc on `:9090` (hooked into Envoy) | full | `ghcr.io/rossoctl/cortex/authbridge-envoy` |
 | `authbridge-lite` _(build variant of `cortex`)_ | `proxy-sidecar` | HTTP forward + reverse proxies | lite — `cortex` built with the `lite` profile, a sidecar minimum (see [`../scripts/profile-tags`](../scripts/profile-tags)) | `ghcr.io/rossoctl/cortex/authbridge-lite` |
 | `authbridge-cpex` _(build variant of `cortex`; [`cortex-cpex/`](cortex-cpex/) holds its Dockerfile and FFI pins)_ | `proxy-sidecar` | HTTP forward + reverse proxies | the `cpex` profile: sidecar plugins + `cpex` (needs cgo; links `libcpex_ffi.a` from the CPEX release pinned in `CPEX_FFI_VERSION`) | `ghcr.io/rossoctl/cortex/authbridge-cpex` |
-| [`cortex-praxis/`](cortex-praxis/) | `proxy-sidecar` _(output shape; pins no input mode)_ | HTTP, from a rendered Praxis config | **none** — does not import `core/plugins/all`. **Paused, not abandoned:** kept and kept compiling (it is in the `ci.yaml` matrix for that reason). Do not delete. | not published |
 | [`agentop/`](agentop/) | n/a | n/a | n/a | not published as an image; released as a standalone binary by `release-binaries.yaml` |
 
 Each sidecar binary directory contains `main.go`, `go.mod`/`go.sum`,
@@ -38,9 +37,11 @@ at the YAML config file the operator mounts at
 `/etc/authbridge/config.yaml`. The config schema and per-plugin
 options are documented in
 [`../docs/plugin-reference.md`](../docs/plugin-reference.md).
-Hot-reload, the session-events API at `:9094`, and the supporting
-ConfigMap contracts are documented in
-[`../CLAUDE.md`](../CLAUDE.md).
+The session-events API at `:9094` is documented in
+[`../docs/session-api.md`](../docs/session-api.md), hot-reload in
+[`../docs/framework-architecture.md`](../docs/framework-architecture.md#9-config-hot-reload), and the supporting
+ConfigMap contracts in
+[`cortex-demos/CLAUDE.md`](https://github.com/rossoctl/cortex-demos/blob/main/CLAUDE.md#configmaps-and-secrets-expected-at-runtime).
 
 ## Ports
 
@@ -133,12 +134,9 @@ downloads and verifies the library pinned in `cortex-cpex/`.
   with the `cpex` profile against the musl library, and installs it as
   `/usr/local/bin/cortex-cpex` so the entrypoint and container args are
   unchanged.
-- **Laptop** — `make cortex-cpex` builds `cmd/cortex` with the `fullcpex`
-  profile (`full` plus `cpex`) for the host (linux amd64/arm64, darwin arm64)
-  to `bin/cortex-cpex/cortex`. It needs a C toolchain (Xcode Command Line
-  Tools on macOS) and `cosign`. The binary is still called `cortex` and runs
-  `--local` like the default build; `cortex --version` prints
-  `cortex (cpex) <version>`.
+
+The laptop build (`make cortex-cpex`) is removed. The image is the only cpex
+build left, so Kubernetes use is unchanged.
 
 The image used to run its own `main.go`, a reduced copy of `cortex`'s. With
 the same config, the `cortex` build differs from it in these ways:

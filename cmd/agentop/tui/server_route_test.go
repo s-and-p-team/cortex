@@ -7,7 +7,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -155,13 +154,11 @@ func serverModel(t *testing.T, f *fakeProxy) *model {
 // onRow puts the AGENTS cursor on the row labelled label, All agents being "".
 func onRow(t *testing.T, m *model, label string) {
 	t.Helper()
-	for i, l := range m.agentRowLabels {
-		if l == label {
-			m.agentsTbl.SetCursor(i)
-			return
-		}
+	if i := agentRowIndex(m, label); i >= 0 {
+		m.agentsTbl.SetCursor(i)
+		return
 	}
-	t.Fatalf("no AGENTS row %q in %q", label, m.agentRowLabels)
+	t.Fatalf("no AGENTS row %q in %+v", label, m.agentRowDescs)
 }
 
 // agentsCell is the cell under the column titled title in the AGENTS row labelled label, and
@@ -177,17 +174,15 @@ func agentsCell(t *testing.T, m *model, label, title string) (string, bool) {
 	if col < 0 {
 		return "", false
 	}
-	for i, l := range m.agentRowLabels {
-		if l == label {
-			return m.agentsTbl.Rows()[i][col], true
-		}
+	if i := agentRowIndex(m, label); i >= 0 {
+		return m.agentsTbl.Rows()[i][col], true
 	}
-	t.Fatalf("no AGENTS row %q", label)
+	t.Fatalf("no AGENTS row %q in %+v", label, m.agentRowDescs)
 	return "", false
 }
 
 // The column is there only while the proxy runs the router, and says each agent's server — or
-// own choice — with nothing on All agents.
+// "by key" — with nothing on All agents.
 func TestAgentsPane_ServerColumnFollowsTheRouter(t *testing.T) {
 	m := serverModel(t, newFakeProxy(t, false))
 	for label, want := range map[string]string{"": "", "claude-code/2.1.270": "ete", "opencode/1.0.3": agentOwnChoice} {
@@ -202,7 +197,7 @@ func TestAgentsPane_ServerColumnFollowsTheRouter(t *testing.T) {
 	}
 }
 
-// The SERVER cells carry no ANSI: the table truncates an escape as text. "own choice" is the
+// The SERVER cells carry no ANSI: the table truncates an escape as text. "by key" is the
 // dimming, in words.
 func TestServerCells_CarryNoANSI(t *testing.T) {
 	restore := lipgloss.ColorProfile()
@@ -401,11 +396,11 @@ func TestPipelineLoaded_RepaintsTheAgentsOnlyWhenTheRouterChanged(t *testing.T) 
 	// Rows that are not drawn yet: they appear only when something repaints.
 	m.agents = append(m.agents, agentRow{label: "bob-shell/1.0", Counts: usage.Counts{Requests: 2}})
 	m.Update(pipelineLoadedMsg(routerPipeline(routerRaw)))
-	if slices.Contains(m.agentRowLabels, "bob-shell/1.0") {
+	if agentRowIndex(m, "bob-shell/1.0") >= 0 {
 		t.Error("an unchanged router repainted the agents table")
 	}
 	m.Update(pipelineLoadedMsg(routerPipeline(strings.Replace(routerRaw, `"claude-code":"ete"`, `"claude-code":"glm"`, 1))))
-	if !slices.Contains(m.agentRowLabels, "bob-shell/1.0") {
+	if agentRowIndex(m, "bob-shell/1.0") < 0 {
 		t.Error("a changed route did not repaint the agents table")
 	}
 	if got, _ := agentsCell(t, m, "claude-code/2.1.270", "SERVER"); got != "glm" {
@@ -419,7 +414,7 @@ func TestPipelineLoaded_RepaintsTheAgentsOnlyWhenTheRouterChanged(t *testing.T) 
 
 // A SERVER cell names a server only where one can be chosen. Other pools many agents, and the
 // no-User-Agent row is one the router refuses to route, so both show nothing rather than an
-// "own choice" S would then refuse. A server name is sanitised like every other served label.
+// "by key" S would then refuse. A server name is sanitised like every other served label.
 func TestAgentServerCell_NamesNoServerWhereNoneCanBeChosen(t *testing.T) {
 	router := routerconfig.Config{Agents: map[string]string{"claude-code": "ete", "opencode": "\x1b[31mglm"}}
 	for label, want := range map[string]string{
@@ -484,5 +479,17 @@ func TestAgentsPane_TheAgentsNameSurvivesTheServerColumnAt80(t *testing.T) {
 	}
 	if view := m.View(); !strings.Contains(view, "claude-code/2.1") {
 		t.Errorf("the row does not show the agent's name:\n%s", view)
+	}
+}
+
+func TestSameRouter_SeesAHeadersChange(t *testing.T) {
+	cfg := func(ua string) routerconfig.Config {
+		return routerconfig.Config{Servers: map[string]routerconfig.Server{"bob": {URL: "https://bob.example.com", Headers: map[string]string{"User-Agent": ua}}}}
+	}
+	if !sameRouter(cfg("bob-shell"), cfg("bob-shell")) {
+		t.Error("sameRouter = false for equal configs")
+	}
+	if sameRouter(cfg("bob-shell"), cfg("other")) {
+		t.Error("sameRouter = true for configs with different headers")
 	}
 }

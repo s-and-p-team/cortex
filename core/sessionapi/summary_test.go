@@ -59,8 +59,14 @@ func fullEvent() pipeline.SessionEvent {
 			PresentKinds:     9,
 			FinishReason:     "stop",
 			// Set only when a plugin changed the model; differs from Model on purpose.
-			RequestedModel: "claude-opus-5-5",
-			ServedModel:    "bedrock/us.anthropic.claude-opus-5-5",
+			RequestedModel:   "claude-opus-5-5",
+			ServedModel:      "bedrock/us.anthropic.claude-opus-5-5",
+			ThinkingType:     "adaptive",
+			ThinkingDisplay:  "summarized",
+			Effort:           "high",
+			AnthropicBeta:    "interleaved-thinking-2025-05-14",
+			HistoryThinking:  &pipeline.InferenceThinking{Blocks: 3, SignatureBytes: 2944},
+			ResponseThinking: &pipeline.InferenceThinking{Blocks: 1, TextBytes: 7, SignatureBytes: 1300},
 		},
 		A2A: &pipeline.A2AExtension{
 			Method:       "message/send",
@@ -86,9 +92,16 @@ func fullEvent() pipeline.SessionEvent {
 		// Set only on a Claude Code subagent's requests; the parent only on a nested one's.
 		Subagent:       "a1a2e36cb5946f31c",
 		ParentSubagent: "a0974b0b8591dc76b",
-		Proc:           "100.5",
-		ClientProc:     "101.5",
-		SessionHeader:  "X-Claude-Code-Session-Id",
+		// Set only on a Bob child task's rows.
+		SubagentKind:  "subtask",
+		Proc:          "100.5",
+		ClientProc:    "101.5",
+		SessionHeader: "X-Claude-Code-Session-Id",
+		Project:       "~/src/app",
+		ParentSession: "s-parent",
+		ParentProject: "~/src/parent",
+		Source:        "imported:claude-code",
+		NoRecord:      true,
 	}
 }
 
@@ -127,6 +140,12 @@ func TestSummarizeEvent_DropsPayloadsKeepsTimelineFields(t *testing.T) {
 	if got.Inference.ToolCount != len(full.Inference.Tools) {
 		t.Errorf("toolCount = %d, want %d", got.Inference.ToolCount, len(full.Inference.Tools))
 	}
+	// ToolCalls joins them: core/sessionexport exports a tool-call figure, and reading
+	// len(ToolCalls) alone reported absence for every row this projection delivers.
+	if got.Inference.ToolCallCount != len(full.Inference.ToolCalls) {
+		t.Errorf("toolCallCount = %d, want %d", got.Inference.ToolCallCount,
+			len(full.Inference.ToolCalls))
+	}
 	// agentRole needs no such rescue — it is a scalar the struct copy carries — but it is read by
 	// the same consumer for the same question, so a projection that lost it would break the
 	// CONTEXT gauge exactly as dropping the counts did.
@@ -142,6 +161,20 @@ func TestSummarizeEvent_DropsPayloadsKeepsTimelineFields(t *testing.T) {
 	if got.Inference.ServedModel != full.Inference.ServedModel {
 		t.Errorf("servedModel = %q, want %q — the detail pane's model: line reads it",
 			got.Inference.ServedModel, full.Inference.ServedModel)
+	}
+	// The thinking and effort fields are kept: a few short scalars, and the counts do not grow
+	// with the conversation the way the blocks would.
+	gi, fi := got.Inference, full.Inference
+	if gi.ThinkingType != fi.ThinkingType || gi.ThinkingDisplay != fi.ThinkingDisplay ||
+		gi.Effort != fi.Effort || gi.AnthropicBeta != fi.AnthropicBeta {
+		t.Errorf("thinking/effort/beta = %q/%q/%q/%q, want %q/%q/%q/%q",
+			gi.ThinkingType, gi.ThinkingDisplay, gi.Effort, gi.AnthropicBeta,
+			fi.ThinkingType, fi.ThinkingDisplay, fi.Effort, fi.AnthropicBeta)
+	}
+	if gi.HistoryThinking == nil || *gi.HistoryThinking != *fi.HistoryThinking ||
+		gi.ResponseThinking == nil || *gi.ResponseThinking != *fi.ResponseThinking {
+		t.Errorf("history/response thinking = %+v/%+v, want %+v/%+v",
+			gi.HistoryThinking, gi.ResponseThinking, fi.HistoryThinking, fi.ResponseThinking)
 	}
 	if got.A2A.Artifact != "" {
 		t.Error("A2A.Artifact survived")
@@ -187,10 +220,32 @@ func TestSummarizeEvent_DropsPayloadsKeepsTimelineFields(t *testing.T) {
 		t.Errorf("parentSubagent = %q, want %q — the tree of agents is built from it",
 			got.ParentSubagent, full.ParentSubagent)
 	}
+	// subagentKind is TIMELINE data: agentop labels a subtask block by it.
+	if got.SubagentKind != full.SubagentKind {
+		t.Errorf("subagentKind = %q, want %q — agentop labels a subtask block by it",
+			got.SubagentKind, full.SubagentKind)
+	}
 	// proc is kept: agentop merges a session's linked process rows into its timeline by it.
 	if got.Proc != full.Proc || got.ClientProc != full.ClientProc || got.SessionHeader != full.SessionHeader {
 		t.Errorf("proc %q sessionHeader %q, want %q %q — the linked-row fold reads them",
 			got.Proc, got.SessionHeader, full.Proc, full.SessionHeader)
+	}
+	// project is kept: a short scalar (capped at 256 runes) that labels the row.
+	if got.Project != full.Project {
+		t.Errorf("project = %q, want %q", got.Project, full.Project)
+	}
+	// source is kept: a short scalar that marks an imported row in the timeline.
+	if got.ParentSession != full.ParentSession || got.ParentProject != full.ParentProject {
+		t.Errorf("parent = %q %q, want %q %q", got.ParentSession, got.ParentProject,
+			full.ParentSession, full.ParentProject)
+	}
+	if got.Source != full.Source {
+		t.Errorf("source = %q, want %q", got.Source, full.Source)
+	}
+	// noRecord is kept for the same reason: a bool that marks a row of a session the archive
+	// withholds (#1923).
+	if got.NoRecord != full.NoRecord {
+		t.Errorf("noRecord = %v, want %v", got.NoRecord, full.NoRecord)
 	}
 	if got.Direction != full.Direction || got.Phase != full.Phase {
 		t.Error("direction/phase did not survive")
@@ -321,15 +376,16 @@ func TestSummarizeEvent_IsOrdersOfMagnitudeSmaller(t *testing.T) {
 // The half that was missed the first time, and silently: the events table has a
 // FILTER, and it searches fields the projection had been dropping. `plugin:foo`
 // matched nothing because it is a lookup into Plugins, and `/some completion text`
-// stopped matching because eventHaystack reads Inference.Completion and
-// A2A.Parts[].Content.
+// stopped matching because the filter read Inference.Completion and
+// A2A.Parts[].Content. agentop's details search reads them now, with detailHas on the
+// summary rows it holds.
 //
 // Worse than losing a feature, it was INCONSISTENT: SSE-streamed events are not
 // projected, so the same query matched newly arrived rows and missed everything a
 // snapshot had replaced.
 //
-// Each field below is named by agentop's eventHaystack / matchEventRow
-// (cmd/agentop/tui/events_pane.go). Keeping them costs 299x → 163x, which is 1.12 MiB
+// Each field below is read by agentop's detailHas on a summary row
+// (cmd/agentop/tui/search_details.go). Keeping them costs 299x → 163x, which is 1.12 MiB
 // against 0.61 for a 1000-event session — both instant.
 func TestSummarizeEvent_KeepsEverythingTheFilterSearches(t *testing.T) {
 	full := fullEvent()
@@ -339,7 +395,7 @@ func TestSummarizeEvent_KeepsEverythingTheFilterSearches(t *testing.T) {
 	if _, ok := got.Plugins["cost"]; !ok {
 		t.Error("Plugins was dropped — the plugin:<name> filter is a lookup into it")
 	}
-	// Free-text: eventHaystack appends both of these.
+	// Free-text: agentop's detailHas reads both of these on the summary row.
 	if got.Inference.Completion != full.Inference.Completion {
 		t.Error("Inference.Completion was dropped — the / filter searches it")
 	}
@@ -395,7 +451,16 @@ func TestSummarizeEvent_ShapeIsGuarded(t *testing.T) {
 		// keeps it.
 		// 33 since Proc, ClientProc and SessionHeader, TIMELINE data: agentop folds a session's
 		// linked process rows by them. Asserted above.
-		{"SessionEvent", reflect.TypeOf(pipeline.SessionEvent{}), 33},
+		// 34 since SubagentKind, TIMELINE data: agentop labels a subtask block by it.
+		// 35 since Project, TIMELINE data: the project label of the row (#1815). A scalar,
+		// so the struct copy keeps it; asserted above.
+		// 36 since Source, TIMELINE data: agentop marks an imported row by it (#1871). A
+		// scalar, so the struct copy keeps it; asserted above.
+		// 38 since ParentSession and ParentProject, TIMELINE data: a reader files the row
+		// under RollupProject (#1991). Scalars, so the struct copy keeps them; asserted above.
+		// 39 since NoRecord, TIMELINE data: it marks a row of a withheld session (#1923). A
+		// scalar, so the struct copy keeps it; asserted above.
+		{"SessionEvent", reflect.TypeOf(pipeline.SessionEvent{}), 39},
 		// 25 since AgentRole, which is TIMELINE data: agentop's CONTEXT gauge reads it on every
 		// row the timeline serves. It needs no assertion of its own in the projection test
 		// beyond the equality one there — a scalar survives the struct copy, unlike the two
@@ -406,7 +471,13 @@ func TestSummarizeEvent_ShapeIsGuarded(t *testing.T) {
 		// 28 since ServedModel, kept as RequestedModel is: agentop's detail pane draws its
 		// model: line from the projected event. A capped scalar; asserted above.
 		// 29 since HistoryToolCalls, DETAIL data like ToolResults: dropped, asserted above.
-		{"InferenceExtension", reflect.TypeOf(pipeline.InferenceExtension{}), 29},
+		// 35 since ThinkingType, ThinkingDisplay, Effort, AnthropicBeta, HistoryThinking and
+		// ResponseThinking: small scalars and counts, kept, asserted above.
+		// 36 since ToolCallCount, the third member of the derived-count category beside
+		// MessageCount and ToolCount: recorded before ToolCalls is dropped, because
+		// core/sessionexport's content-free record carries a tool-call figure and len() on a
+		// nilled slice reported absence for every projected row. Kept; asserted above.
+		{"InferenceExtension", reflect.TypeOf(pipeline.InferenceExtension{}), 36},
 		{"A2AExtension", reflect.TypeOf(pipeline.A2AExtension{}), 11},
 		{"MCPExtension", reflect.TypeOf(pipeline.MCPExtension{}), 6},
 	} {
@@ -414,10 +485,11 @@ func TestSummarizeEvent_ShapeIsGuarded(t *testing.T) {
 			if got := g.typ.NumField(); got != g.want {
 				t.Errorf("%s has %d fields, this guard was written against %d.\n"+
 					"A field was added or removed. Decide which it is:\n"+
-					"  TIMELINE data — rendered in the events table, or searched by agentop's\n"+
-					"    eventHaystack/matchEventRow — then it MUST survive summarizeEvent, and\n"+
-					"    belongs in one of the assertions above.\n"+
-					"  DETAIL data — read only by the detail pane — then drop it in summarizeEvent.\n"+
+					"  TIMELINE data — rendered in the events table — then it MUST survive\n"+
+					"    summarizeEvent, and belongs in one of the assertions above.\n"+
+					"  DETAIL data — read only by the detail pane — then drop it in summarizeEvent,\n"+
+					"    and add it to the search route's matcher (search.go), or the details\n"+
+					"    search stops seeing it.\n"+
 					"Then update this count.", g.name, got, g.want)
 			}
 		})

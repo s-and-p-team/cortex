@@ -10,7 +10,7 @@ import (
 	"github.com/rossoctl/cortex/core/cost/event"
 	"github.com/rossoctl/cortex/core/cost/pricing"
 	"github.com/rossoctl/cortex/core/cost/usage"
-	"github.com/rossoctl/cortex/core/pipeline"
+	"github.com/rossoctl/cortex/core/model"
 )
 
 // opsBuffer is how many batches the writer goroutine can be behind by.
@@ -43,7 +43,7 @@ type batch struct {
 	// pruneAt is non-zero when retention should be enforced back from that instant.
 	pruneAt time.Time
 	// done, when non-nil, receives the append error. Set by submit for the callers
-	// that need to know the write landed — shutdown and tests.
+	// that need to know the write landed — shutdown, RecordBatch and tests.
 	done chan error
 }
 
@@ -60,10 +60,12 @@ type batch struct {
 // in sixty closes a minute and walks the accumulator, which foldLocked caps. Anything
 // added to this path has to keep that bound.
 //
-// OWNERSHIP: while pending() reports a minute, nothing THIS WRITER has put on disk carries
-// that minute or a later one. Three write paths keep it and TestPendingMinute_IsNeverAlsoOnDisk
-// drives all three. Note the qualifier — it says nothing about day files another writer
-// left there, and Window must not infer anything about the disk from it.
+// OWNERSHIP: while pending() reports a minute, no row that went through the accumulator
+// (Record) is on disk for that minute or a later one. Three write paths keep it and
+// TestPendingMinute_IsNeverAlsoOnDisk drives all three. RecordBatch is outside the rule: its
+// rows never enter the accumulator, so they may share a held minute, and Window sums them
+// with the held rows once each. The rule says nothing about day files another writer left
+// there, and Window must not infer anything about the disk from it.
 type Writer struct {
 	store *store
 	now   func() time.Time
@@ -150,9 +152,10 @@ type Writer struct {
 	// be added. If it HAS moved, the memory half may now also be on disk and is dropped
 	// instead. See Window.
 	flushGen uint64
-	// flushedThrough is the newest minute any of whose rows have reached disk.
+	// flushedThrough is the newest minute any of whose accumulator rows have reached disk.
+	// RecordBatch rows do not move it: they never enter the map, so they cannot be counted twice.
 	//
-	// It exists so a minute is never HELD after part of it has been written. Without
+	// It exists so a minute is never HELD after part of its accumulator rows were written. Without
 	// it, a Flush (shutdown, or the periodic settle) followed by another event in the
 	// same minute would leave that minute both on disk and in memory, and Window —
 	// which counts the held minute from memory and everything else from disk — would
@@ -255,7 +258,7 @@ func New(dir string, opts ...Option) (*Writer, error) {
 	return w, nil
 }
 
-// agentLabel is the ledger's STORAGE-side spelling of pipeline.EventClient.Label:
+// agentLabel is the ledger's STORAGE-side spelling of model.EventClient.Label:
 // the same label for a client that exists, and "" instead of "unknown" for one that
 // does not.
 //
@@ -265,7 +268,7 @@ func New(dir string, opts ...Option) (*Writer, error) {
 // indistinguishable from an agent that really did call itself that. labelFor puts the
 // display string back at the query boundary, so nothing a client sees differs. See
 // Row.Agent.
-func agentLabel(c *pipeline.EventClient) string {
+func agentLabel(c *model.EventClient) string {
 	if c == nil {
 		return ""
 	}
@@ -317,7 +320,7 @@ func agentLabel(c *pipeline.EventClient) string {
 // PresentKinds is left as the parser set it. Clearing the bit for the offending kind would
 // be the fuller reading of "absent" — a set bit with a zero value means "reported zero"
 // where an unset bit means "not exposed" — but the bit layout is parsercommon's, restated in
-// pipeline.InferenceExtension precisely to avoid an import, and re-deriving it here would
+// model.InferenceExtension precisely to avoid an import, and re-deriving it here would
 // put a third copy in the tree with nothing keeping the three in agreement. So the residual
 // is that a refused count reads as "reported zero" rather than "not exposed", a smaller
 // error than a wrong total and smaller still because PresentKinds is a UNION over the
@@ -335,7 +338,28 @@ func tokenCount(n int) int64 {
 // session-append path, under the store's write lock, and the ledger is
 // observability. Neither a failure nor a delay here may become a failed or a slow
 // request. See the type doc for how the hand-off works.
-func (w *Writer) Record(_ string, e *pipeline.SessionEvent) {
+func (w *Writer) Record(_ string, e *model.SessionEvent) {
+	if minute, r, ok := w.row(e); ok {
+		w.add(minute, r)
+	}
+}
+
+// RecordBatch records es as Record does, but writes every row in one append and waits for it.
+// For a bulk caller (the transcript import): Record never blocks, so thousands of back-dated
+// rows overflow the queue and are dropped, live rows with them. Writing a minute that is also
+// held in memory is safe: Window sums the disk rows and the pending ones.
+func (w *Writer) RecordBatch(es []*model.SessionEvent) error {
+	var rows []Row
+	for _, e := range es {
+		if _, r, ok := w.row(e); ok {
+			rows = append(rows, r)
+		}
+	}
+	return w.submit(batch{rows: rows})
+}
+
+// row builds the ledger row for e. ok is false when e is not admitted.
+func (w *Writer) row(e *model.SessionEvent) (minute time.Time, r Row, ok bool) {
 	if e == nil {
 		return
 	}
@@ -351,7 +375,7 @@ func (w *Writer) Record(_ string, e *pipeline.SessionEvent) {
 	// json.Unmarshal, and this method executes under session.Store.Append's write lock.
 	// Decoding a request event's plugin map there would put parsing work in front of every
 	// request to answer a question this guard already settles.
-	if e.Phase != pipeline.SessionResponse && e.Phase != pipeline.SessionDenied {
+	if e.Phase != model.SessionResponse && e.Phase != model.SessionDenied {
 		return
 	}
 	ev, hasCost := event.Record(e)
@@ -417,13 +441,13 @@ func (w *Writer) Record(_ string, e *pipeline.SessionEvent) {
 	// window — so a producer that built At in UTC while a reader asks about a local day
 	// put the row in one file and looked for it in another, losing rows near midnight.
 	// Normalising here pins both sides to store.loc. See store.loc and Query.
-	minute := e.At.In(w.store.loc).Truncate(time.Minute)
+	minute = e.At.In(w.store.loc).Truncate(time.Minute)
 	if e.At.IsZero() {
 		// A zero At would file the row under year 1 and make it invisible to every
 		// query. The aggregator substitutes its own clock for the same reason.
 		minute = w.now().In(w.store.loc).Truncate(time.Minute)
 	}
-	r := Row{
+	r = Row{
 		At: minute,
 		// SANITISED AND TRUNCATED, both of them, and neither is cosmetic: Model is the model
 		// name straight off the parsed request body and Host is whatever the workload asked
@@ -446,13 +470,20 @@ func (w *Writer) Record(_ string, e *pipeline.SessionEvent) {
 		// where the live aggregator displays it as "unknown". See Row.Agent for why the two
 		// representations differ and why they still mean the same thing.
 		//
-		// Capped as well. pipeline.maxClientLen already holds the retained User-Agent to
+		// Capped as well. model.maxClientLen already holds the retained User-Agent to
 		// 128, so this is not the unbounded case Model is — but the ring truncates the same
 		// label to maxLabelLen before it becomes a byAgent key, so cutting at 96 here is
 		// what keeps group=agent spelled identically whichever half answers. Sanitised for
 		// the same reason as the two above: EventClient.Raw is the header verbatim.
-		Agent:  rowLabel(agentLabel(e.Client)),
-		Counts: usage.Counts{Requests: 1},
+		Agent:   rowLabel(agentLabel(e.Client)),
+		Project: projectRowLabel(e.RollupProject()),
+		Counts:  usage.Counts{Requests: 1},
+	}
+	if e.ParentProject != "" {
+		r.OwnProject = projectRowLabel(e.Project)
+	}
+	if e.Imported() {
+		r.Source = event.SourceTranscript
 	}
 	// NIL-SAFE, because the guard above admits a row with no extension: an endpoint
 	// inference-parser cannot parse still gets its gateway-reported cost settled, and that
@@ -503,7 +534,13 @@ func (w *Writer) Record(_ string, e *pipeline.SessionEvent) {
 	if e.Inference != nil {
 		model = e.Inference.Model
 	}
-	if c := pricing.UnitOf(w.rates, e.Host, model); c != "" {
+	// An imported event has no Host, so UnitOf gives "". Then the record's own unit, which the
+	// importer set from the source's endpoint, labels the row, as usage.Aggregator does.
+	c := pricing.UnitOf(w.rates, e.Host, model)
+	if c == "" && hasCost {
+		c = ev.Currency // set by pricing.UnitOf, so "" is already the default
+	}
+	if c != "" {
 		r.Currency = rowLabel(c)
 	}
 	// The error rule is the ring's own function and the priceable rule matches
@@ -642,7 +679,7 @@ func (w *Writer) Record(_ string, e *pipeline.SessionEvent) {
 		}
 	}
 
-	w.add(minute, r)
+	return minute, r, true
 }
 
 // add folds one row into the open minute and hands off any work that touches disk.
@@ -702,7 +739,7 @@ func (w *Writer) foldLocked(r Row) {
 	// (cap+1)th entry, so the map would settle one over the bound it claims. A second unit's
 	// overflow row goes past it — see overflowKeyFor for why units are bounded anyway.
 	if len(w.rows) >= maxLabelsPerMinute-1 {
-		k = overflowKeyFor(k.currency)
+		k = overflowKeyFor(k.source, k.currency)
 		if cur, ok := w.rows[k]; ok {
 			cur.Add(r.Counts)
 			return
@@ -797,7 +834,7 @@ func (w *Writer) markPruned(at time.Time) {
 // COPIED, not aliased: the caller is an HTTP handler that will encode these while the
 // next Record mutates the live map.
 //
-// The returned minute is the ownership boundary the writer keeps — see the type doc and
+// The returned minute is the ownership boundary for accumulator rows — see the type doc and
 // TestPendingMinute_IsNeverAlsoOnDisk. Zero, with no rows, when nothing is held. Window
 // decides nothing from it; the third return is what Window uses.
 //
@@ -1117,7 +1154,7 @@ func (w *Writer) sync() error {
 }
 
 // submit sends a batch and waits for it. Blocking, unlike enqueue — every caller is
-// a shutdown or a test, never a request.
+// a shutdown, a test or RecordBatch (the transcript import), never a request.
 func (w *Writer) submit(b batch) error {
 	if len(b.rows) == 0 && b.pruneAt.IsZero() {
 		return nil

@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -26,6 +27,15 @@ type identityProbePlugin struct {
 	sawEvents []int
 	sawSource []pipeline.SessionSource
 	sawHeader []string
+	// sawSessionID is pctx.SessionID, recorded for every request beside sawID.
+	sawSessionID []string
+	// sawIntent is pctx.LastIntent(), and sawViewIntent the view's own LastIntent(), for every
+	// request.
+	sawIntent     []pipeline.SessionFact
+	sawViewIntent []*pipeline.SessionEvent
+	// sawHosts and sawHostsKnown are pctx.InferenceHosts(), for every request.
+	sawHosts      []pipeline.InferenceHosts
+	sawHostsKnown []bool
 }
 
 func (p *identityProbePlugin) Name() string { return "identity-probe" }
@@ -33,7 +43,12 @@ func (p *identityProbePlugin) Capabilities() pipeline.PluginCapabilities {
 	return pipeline.PluginCapabilities{}
 }
 func (p *identityProbePlugin) OnRequest(_ context.Context, pctx *pipeline.Context) pipeline.Action {
+	p.sawSessionID = append(p.sawSessionID, pctx.SessionID)
+	p.sawIntent = append(p.sawIntent, pctx.LastIntent())
+	hosts, known := pctx.InferenceHosts()
+	p.sawHosts, p.sawHostsKnown = append(p.sawHosts, hosts), append(p.sawHostsKnown, known)
 	if pctx.Session == nil {
+		p.sawViewIntent = append(p.sawViewIntent, nil)
 		p.sawNil = append(p.sawNil, true)
 		p.sawID = append(p.sawID, "")
 		p.sawEvents = append(p.sawEvents, -1)
@@ -44,6 +59,7 @@ func (p *identityProbePlugin) OnRequest(_ context.Context, pctx *pipeline.Contex
 	p.sawHeader = append(p.sawHeader, pctx.SessionHeader)
 	p.sawID = append(p.sawID, pctx.Session.ID)
 	p.sawEvents = append(p.sawEvents, len(pctx.Session.Events))
+	p.sawViewIntent = append(p.sawViewIntent, pctx.Session.LastIntent())
 	return pipeline.Action{Type: pipeline.Continue}
 }
 func (p *identityProbePlugin) OnResponse(_ context.Context, _ *pipeline.Context) pipeline.Action {
@@ -228,6 +244,106 @@ func TestPluginIdentity_NoSessionAtAllStaysNil(t *testing.T) {
 	}
 }
 
+// TestPluginIdentity_HydratesSessionFacts: a plugin gets the store's facts with the view.
+// A header session with a recorded A2A intent: FactPresent, at the view's own intent. A header
+// session with no events yet: FactNone, not FactNoSession. No session: FactNoSession.
+func TestPluginIdentity_HydratesSessionFacts(t *testing.T) {
+	store := session.New(5*time.Minute, 100, 0)
+	defer store.Close()
+	const sidA = "511754a6-63e2-47df-bb22-706dc165c344"
+	const sidB = "f4019b9f-3550-442f-9bc7-229809a3b486"
+	store.Append(sidA, pipeline.SessionEvent{
+		At:        time.Now(),
+		Direction: pipeline.Inbound,
+		Phase:     pipeline.SessionRequest,
+		A2A:       &pipeline.A2AExtension{Method: "message/send", SessionID: sidA},
+	})
+	probe, client, backendURL := newProbedProxy(t, store)
+
+	get(t, client, backendURL, sidA)
+	get(t, client, backendURL, sidB)
+	if len(probe.sawIntent) != 2 {
+		t.Fatalf("probe ran %d times, want 2", len(probe.sawIntent))
+	}
+	if got := probe.sawIntent[0]; got.State != pipeline.FactPresent || got.Event == nil || got.Event != probe.sawViewIntent[0] {
+		t.Errorf("recorded intent: LastIntent = %+v, want FactPresent at the view's intent %p", got, probe.sawViewIntent[0])
+	}
+	if got := probe.sawIntent[1]; got.State != pipeline.FactNone || got.Event != nil {
+		t.Errorf("first turn: LastIntent = %+v, want FactNone", got)
+	}
+
+	empty := session.New(5*time.Minute, 100, 0)
+	defer empty.Close()
+	noSession, client2, backendURL2 := newProbedProxy(t, empty)
+	get(t, client2, backendURL2, "")
+	if got := noSession.sawIntent[0]; got.State != pipeline.FactNoSession || !noSession.sawNil[0] {
+		t.Errorf("no session: LastIntent = %+v, Session nil = %v, want FactNoSession and nil", got, noSession.sawNil[0])
+	}
+}
+
+// hostsKeeper is a session archive that holds only InferenceHosts tables.
+type hostsKeeper map[string]pipeline.InferenceHosts
+
+func (hostsKeeper) Record(string, *pipeline.SessionEvent)                      {}
+func (k hostsKeeper) InferenceHosts(id string) (pipeline.InferenceHosts, bool) { return k[id], true }
+
+// TestPluginIdentity_HydratesTheHostsFact: a plugin gets the store's InferenceHosts table, which a
+// view cannot give. A session with an entry: the entry's table. A session with no entry: the
+// archive's table, which is the answer after a restart. No session: unknown.
+func TestPluginIdentity_HydratesTheHostsFact(t *testing.T) {
+	const sidA = "511754a6-63e2-47df-bb22-706dc165c344"
+	const sidB = "f4019b9f-3550-442f-9bc7-229809a3b486"
+	archived := pipeline.InferenceHosts{{Agent: "claude-code", Host: "glm.example.com:8443", Last: 7}}
+	store := session.New(5*time.Minute, 100, 0)
+	defer store.Close()
+	store.AddRecorder(hostsKeeper{sidB: archived})
+	store.Append(sidA, pipeline.SessionEvent{Direction: pipeline.Outbound, Phase: pipeline.SessionRequest,
+		Host: "ete.example.com", Client: pipeline.ParseUserAgent("claude-cli/2.1.0 (external, cli)"),
+		Inference: &pipeline.InferenceExtension{Model: "m"}})
+	probe, client, backendURL := newProbedProxy(t, store)
+
+	get(t, client, backendURL, sidA)
+	get(t, client, backendURL, sidB)
+	if len(probe.sawHosts) != 2 {
+		t.Fatalf("probe ran %d times, want 2", len(probe.sawHosts))
+	}
+	want := []pipeline.InferenceHosts{{{Agent: "claude-code", Host: "ete.example.com", Last: 1}}, archived}
+	for i, name := range []string{"an entry", "no entry"} {
+		if got := probe.sawHosts[i]; !probe.sawHostsKnown[i] || !reflect.DeepEqual(got, want[i]) {
+			t.Errorf("%s: InferenceHosts = %+v, %v; want %+v, true", name, got, probe.sawHostsKnown[i], want[i])
+		}
+	}
+
+	empty := session.New(5*time.Minute, 100, 0)
+	defer empty.Close()
+	empty.AddRecorder(hostsKeeper{"": archived})
+	noSession, client2, backendURL2 := newProbedProxy(t, empty)
+	get(t, client2, backendURL2, "")
+	if got, known := noSession.sawHosts[0], noSession.sawHostsKnown[0]; known || got != nil {
+		t.Errorf("no session: InferenceHosts = %+v, %v; want nil, false", got, known)
+	}
+	if got := noSession.sawIntent[0]; got.State != pipeline.FactNoSession {
+		t.Errorf("no session: LastIntent = %+v, want FactNoSession", got)
+	}
+}
+
+// pctx.SessionID is the view's id when the request has a view, and empty when it has none.
+func TestPluginIdentity_SessionIDIsTheViewID(t *testing.T) {
+	for _, sid := range []string{"511754a6-63e2-47df-bb22-706dc165c344", ""} {
+		store := session.New(5*time.Minute, 100, 0)
+		probe, client, backendURL := newProbedProxy(t, store)
+		get(t, client, backendURL, sid)
+		store.Close()
+		if len(probe.sawID) != 1 {
+			t.Fatalf("probe ran %d times, want 1", len(probe.sawID))
+		}
+		if probe.sawNil[0] != (sid == "") || probe.sawID[0] != sid || probe.sawSessionID[0] != sid {
+			t.Errorf("header %q: nil view %v, view id %q, SessionID %q; want SessionID and view id %q",
+				sid, probe.sawNil[0], probe.sawID[0], probe.sawSessionID[0], sid)
+		}
+	}
+}
+
 // flipAndRejectPlugin reproduces the interleaving that makes re-resolution
 // unsafe: it appends an event under an unrelated session (flipping the global
 // ActiveSession, exactly as a health probe under "default" does) and then
@@ -337,7 +453,7 @@ func (p *pinHijackPlugin) OnResponse(_ context.Context, _ *pipeline.Context) pip
 // TestPinIsNotPluginWritable guards the hazard created by resolving the identity
 // before the pipeline runs: OutboundSessionID is exported, so a plugin that
 // writes it could re-file both the request and its paired response event.
-// resolveOutboundSessionID's own contract forbids exactly that — a plugin must
+// recordingSessionID's own contract forbids exactly that — a plugin must
 // not silently re-file telemetry, and it would fail invisibly because "" means
 // "fall back", never an error. The listener's resolution must win.
 func TestPinIsNotPluginWritable(t *testing.T) {
@@ -376,14 +492,17 @@ func TestPinIsNotPluginWritable(t *testing.T) {
 }
 
 // TestSessionViewFor_NilStoreDoesNotPanic holds sessionViewFor to the convention
-// resolveOutboundSessionID states thirty lines above it — safe to call with a nil
+// recordingSessionID states in identity.go — safe to call with a nil
 // store, so a future caller that forgets the guard gets a usable answer rather
 // than a panic. Both current callers guard, so this is latent by design.
 func TestSessionViewFor_NilStoreDoesNotPanic(t *testing.T) {
 	s := &Server{} // Sessions nil: session tracking disabled
-	v := s.sessionViewFor("sess-1")
+	v, f := s.sessionViewFor("sess-1")
 	if v == nil || v.ID != "sess-1" {
 		t.Fatalf("sessionViewFor with a nil store = %+v, want a view identifying sess-1", v)
+	}
+	if f.LastIntent.State != pipeline.FactNone || f.LastInference.State != pipeline.FactNone {
+		t.Errorf("sessionViewFor with a nil store: facts = %+v, want both FactNone", f)
 	}
 }
 
@@ -423,11 +542,7 @@ func TestTransparentPath_RecordsUnderTheIdentityThePluginSaw(t *testing.T) {
 		defer close(done)
 		srv.HandleTransparentConn(serverSide, "10.0.0.1:9999")
 	}()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("HandleTransparentConn did not return; it should reject before dialing")
-	}
+	<-done // the rejection comes before any dial
 
 	countDenied := func(id string) int {
 		v := store.View(id)
@@ -489,11 +604,7 @@ func TestTransparentPath_HydratesTheIdentityItGatesOn(t *testing.T) {
 		defer close(done)
 		srv.HandleTransparentConn(serverSide, "10.0.0.1:9999")
 	}()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("HandleTransparentConn did not return; it should reject before dialing")
-	}
+	<-done // the rejection comes before any dial
 
 	if len(probe.sawID) != 1 {
 		t.Fatalf("probe ran %d times on the transparent path, want 1", len(probe.sawID))
@@ -522,7 +633,8 @@ func TestSessionViewFor_IsTheOnlyHydrationPath(t *testing.T) {
 			t.Fatal(err)
 		}
 		for i, line := range strings.Split(string(b), "\n") {
-			if strings.Contains(line, "pctx.Session = ") && !strings.Contains(line, "sessionViewFor") {
+			assigns := strings.Contains(line, "pctx.Session = ") || strings.Contains(line, "pctx.Session, ")
+			if assigns && !strings.Contains(line, "sessionViewFor") {
 				t.Errorf("%s:%d hydrates pctx.Session without sessionViewFor: %s",
 					f, i+1, strings.TrimSpace(line))
 			}

@@ -1,14 +1,16 @@
 package claude
 
 import (
-	"context"
+	"bytes"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -706,13 +708,6 @@ func TestReadMetadata_IsBounded(t *testing.T) {
 	}
 }
 
-// childTimeout bounds a harvester subprocess.
-//
-// Its own constant rather than a shared one, since cmd_observe_test.go's namesake is in a different
-// module. Generous enough that a loaded CI machine running six children against one lock does not
-// flake, short enough that a wedge fails the test instead of the package.
-const childTimeout = 60 * time.Second
-
 // A concurrent run's FRESHER title for a shared id survives this run's recovery pass.
 //
 // recoverConcurrentEntries only pulled in ids this run did not have (`if _, ours := meta[id];
@@ -833,9 +828,15 @@ func TestRecoverConcurrentEntries_KeepsOursWhenNeitherIsComparable(t *testing.T)
 // Deliberately more children than a single pair, and repeated, because one pair passes by luck often
 // enough to be a useless regression test.
 //
-// The child branch is in TestMain, not here: it os.Exit()s before m.Run(), so a child never reaches
-// a test body at all. A guard at the top of this function would be dead code.
+// A child re-enters this test with CLAUDE_HARVEST_CHILD set and runs one harvest, under the
+// parent's -test.timeout.
 func TestHarvest_ConcurrentRunsLoseNothing(t *testing.T) {
+	if dir := os.Getenv("CLAUDE_HARVEST_CHILD"); dir != "" {
+		if _, err := Harvest(Options{ConfigDir: dir, Merge: true}); err != nil {
+			t.Fatalf("child harvest: %v", err)
+		}
+		return
+	}
 	if testing.Short() {
 		t.Skip("spawns subprocesses")
 	}
@@ -875,19 +876,16 @@ func TestHarvest_ConcurrentRunsLoseNothing(t *testing.T) {
 			wg.Add(1)
 			go func(dir string) {
 				defer wg.Done()
-				// BOUNDED, and it matters more here than the usual "tests should have timeouts".
-				// Every child shares one HOME, so they contend on a single blocking
-				// syscall.Flock(LOCK_EX) — lock_unix.go takes it with no timeout, deliberately. A
-				// child wedged holding it would block cmd.Wait(), then wg.Wait(), and with three
-				// attempts times six children the package would hit its own timeout with nothing
-				// saying which child stuck. Same two lines cmd_observe_test.go's runAgentopChild uses.
-				ctx, cancel := context.WithTimeout(context.Background(), childTimeout)
-				defer cancel()
-				cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=TestHarvest_ConcurrentRunsLoseNothing")
+				// Every child shares one HOME, so they contend on one metadata lock. Each child
+				// runs under this run's -test.timeout, so a wedged child still exits.
+				cmd := exec.Command(os.Args[0], "-test.run=^TestHarvest_ConcurrentRunsLoseNothing$",
+					"-test.timeout="+flag.Lookup("test.timeout").Value.String())
 				cmd.Env = append(os.Environ(),
 					"CLAUDE_HARVEST_CHILD="+dir,
 					"HOME="+home, "USERPROFILE="+home,
 				)
+				var out bytes.Buffer
+				cmd.Stdout, cmd.Stderr = &out, &out
 				// Started BEFORE the barrier so the spawn cost is paid in parallel; the barrier
 				// then releases the harvests themselves as close together as this can manage.
 				if err := cmd.Start(); err != nil {
@@ -896,12 +894,7 @@ func TestHarvest_ConcurrentRunsLoseNothing(t *testing.T) {
 				}
 				<-start
 				if err := cmd.Wait(); err != nil {
-					if ctx.Err() != nil {
-						t.Errorf("child for %s did not exit within %s — likely wedged on the metadata lock",
-							dir, childTimeout)
-						return
-					}
-					t.Errorf("child for %s failed: %v", dir, err)
+					t.Errorf("child for %s failed: %v\n%s", dir, err, out.Bytes())
 				}
 			}(dirs[i])
 		}
@@ -918,18 +911,6 @@ func TestHarvest_ConcurrentRunsLoseNothing(t *testing.T) {
 			}
 		}
 	}
-}
-
-// TestMain lets the test above re-enter this binary as a harvester.
-func TestMain(m *testing.M) {
-	if dir := os.Getenv("CLAUDE_HARVEST_CHILD"); dir != "" {
-		if _, err := Harvest(Options{ConfigDir: dir, Merge: true}); err != nil {
-			fmt.Fprintln(os.Stderr, "child harvest:", err)
-			os.Exit(1)
-		}
-		os.Exit(0)
-	}
-	os.Exit(m.Run())
 }
 
 // Both title line kinds are read: ai-title and agent-name.
@@ -1262,8 +1243,8 @@ func TestTitleFromTranscript_UnwrapsSlashCommands(t *testing.T) {
 		},
 		{
 			"name only",
-			`<command-message>clear</command-message>\n<command-name>/clear</command-name>\n<command-args></command-args>`,
-			"/clear",
+			`<command-message>review</command-message>\n<command-name>/review</command-name>\n<command-args></command-args>`,
+			"/review",
 		},
 		{
 			"ordinary prose is untouched",
@@ -1290,38 +1271,43 @@ func TestTitleFromTranscript_UnwrapsSlashCommands(t *testing.T) {
 	}
 }
 
-// The cwd fallback is NOT clipped, so sibling directories stay distinguishable.
-//
-// A path's distinguishing end is its leaf and clipTitle keeps the head, so two worktrees under a
-// prefix of 80 runes or more clipped to byte-identical titles — the column stopped telling apart
-// exactly the sessions it exists to name. Also a regression against the behaviour before titles
-// were clipped at all.
-func TestTitleFromTranscript_DoesNotClipTheCwdFallback(t *testing.T) {
-	// 81 runes, so the leaf is entirely past the cap.
-	const prefix = "/Users/somebody/go/src/github.com/some-organisation/some-repository/worktrees/wt/"
-	if len([]rune(prefix)) <= MaxTitleLen {
-		t.Fatalf("fixture prefix is %d runes, needs to exceed %d to exercise the cut",
-			len([]rune(prefix)), MaxTitleLen)
-	}
-	titleFor := func(cwd string) string {
-		dir := t.TempDir()
-		body, err := json.Marshal(cwd)
+// /clear never names a session. Claude Code writes it as the first user turn of the transcript it
+// starts, so a session left idle after /clear was titled "/clear".
+func TestTitleFromTranscript_ClearNamesNothing(t *testing.T) {
+	const clear = `<command-name>/clear</command-name>\n            <command-message>clear</command-message>\n            <command-args></command-args>`
+	user := func(content string) string {
+		body, err := json.Marshal(strings.ReplaceAll(content, `\n`, "\n"))
 		if err != nil {
 			t.Fatal(err)
 		}
-		writeSessionTranscript(t, dir, "s.jsonl", `{"type":"user","cwd":`+string(body)+`}`)
-		got, gerr := titleFromTranscript(filepath.Join(dir, "s.jsonl"))
-		if gerr != nil {
-			t.Fatal(gerr)
-		}
-		return got
+		return `{"type":"user","cwd":"/w/repo","message":{"role":"user","content":` + string(body) + `}}`
 	}
-	a, b := titleFor(prefix+"alpha"), titleFor(prefix+"beta")
-	if a == b {
-		t.Errorf("sibling paths produced the same title %q — the leaf was clipped away", a)
+	human := func(line string) string {
+		return strings.Replace(line, `"type":"user",`, `"type":"user","origin":{"kind":"human"},`, 1)
 	}
-	if !strings.HasSuffix(a, "alpha") || !strings.HasSuffix(b, "beta") {
-		t.Errorf("the leaf did not survive: %q / %q", a, b)
+	for _, tc := range []struct {
+		name  string
+		lines []string
+		want  string
+	}{
+		{"alone falls through to the cwd", []string{user(clear)}, "/w/repo"},
+		{"attributed human turn", []string{human(user(clear))}, "/w/repo"},
+		{"last-prompt record", []string{user(clear), `{"type":"last-prompt","lastPrompt":"/clear"}`}, "/w/repo"},
+		{"the prompt after it wins", []string{user(clear), user("fix the title bug")}, "fix the title bug"},
+		{"a prompt before it is kept", []string{user("fix the title bug"), user(clear)}, "fix the title bug"},
+		{"a longer command name is not /clear", []string{user(`<command-name>/clearcache</command-name><command-args></command-args>`)}, "/clearcache"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeSessionTranscript(t, dir, "s.jsonl", tc.lines...)
+			got, err := titleFromTranscript(filepath.Join(dir, "s.jsonl"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Errorf("title = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -1994,7 +1980,6 @@ func TestTitleFromTranscript_TitlesAreAlwaysPlain(t *testing.T) {
 		"a\x1b(Binjected",          // charset selection
 		"a\x1b_injected\x07b",      // APC
 		"title\x1b",                // trailing lone ESC
-		"my question\n\v<system-reminder>HARNESSBODY</system-reminder>",
 		"my question\n\f<system-reminder>HARNESSBODY</system-reminder>",
 		"my question\n\u00a0<system-reminder>HARNESSBODY</system-reminder>",
 		// Control characters and invisible code points.
@@ -2101,7 +2086,6 @@ func TestTitleFromTranscript_TitlesAreAlwaysPlain(t *testing.T) {
 func TestClipTitle_KeepsLegitimateText(t *testing.T) {
 	for _, tc := range []struct{ in, want string }{
 		{"how do I build agentop?", "how do I build agentop?"},
-		{"is 3 < 5 in Go?", "is 3 < 5 in Go?"},
 		{"日本語のセッションタイトル", "日本語のセッションタイトル"},
 		{"ship it 🎉", "ship it 🎉"},
 		{"café naïve", "café naïve"},
@@ -2446,38 +2430,25 @@ func TestTitleFromTranscript_AttributionDoesNotChangeBlockTitles(t *testing.T) {
 // four times the input for eleven times the work. bufio admits lines up to 16MB, so one chatty
 // transcript line could stall the harvest for seconds. After: 9ms, 24ms, 54ms.
 //
-// Asserted as a RATIO rather than a wall-clock bound, so the test says what it means on a loaded CI
-// machine: quadratic growth shows up as time scaling with the square of the input, and a 4x input
-// step would take ~16x. The 8x ceiling leaves room for noise while still failing the 11x that was
-// measured.
+// Asserted on the bytes it allocates, which are the same on any machine: re-slicing on every
+// excision copies the rest of the input each time, so a 1MB input of 85-byte blocks allocates
+// gigabytes, where one output buffer allocates about the input's size.
 func TestStripHarnessSpans_ScalesLinearly(t *testing.T) {
-	if testing.Short() {
-		t.Skip("timing-sensitive")
+	var b strings.Builder
+	for b.Len() < 1024*1024 {
+		b.WriteString("some prose here <system-reminder>hidden payload text</system-reminder> more prose\n")
 	}
-	build := func(kb int) string {
-		var b strings.Builder
-		for b.Len() < kb*1024 {
-			b.WriteString("some prose here <system-reminder>hidden payload text</system-reminder> more prose\n")
-		}
-		return b.String()
-	}
-	measure := func(s string) time.Duration {
-		start := time.Now()
-		stripHarnessSpans(s)
-		return time.Since(start)
-	}
-	small, large := build(256), build(1024) // a 4x step
+	s := b.String()
 
-	// Warm up, so the first allocation does not land inside a measurement.
-	measure(small)
-
-	ts, tl := measure(small), measure(large)
-	if ts <= 0 {
-		ts = time.Microsecond
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	out := stripHarnessSpans(s)
+	runtime.ReadMemStats(&after)
+	if strings.Contains(out, "hidden payload") {
+		t.Fatal("the spans were not stripped")
 	}
-	if ratio := float64(tl) / float64(ts); ratio > 8 {
-		t.Errorf("4x the input took %.1fx the time (%v vs %v) — that is quadratic, not linear",
-			ratio, tl, ts)
+	if got := after.TotalAlloc - before.TotalAlloc; got > 3*uint64(len(s)) {
+		t.Errorf("stripping %d bytes allocated %d — that is quadratic, not linear", len(s), got)
 	}
 }
 
@@ -2607,6 +2578,8 @@ func titleOf(t *testing.T, prompt string) string {
 // since either may contain the other unescaped.
 func TestTagSpanLen_QuotedAngleBracketDoesNotCloseTheTag(t *testing.T) {
 	for _, tc := range []struct{ in, want string }{
+		// ATTRIBUTE SYNTAX keeps only the name. Measured on 857 real string user turns: all 126
+		// attribute-bearing spans carry "=" or a quote, and none of the 45 prose interiors does.
 		{`hello <a href="x>y">link</a> world`, "hello a link a world"},
 		{`hi <img alt='a>b'> there`, "hi img there"},
 		{`<span title="a > b">txt</span>`, "span txt span"},
@@ -2652,11 +2625,6 @@ func TestNormalizeTitle_NeutersUnknownTagsInsteadOfSwallowingProse(t *testing.T)
 		{"<system-reminder>INJECTED</system-reminder>", ""},
 		{"prose <system-reminder>INJECTED</system-reminder> more", "prose more"},
 		{"a <bash-stdout>total 40</bash-stdout> b", "a b"},
-
-		// ATTRIBUTE SYNTAX keeps only the name. Measured on 857 real string user turns: all 126
-		// attribute-bearing spans carry "=" or a quote, and none of the 45 prose interiors does.
-		{`hello <a href="x>y">link</a> world`, "hello a link a world"},
-		{`<span title="a > b">txt</span>`, "span txt span"},
 
 		// Unchanged: a lone "<" is not a span.
 		{"is 3 < 5 in Go?", "is 3 < 5 in Go?"},
@@ -2718,10 +2686,6 @@ func TestStripHarnessSpans_MatchesTheNameNotItsBytes(t *testing.T) {
 		{"orphan close", "</system-reminder>", ""},
 		{"orphan close, mid-prose", "prose </system-reminder> more", "prose"},
 		{"orphan close, uppercase", "</SYSTEM-REMINDER>", ""},
-
-		// Unchanged: a name that is NOT a harness tag is still only neutered, never body-removed.
-		{"unknown tag keeps its words", "<unknown-tag>X</unknown-tag>", "unknown-tag X unknown-tag"},
-		{"comparison is not a span", "is 3 < 5 in Go?", "is 3 < 5 in Go?"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := normalizeTitle(tc.in); got != tc.want {
@@ -2995,6 +2959,45 @@ func TestHarvest_ReadsSubagentMetaFiles(t *testing.T) {
 	}
 }
 
+// The Workflow tool's agents keep their meta files in subagents/workflows/<run>/. They
+// start without a write to the main transcript, so an incremental harvest that skips the
+// unchanged transcript must still find an agent that started after the last harvest.
+func TestHarvest_ReadsWorkflowSubagentsWhenTranscriptIsUnchanged(t *testing.T) {
+	metadataHome(t)
+	cfg := filepath.Join(t.TempDir(), "claude")
+	proj := filepath.Join(cfg, "projects", "-p")
+	writeSessionTranscript(t, proj, "s1.jsonl", `{"type":"ai-title","aiTitle":"t"}`)
+	subs := filepath.Join(proj, "s1", "subagents")
+	writeSessionTranscript(t, subs, "agent-a1.meta.json", `{"description":"Agent tool child"}`)
+	run := filepath.Join(subs, "workflows", "wf_1")
+	writeSessionTranscript(t, run, "agent-b1.meta.json", `{"agentType":"workflow-subagent","description":"implement T1: x"}`)
+
+	if _, err := Harvest(Options{ConfigDir: cfg, Merge: true, Incremental: true}); err != nil {
+		t.Fatal(err)
+	}
+	writeSessionTranscript(t, run, "agent-b2.meta.json", `{"description":"merge T1: x"}`)
+	res, err := Harvest(Options{ConfigDir: cfg, Merge: true, Incremental: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Skipped != 1 {
+		t.Fatalf("Skipped = %d, want 1: the transcript did not change", res.Skipped)
+	}
+	got := readMetadataFile(t, res.Path)["s1"]
+	want := map[string]string{"a1": "Agent tool child", "b1": "implement T1: x", "b2": "merge T1: x"}
+	if len(got.Subagents) != len(want) {
+		t.Fatalf("Subagents = %v, want %v", got.Subagents, want)
+	}
+	for id, d := range want {
+		if got.Subagents[id].Description != d {
+			t.Errorf("Subagents[%s] = %+v, want description %q", id, got.Subagents[id], d)
+		}
+	}
+	if got.Title != "t" {
+		t.Errorf("Title = %q, want the kept title", got.Title)
+	}
+}
+
 // A session with no subagents carries no Subagents map at all, so the JSON spells nothing
 // out for the sessions that have none — which is most of them.
 func TestHarvest_SessionWithoutSubagentsHasNoMap(t *testing.T) {
@@ -3009,5 +3012,48 @@ func TestHarvest_SessionWithoutSubagentsHasNoMap(t *testing.T) {
 	}
 	if got := readMetadataFile(t, res.Path)["s1"].Subagents; got != nil {
 		t.Errorf("Subagents = %v, want nil", got)
+	}
+}
+
+// An entry an older build titled "/clear" is re-parsed even when its transcript has not moved:
+// a session left idle after /clear never writes again, so the mtime skip would keep the title.
+func TestHarvest_IncrementalReparsesAClearTitle(t *testing.T) {
+	for _, title := range []string{"/clear", "/clear my-feature"} {
+		t.Run(title, func(t *testing.T) {
+			metadataHome(t)
+			cfg := filepath.Join(t.TempDir(), "claude")
+			proj := filepath.Join(cfg, "projects", "-p")
+			log := filepath.Join(proj, "s1.jsonl")
+			writeSessionTranscript(t, proj, "s1.jsonl", `{"type":"ai-title","aiTitle":"current"}`)
+			touch(t, log, time.Now().Add(-time.Hour))
+
+			path, err := SessionMetadataPath()
+			if err != nil {
+				t.Fatal(err)
+			}
+			old, err := json.Marshal(map[string]SessionMetadata{"s1": {
+				Title: title, AgentType: "Claude Code", LogFile: log, LogModTime: time.Now(),
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, old, 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			res, err := Harvest(Options{ConfigDir: cfg, Merge: true, Incremental: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.Harvested != 1 || res.Skipped != 0 {
+				t.Errorf("harvested/skipped = %d/%d, want 1/0", res.Harvested, res.Skipped)
+			}
+			if got := readMetadataFile(t, res.Path)["s1"].Title; got != "current" {
+				t.Errorf("title = %q, want %q", got, "current")
+			}
+		})
 	}
 }

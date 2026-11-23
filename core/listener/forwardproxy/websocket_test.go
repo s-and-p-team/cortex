@@ -42,6 +42,8 @@ type wsOrigin struct {
 	creates []map[string]any
 	// sawExtensions is the Sec-WebSocket-Extensions offer the handshake reached it with.
 	sawExtensions string
+	// answer, when set, is the events the origin sends for turn n instead of turnEvents.
+	answer func(n int) []string
 }
 
 // wsHost is the name the origin is addressed by. It must be one of OpenAI's: the
@@ -132,7 +134,13 @@ func (o *wsOrigin) serve(conn net.Conn, br *bufio.Reader) {
 			continue
 		}
 		turn++
-		for _, ev := range turnEvents(turn) {
+		o.mu.Lock()
+		events := turnEvents
+		if o.answer != nil {
+			events = o.answer
+		}
+		o.mu.Unlock()
+		for _, ev := range events(turn) {
 			_, _ = conn.Write(wsframe.Encode(wsframe.OpText, []byte(ev), false))
 		}
 	}
@@ -249,7 +257,6 @@ func (h *wsHarness) dial(t *testing.T, extra http.Header) *wsClient {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = raw.Close() })
-	_ = raw.SetDeadline(time.Now().Add(15 * time.Second))
 	connect, _ := http.NewRequest(http.MethodConnect, "//"+authority, nil)
 	connect.Host, connect.URL.Host = authority, authority
 	if err := connect.Write(raw); err != nil {
@@ -345,29 +352,24 @@ func responseCreate(text string) string {
 // events reads the session's rows once the socket has closed and recorded its close.
 func (h *wsHarness) events(t *testing.T, sid string, wantClose bool) []pipeline.SessionEvent {
 	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
-	for {
+	var got []pipeline.SessionEvent
+	eventually(t, h.store, func() bool {
 		v := h.store.View(sid)
-		if v != nil {
-			if !wantClose {
-				return v.Events
-			}
-			for _, e := range v.Events {
-				if e.Tunnel && e.Phase == pipeline.SessionResponse {
-					return v.Events
-				}
+		if v == nil {
+			return false
+		}
+		got = v.Events
+		if !wantClose {
+			return true
+		}
+		for _, e := range v.Events {
+			if e.Tunnel && e.Phase == pipeline.SessionResponse {
+				return true
 			}
 		}
-		if time.Now().After(deadline) {
-			if v == nil {
-				t.Fatalf("no session %q", sid)
-			}
-			// Failing here, not returning what there is: a slow run would otherwise
-			// fail later, on an assertion about rows that had not landed yet.
-			t.Fatalf("session %q has no WebSocket close row after 10s (%d events)", sid, len(v.Events))
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+		return false
+	}, "session "+sid+"'s WebSocket close row")
+	return got
 }
 
 const codexSID = "11111111-2222-3333-4444-555555555555"
@@ -435,11 +437,29 @@ func TestResponsesWebSocket_TurnsAreParsedLikeHTTPS(t *testing.T) {
 		}
 		t.Fatalf("got %d turn rows, want 4 (two request/response pairs)", len(turns))
 	}
+	// Paired by RequestID, as agentop pairs them, not by position. relayDown forwards a
+	// turn's last frame before it records the turn's response row, so the client's next
+	// turn can record its request row first: request 1, request 2, response 1, response 2.
+	var reqs []pipeline.SessionEvent
+	resps := map[string]pipeline.SessionEvent{}
+	for _, e := range turns {
+		if e.Phase == pipeline.SessionRequest {
+			reqs = append(reqs, e)
+		} else {
+			resps[e.RequestID] = e
+		}
+	}
+	if len(reqs) != 2 {
+		t.Fatalf("got %d turn request rows, want 2", len(reqs))
+	}
+	if reqs[0].RequestID == reqs[1].RequestID {
+		t.Fatal("the two turns share a RequestID; each needs its own")
+	}
 	wantInput := []int{12862, 13002}
-	for i := 0; i < 2; i++ {
-		req, res := turns[2*i], turns[2*i+1]
-		if req.Phase != pipeline.SessionRequest || res.Phase != pipeline.SessionResponse || req.RequestID != res.RequestID {
-			t.Errorf("turn %d rows do not pair: %+v / %+v", i+1, req, res)
+	for i, req := range reqs {
+		res, ok := resps[req.RequestID]
+		if !ok || res.Phase != pipeline.SessionResponse {
+			t.Errorf("turn %d request row %+v has no response row with its RequestID", i+1, req)
 			continue
 		}
 		if req.Inference == nil || req.Inference.Model != "gpt-6-luna" || len(req.Inference.Messages) != 1 {
@@ -460,13 +480,76 @@ func TestResponsesWebSocket_TurnsAreParsedLikeHTTPS(t *testing.T) {
 			t.Errorf("turn %d response parse: completion=%q out=%d total=%d", i+1, inf.Completion, inf.CompletionTokens, inf.TotalTokens)
 		}
 	}
-	if turns[0].RequestID == turns[2].RequestID {
-		t.Error("the two turns share a RequestID; each needs its own")
-	}
 	// Turns sit between the socket's open and close in the timeline.
 	if !(opens[0].Seq < turns[0].Seq && turns[3].Seq < closes[0].Seq) {
 		t.Errorf("order: open %d, turns %d..%d, close %d", opens[0].Seq, turns[0].Seq, turns[3].Seq, closes[0].Seq)
 	}
+}
+
+// A parsed turn is an open inference response like any other, so the store publishes its live byte
+// count while it streams and drops it when the turn ends (#1861).
+func TestResponsesWebSocket_OpenTurnPublishesItsLiveCount(t *testing.T) {
+	// Hold the turn open at its second event: the first is relayed and counted by then.
+	gate := &frameGate{streamingProbe: newStreamingProbe(false), at: 2, reached: make(chan struct{}), release: make(chan struct{})}
+	h := newWSHarness(t, config.ResponsesWebSocketsParse, gate)
+	var relOnce sync.Once
+	rel := func() { relOnce.Do(func() { close(gate.release) }) }
+	t.Cleanup(rel) // before the harness's cleanup, which waits on the origin
+
+	c := h.dial(t, nil)
+	if c.status != http.StatusSwitchingProtocols {
+		t.Fatalf("handshake answered %d (%s), want 101", c.status, c.body)
+	}
+	defer c.close()
+	c.send(responseCreate("hello"))
+	<-gate.reached
+
+	// The turn's own request row names the stream, as an HTTPS request's does.
+	var id string
+	if v := h.store.View(codexSID); v != nil {
+		for _, e := range v.Events {
+			if e.Phase == pipeline.SessionRequest && !e.Tunnel {
+				id = e.RequestID
+			}
+		}
+	}
+	if id == "" {
+		t.Fatal("the turn recorded no request row")
+	}
+	// The first frame reached the client, so it is counted: a permanent zero must fail here.
+	if n, ok := h.store.StreamBytes(id); !ok || n <= 0 {
+		t.Fatalf("StreamBytes(%q) = (%d, %v) with a frame relayed, want a positive count", id, n, ok)
+	}
+
+	rel()
+	c.readUntil("response.completed")
+	// The relay ends a turn before it carries the next one's answer, so the socket stays
+	// open and the count is gone once the second turn's answer arrives.
+	c.send(responseCreate("again"))
+	c.readUntil("response.completed")
+	if _, ok := h.store.StreamBytes(id); ok {
+		t.Fatalf("StreamBytes(%q) still answers after the turn ended", id)
+	}
+}
+
+// frameGate blocks the at-th data frame of a response until release closes, and closes
+// reached when that frame arrives.
+type frameGate struct {
+	*streamingProbe
+	at      int
+	seen    int
+	reached chan struct{}
+	release chan struct{}
+}
+
+func (g *frameGate) OnResponseFrame(ctx context.Context, pctx *pipeline.Context, frame []byte, last bool) pipeline.Action {
+	if !last {
+		if g.seen++; g.seen == g.at {
+			close(g.reached)
+			<-g.release
+		}
+	}
+	return g.streamingProbe.OnResponseFrame(ctx, pctx, frame, last)
 }
 
 // Compression would make every frame unreadable, so the offer never reaches the origin.
@@ -1012,6 +1095,7 @@ func TestResponsesWebSocket_ReloadMidTurnFinishesOnTheTurnsPipeline(t *testing.T
 		_, _ = fr.ReadFrame()
 	})
 	c := h.dial(t, nil)
+	handshake := h.holder.Load().Held()
 	c.send(responseCreate("hello"))
 	<-midTurn
 
@@ -1022,7 +1106,11 @@ func TestResponsesWebSocket_ReloadMidTurnFinishesOnTheTurnsPipeline(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
+	old := h.holder.Load()
 	h.holder.Store(fresh)
+	if n := old.Held(); n != handshake+1 {
+		t.Errorf("Held = %d mid-turn, want %d: the open turn must hold the pipeline it began on", n, handshake+1)
+	}
 	close(resume)
 	c.readUntil("response.completed")
 	c.close()
@@ -1045,11 +1133,10 @@ func TestResponsesWebSocket_ReloadMidTurnFinishesOnTheTurnsPipeline(t *testing.T
 //
 // The turn is just over that 10 MB, not far over it: the size is what the test is about,
 // and parsing it is the costliest thing in this file — under -race it is ~3s on a laptop
-// and was over 15s on a shared CI runner. The read deadline is raised for the same reason.
+// and was over 15s on a shared CI runner.
 func TestResponsesWebSocket_LargeFirstTurnIsParsed(t *testing.T) {
 	h := newWSHarness(t, config.ResponsesWebSocketsParse)
 	c := h.dial(t, nil)
-	_ = c.conn.SetDeadline(time.Now().Add(60 * time.Second))
 	big := strings.Repeat("x", maxBodySize+1<<20)
 	c.send(responseCreate(big))
 	c.readUntil("response.completed")

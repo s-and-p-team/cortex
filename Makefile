@@ -1,7 +1,7 @@
 # Root Makefile for cortex monorepo
 # Orchestrates linting and formatting across all sub-projects
 
-.PHONY: lint fmt pre-commit build-proxy-init pricing-table agentop cortex cortex-cpex dev-install help
+.PHONY: lint fmt test coverage pre-commit build-proxy-init pricing-table agentop cortex dev-install help
 
 BIN_DIR := $(CURDIR)/bin
 
@@ -31,6 +31,22 @@ fmt: ## Run formatters across all sub-projects
 pre-commit: ## Install pre-commit hooks (including commit-msg)
 	pre-commit install --hook-type pre-commit --hook-type commit-msg
 
+##@ Tests
+
+# Both run scripts/dev/go-coverage.sh over the Go modules that ship in a binary, with
+# -short: it skips cmd/agentop's setup, service, doctor and uninstall scenes, and a
+# run takes about 2 minutes instead of 7. `make test` also shards agentop's root
+# package (scripts/dev/go-test-shards.sh); `make coverage` does not, because that
+# script writes no profile. CI runs the full suite. For the same here, clear the flags:
+# `make test TEST_FLAGS=`. To add the race detector: `TEST_FLAGS="-short -race"`.
+TEST_FLAGS ?= -short
+
+test: ## Run the unit tests, -short by default (TEST_FLAGS= for the full suite)
+	scripts/dev/go-coverage.sh $(TEST_FLAGS)
+
+coverage: ## Run the unit tests and print the coverage of the CLI (agentop) and the proxy (cortex)
+	scripts/dev/go-coverage.sh -cover $(TEST_FLAGS)
+
 ##@ Sub-project Targets
 
 build-proxy-init: ## Build the proxy-init iptables init container
@@ -57,7 +73,8 @@ endif
 # list stays in sync without hand-maintenance. agentop links no plugins.
 
 # The commit agentop's title bar names, from git run in this tree. Go's own VCS stamp is wrong
-# in a .worktrees/ checkout: it takes the enclosing checkout's HEAD and dirty state.
+# in an in-repo worktree (.claude/worktrees/, .worktrees/): it takes the enclosing
+# checkout's HEAD and dirty state.
 AGENTOP_REV = $(shell git rev-parse --short=8 HEAD 2>/dev/null)
 AGENTOP_REVISION = $(if $(AGENTOP_REV),$(AGENTOP_REV)$(shell git status --porcelain 2>/dev/null | grep -q . && echo +dirty))
 
@@ -82,30 +99,6 @@ cortex: ## Build cortex to ./bin/cortex (PROFILE=full|lite|local, default full)
 		echo "→ building cortex (profile $(or $(PROFILE),full)): $$TAGS" && \
 		cd cmd/cortex && \
 		GOWORK=off go build -tags "$$TAGS" -o $(BIN_DIR)/cortex .
-
-# cortex with the cpex plugin: the `fullcpex` profile (full plus cpex) and the
-# `cpex` tag, linked against the pinned libcpex_ffi.a that scripts/fetch-cpex-ffi.sh
-# downloads and verifies for this host (linux amd64/arm64, darwin arm64). Needs cgo:
-# a C toolchain (Xcode Command Line Tools on macOS) and cosign for the signature
-# check. The binary is still called `cortex`; it goes to its own directory so it
-# does not replace the default build that dev-install installs.
-# CPEX_FFI_DIR=<dir> links that directory's libcpex_ffi.a instead, for a local
-# CPEX build; nothing is downloaded or verified then.
-CORTEX_CPEX_DIR := $(BIN_DIR)/cortex-cpex
-CPEX_FFI_DIR ?=
-
-cortex-cpex: ## Build cortex with the cpex plugin (cgo) to ./bin/cortex-cpex/cortex
-	@mkdir -p $(CORTEX_CPEX_DIR)
-	@# On macOS, link for the SDK the Go objects are built against, or ld warns
-	@# that every object targets a newer macOS than the binary.
-	@FFI=$(if $(CPEX_FFI_DIR),$(abspath $(CPEX_FFI_DIR)),$$(bash scripts/fetch-cpex-ffi.sh)) && \
-		TAGS="cpex,$$(go -C scripts/profile-tags run . fullcpex)" && \
-		if [ "$$(uname -s)" = Darwin ]; then \
-			export MACOSX_DEPLOYMENT_TARGET=$${MACOSX_DEPLOYMENT_TARGET:-$$(xcrun --show-sdk-version)}; \
-		fi && \
-		echo "→ building cortex (profile fullcpex, cpex FFI $$FFI): $$TAGS" && \
-		cd cmd/cortex && \
-		CGO_ENABLED=1 CGO_LDFLAGS="-L$$FFI" GOWORK=off go build -tags "$$TAGS" -o $(CORTEX_CPEX_DIR)/cortex .
 
 ##@ Local Dev
 

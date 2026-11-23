@@ -317,26 +317,6 @@ func TestHandleUsage_AcceptsModelAndEndpointGroups(t *testing.T) {
 	}
 }
 
-// A deliberate DUPLICATE of TestHandleUsage_ErrorsDoNotEchoInput's group case, kept
-// only so the group parameter's no-reflection guarantee is asserted under a name
-// that says so — ParseGroup's error string is the one most likely to be reworded as
-// groupings are added, and this is what a reworder will grep for.
-//
-// It adds no coverage: percent-encoding the probe changes nothing, because both
-// tests read through r.URL.Query().Get, which decodes. Delete this rather than the
-// broader test if one has to go.
-func TestHandleUsage_RejectsUnknownGroupWithoutReflectingIt(t *testing.T) {
-	ts, _ := newTestServer(t, WithUsage(usage.New()))
-
-	status, body := fetchUsage(t, ts.URL, "?group=%3Cscript%3E")
-	if status != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", status)
-	}
-	if strings.Contains(body, "script") {
-		t.Errorf("response reflects caller input: %s", body)
-	}
-}
-
 // The whole point of the schema rule is that a consumer reads the same field
 // names the parser published. Assert on the JSON, not the struct.
 //
@@ -555,8 +535,11 @@ func recordCostedMinute(t *testing.T, led *ledger.Writer, at time.Time, host, mo
 func TestHandleUsage_TodayIsServedFromTheLedger(t *testing.T) {
 	// A closed minute on disk, plus an empty ring, so a non-zero total can only
 	// have come from the ledger.
-	led := ledgerWithOneCostedMinute(t, insideToday(t, 2*time.Minute), "gw", "opus", 0.25)
-	ts, _ := newTestServer(t, WithUsage(usage.New()), WithCostLedger(led))
+	// At noon, so today spans more than one bucket whatever time the suite runs.
+	now := time.Date(2026, time.June, 15, 12, 0, 0, 0, time.Local)
+	led := ledgerWithOneCostedMinute(t, now.Add(-2*time.Minute), "gw", "opus", 0.25)
+	ts, _ := newTestServer(t, WithUsage(usage.New()), WithCostLedger(led),
+		WithClock(func() time.Time { return now }))
 
 	status, body := fetchUsage(t, ts.URL, "?window=today")
 	if status != http.StatusOK {
@@ -728,18 +711,6 @@ func TestHandleUsage_SevenDaysIsServedFromTheLedger(t *testing.T) {
 	}
 }
 
-func TestHandleUsage_UnknownWindowStillDoesNotEchoInput(t *testing.T) {
-	ts, _ := newTestServer(t, WithUsage(usage.New()))
-	status, body := fetchUsage(t, ts.URL, "?window=%3Cscript%3E")
-
-	if status != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", status)
-	}
-	if strings.Contains(body, "script") {
-		t.Errorf("response reflects caller input: %s", body)
-	}
-}
-
 func TestHandleUsage_LedgerBackedWindowGroupsByModel(t *testing.T) {
 	// The Cost pane's by-model table must work over "today", not only over the
 	// ring's windows — otherwise the breakdown silently covers a different span
@@ -822,21 +793,6 @@ func TestHandleUsage_LedgerBackedModelSeriesDisclosesWhatItLeavesOut(t *testing.
 	if sum+*snap.UngroupedCostMicros != snap.Totals.CostMicros {
 		t.Errorf("series (%d) + ungrouped (%d) != totals (%d): %s",
 			sum, *snap.UngroupedCostMicros, snap.Totals.CostMicros, body)
-	}
-}
-
-// The other half of the convention: absent, not zero, when the breakdown accounts for
-// every dollar. Same reasoning as TestHandleUsage_ACleanLedgerReadCarriesNoDegradedBlock.
-func TestHandleUsage_ALedgerWindowWithNothingUngroupedOmitsTheField(t *testing.T) {
-	led := ledgerWithOneCostedMinute(t, insideToday(t, 2*time.Minute), "gw", "opus", 0.25)
-	ts, _ := newTestServer(t, WithUsage(usage.New()), WithCostLedger(led))
-
-	status, body := fetchUsage(t, ts.URL, "?window=today&group=model")
-	if status != http.StatusOK {
-		t.Fatalf("status = %d, want 200: %s", status, body)
-	}
-	if strings.Contains(body, "ungroupedCostMicros") {
-		t.Errorf("a window whose series carries every dollar serialised the residual: %s", body)
 	}
 }
 

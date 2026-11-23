@@ -52,10 +52,10 @@ import (
 	"github.com/rossoctl/cortex/core/cost/pricing"
 	"github.com/rossoctl/cortex/core/cost/usage"
 
-	"github.com/rossoctl/cortex/core/pipeline"
+	"github.com/rossoctl/cortex/core/model"
 )
 
-// Row is one minute's totals for one (endpoint, model, agent, provenance) key.
+// Row is one minute's totals for one (endpoint, model, agent, provenance, project) key.
 //
 // usage.Counts is EMBEDDED rather than restated so the ledger, /v1/usage and any
 // future collector share one vocabulary: a field added there appears here, and a
@@ -76,7 +76,7 @@ type Row struct {
 	Model    string `json:"model,omitempty"`
 	// Agent identifies the calling coding agent, as "name/version" —
 	// "claude-code/2.1.14" — or as its raw User-Agent when the parser did not
-	// recognise it. Populated from pipeline.EventClient.Label; see Writer.Record.
+	// recognise it. Populated from model.EventClient.Label; see Writer.Record.
 	//
 	// CLIENT-ASSERTED AND TRIVIALLY SPOOFABLE, because it is derived from a request
 	// header: a cost-attribution and display key, never an authorization subject.
@@ -98,6 +98,15 @@ type Row struct {
 	//     sources differ in representation and agree in meaning; nothing a client sees
 	//     differs.
 	Agent string `json:"agent,omitempty"`
+	// Project is SessionEvent.RollupProject: the git repo root of the agent process's cwd,
+	// or of the parent session's process for a headless run. Stored as written, "" for
+	// absent and never "unknown", for the reason Agent gives; labelFor maps "" to
+	// usage.UnknownProjectLabel at the query boundary.
+	Project string `json:"project,omitempty"`
+	// OwnProject is SessionEvent.Project when the row has a parent project, else "". Part of
+	// the key. The importer matches a transcript turn on it, because a transcript names
+	// the run's own project and not its parent's.
+	OwnProject string `json:"ownProject,omitempty"`
 	// Provenance is part of the KEY, not a summary of the row: one minute can mix a
 	// gateway's own figures with modelled ones, and a single provenance per row
 	// would have to pick a winner. Keying on it keeps /v1/usage's pricedBy
@@ -129,6 +138,11 @@ type Row struct {
 	// neither dollars nor credits.
 	Currency string `json:"currency,omitempty"`
 
+	// Source is event.SourceTranscript when an import wrote the event, else "". Part of
+	// the key, so imported spend and live spend in one minute stay two rows. Omitted for
+	// live rows, so their bytes do not change.
+	Source string `json:"source,omitempty"`
+
 	usage.Counts
 }
 
@@ -146,7 +160,12 @@ func (r Row) currencyOrUSD() string {
 
 // key is the in-memory accumulation key. Mirrors the JSON identity fields exactly.
 type key struct {
-	endpoint, model, agent, provenance string
+	endpoint, model, agent, provenance, project string
+	// ownProject is Row.OwnProject.
+	ownProject string
+	// source is Row.Source. It is a closed set that this process writes, so the overflow
+	// row keeps it, as it keeps the unit.
+	source string
 	// currency is NORMALISED — defaulted and lower-cased — where the others are verbatim, and
 	// both halves of that are load-bearing.
 	//
@@ -162,7 +181,7 @@ type key struct {
 }
 
 func (r Row) key() key {
-	return key{r.Endpoint, r.Model, r.Agent, r.Provenance, strings.ToLower(r.currencyOrUSD())}
+	return key{r.Endpoint, r.Model, r.Agent, r.Provenance, r.Project, r.OwnProject, r.Source, strings.ToLower(r.currencyOrUSD())}
 }
 
 // maxLabelLen bounds one label ON DISK. It is event.MaxLabelLen, so a model name is
@@ -178,7 +197,7 @@ func (r Row) key() key {
 // future read, invisible in the API's totals and unfixable because the file is
 // append-only. Measured: $3.00 of a $3.25 day gone to one 1 MiB model name.
 //
-// So the cap is on the WRITE side, where it is absolute. Four labels at 96 bytes
+// So the cap is on the WRITE side, where it is absolute. Five labels at 96 bytes
 // plus a timestamp and the numeric counters put the longest line this package can
 // emit at well under a kilobyte, three orders of magnitude below maxLineBytes —
 // which is what turns readDay's over-long-line guard from a live failure mode into
@@ -195,7 +214,7 @@ const maxLabelLen = event.MaxLabelLen
 // model name repositions the cursor, recolors the pane or erases the line that reports it,
 // for every future read of a file that is retained for retentionDays and cannot be edited.
 // CWE-150. This is the primary guard for Endpoint, Model and Provenance, and defence in
-// depth for Agent, which pipeline.ParseUserAgent already sanitized.
+// depth for Agent, which model.ParseUserAgent already sanitized.
 //
 // THE ORDER MATTERS. Sanitising can triple a string's length — every replaced byte becomes
 // three — so capping first would let a label of 96 control bytes reach 288 on disk and break
@@ -203,14 +222,20 @@ const maxLabelLen = event.MaxLabelLen
 // boundary, so it cannot split one of the sanitizer's own U+FFFD runes and put an invalid
 // UTF-8 fragment in a durable row.
 func rowLabel(s string) string {
-	return pipeline.TruncateLabel(pipeline.SanitizeControlRunes(s), maxLabelLen)
+	return model.TruncateLabel(model.SanitizeControlRunes(s), maxLabelLen)
+}
+
+// projectRowLabel is rowLabel for Row.Project, but it keeps the END of a long path: the end
+// names the repo, so a cut from the end would merge two repos with one long prefix.
+func projectRowLabel(s string) string {
+	return model.TruncateLabelTail(model.SanitizeControlRunes(s), maxLabelLen)
 }
 
 // maxLabelsPerMinute caps how many DISTINCT rows one open minute accumulates, and
 // it is usage.maxLabelsPerBucket's 64, again matched rather than re-chosen.
 //
 // TIGHTER THAN THE RING'S, and knowingly: usage applies 64 per axis, to independent
-// marginals, while the key here is the (endpoint, model, agent, provenance) JOINT
+// marginals, while the key here is the (endpoint, model, agent, provenance, project) JOINT
 // tuple, so 64 bounds the product rather than each factor. That is the bound this
 // package needs, because the map is not the only cost — every entry is also copied
 // into a batch by takeLocked on a minute roll, which happens INSIDE
@@ -236,9 +261,9 @@ const maxLabelsPerMinute = 64
 const overflowLabel = "(other)"
 
 // overflowKeyFor is the reserved accumulator slot every label past the cap folds
-// into, one per unit. currency is the key's own, already normalised.
+// into, one per unit and source. currency is the key's own, already normalised.
 //
-// ALL FOUR labels, not just the request-controlled two: the key is a tuple, so
+// ALL FIVE labels, not just the request-controlled two: the key is a tuple, so
 // keeping any real label would let the overflow row multiply on that axis and defeat
 // the bound it exists to enforce. The consequence is that a capped minute reports its
 // excess as "(other)" on every axis at once, which reads as "cardinality was capped
@@ -248,13 +273,14 @@ const overflowLabel = "(other)"
 // Row.Currency exists to prevent, and a unit cannot multiply the row the way a label
 // can: it is the rate table's answer, one of the units the table was configured with,
 // not a string a request supplies.
-func overflowKeyFor(currency string) key {
-	return key{overflowLabel, overflowLabel, overflowLabel, overflowLabel, currency}
+func overflowKeyFor(source, currency string) key {
+	return key{overflowLabel, overflowLabel, overflowLabel, overflowLabel, overflowLabel, "", source, currency}
 }
 
 // overflow rewrites a row's labels onto overflowKeyFor's, keeping its unit, At and
 // every counter. The figures are unchanged; only the attribution is coarsened.
 func overflow(r Row) Row {
-	r.Endpoint, r.Model, r.Agent, r.Provenance = overflowLabel, overflowLabel, overflowLabel, overflowLabel
+	r.Endpoint, r.Model, r.Agent, r.Provenance, r.Project = overflowLabel, overflowLabel, overflowLabel, overflowLabel, overflowLabel
+	r.OwnProject = ""
 	return r
 }

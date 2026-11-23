@@ -10,9 +10,13 @@
 //
 // ON DISK: one directory per session id, holding append-only segments. A segment is one zstd
 // stream of JSON lines; each line is either a string record or an event record, and an
-// event's large strings — exactly the five fields the interner shares — are written as
+// event's large strings — exactly the seven fields the interner shares — are written as
 // references to string records earlier in the same segment. See format.go for the records,
 // segment.go and reader.go for the stream, and retention.go for what gets deleted.
+//
+// A request event can also carry its request exactly as it crossed the proxy: a lossless
+// capture, for replay. Its bodies are split at byte offsets into block records, each written
+// once per segment, and rebuilt byte for byte; see capture.go.
 //
 // Files rather than SQLite, on measured grounds: the engine changed the size by about 3%, a
 // pure-Go SQLite driver adds 4MB to every binary while zstd adds nothing (it is already

@@ -61,8 +61,12 @@ jobs:
       - name: Build
         run: go build -v ./...
 
+      # Prints the module's total statement coverage as the last line, for a future
+      # coverage gate. `make coverage` reports the same figures locally.
       - name: Test
-        run: go test -v -race -cover ./...
+        run: |
+          go test -v -race -coverprofile=cover.out ./...
+          go tool cover -func=cover.out | tail -1
 
   # core/peerproc reads the macOS kernel's TCP table by byte offset and checks its record
   # sizes against the layout it was written for, so only a macOS runner exercises that
@@ -106,15 +110,73 @@ jobs:
         run: |
           TAGS=$(go -C ../../scripts/profile-tags run . local)
           go build -tags "${TAGS}" ./...
+          go vet -tags "praxis_e2e,${TAGS}" .
           go test -race -tags "${TAGS}" ./...
 
+      # AGENTOP_LAUNCHD_TESTS=required turns a skip in the real-launchd tests into a
+      # failure, as AGENTOP_SYSTEMD_TESTS=required does on Linux. They need a desktop
+      # session to load a launch agent into, and GitHub's macOS runners have one: they
+      # log the runner user in automatically at boot.
       - name: Build and test cmd/agentop
         working-directory: cmd/agentop
         env:
           GOWORK: "off"
+          AGENTOP_LAUNCHD_TESTS: required
         run: |
           go build ./...
           go test -race ./...
+
+  # Windows (#1520): core and the laptop proxy must keep building, and the session archive and
+  # cost ledger must keep writing where a directory is flushed only through a write handle and
+  # cannot be renamed with a file open in it. Only those packages' tests run: the rest of core
+  # and cmd/cortex still have Unix-only tests (Setpgid, SIGUSR1), and agentop does not build
+  # yet. No -race: the race detector needs cgo and a C toolchain on the runner.
+  go-ci-windows:
+    name: Go CI (Windows build, archive and ledger)
+    runs-on: windows-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    env:
+      GOWORK: "off"
+    steps:
+      # .claude/skills has directories with a colon in their names, which Windows cannot
+      # create, so a plain checkout fails. Leave .claude/ out of the worktree. Git still
+      # refuses those paths in the index (core.protectNTFS), even as skip-worktree entries,
+      # so turn that check off for this step only. actions/checkout passes the step's env to
+      # git, and GIT_CONFIG_* applies to every git call it makes.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        env:
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: core.protectNTFS
+          GIT_CONFIG_VALUE_0: "false"
+        with:
+          sparse-checkout: |
+            /*
+            !/.claude/
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version-file: core/go.mod
+          cache-dependency-path: core/go.sum
+
+      - name: Build core
+        working-directory: core
+        run: go build ./...
+
+      - name: Vet and test bootstrap, the session archive and the cost ledger
+        working-directory: core
+        run: |
+          go vet ./bootstrap/... ./session/archive/... ./cost/ledger/...
+          go test ./bootstrap/... ./session/archive/... ./cost/ledger/...
+
+      - name: Build cmd/cortex (local profile)
+        working-directory: cmd/cortex
+        run: |
+          TAGS=$(go -C ../../scripts/profile-tags run . local)
+          go build -tags "${TAGS}" ./...
 
   # The cpex plugin's FFI-backed code sits behind the `cpex` build tag and needs
   # cgo plus the pinned libcpex_ffi.a, so no other job compiles or tests it. It
@@ -180,7 +242,7 @@ jobs:
           go test -v -count=1 -tags cpex ./plugins/cpex/...
 
       # cmd/cortex is the binary for both cpex artifacts: the authbridge-cpex
-      # image (the `cpex` profile) and the laptop build (`fullcpex`).
+      # image (the `cpex` profile) and full plus cpex (`fullcpex`).
       - name: Vet, build and test cmd/cortex with cpex
         if: steps.changes.outputs.run == 'true'
         working-directory: cmd/cortex
@@ -263,35 +325,9 @@ jobs:
           go vet ./...
 
       - name: Test
-        run: go test -v -race -cover ./...
-
-  # The demo modules build against core through a replace directive, so a core
-  # API change can break them; nothing else compiles them.
-  go-ci-demos:
-    name: Go CI (demos/${{ matrix.demo }})
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    strategy:
-      fail-fast: false
-      matrix:
-        demo: [echo, finance-sparc, ibac]
-    defaults:
-      run:
-        working-directory: demos/${{ matrix.demo }}
-    env:
-      GOWORK: "off"
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
-        with:
-          go-version-file: demos/${{ matrix.demo }}/go.mod
-          cache-dependency-path: demos/${{ matrix.demo }}/go.sum
-
-      - name: Vet and build
         run: |
-          go vet ./...
-          go build ./...
+          go test -v -race -coverprofile=cover.out ./...
+          go tool cover -func=cover.out | tail -1
 
   go-ci-readme-demo:
     name: Go CI (README demo)
@@ -339,13 +375,10 @@ jobs:
           # everywhere else resolved it, and the per-module release build did
           # not — surfacing only when a tag was cut.
           - agentop
-          # cortex-praxis was in no workflow at all, which is how it ended
-          # up broken under GOWORK=off by the same missing go.sum entry. Any
-          # cmd/* module absent from every workflow will drift this way — the
+          # Any cmd/* module absent from every workflow drifts this way: the
           # workspace hides exactly this class of breakage. (cmd/cortex's cpex
           # builds need CGO and libcpex_ffi.a from a pinned release, so
           # go-ci-cpex covers them instead.)
-          - cortex-praxis
     defaults:
       run:
         working-directory: cmd/${{ matrix.binary }}
@@ -386,7 +419,8 @@ jobs:
             echo "::group::profile ${profile}"
             TAGS=$(go -C ../../scripts/profile-tags run . "${profile}")
             go build -v -tags "${TAGS}" ./...
-            go test -race -cover -tags "${TAGS}" ./...
+            go test -race -coverprofile=cover.out -tags "${TAGS}" ./...
+            echo "coverage (profile ${profile}): $(go tool cover -func=cover.out | tail -1)"
             echo "::endgroup::"
           done
 
@@ -414,7 +448,9 @@ jobs:
       - name: Test
         env:
           AGENTOP_SYSTEMD_TESTS: ${{ matrix.binary == 'agentop' && 'required' || '' }}
-        run: go test -v -race -cover ./...
+        run: |
+          go test -v -race -coverprofile=cover.out ./...
+          go tool cover -func=cover.out | tail -1
 
   proxy-init-iptables:
     name: proxy-init iptables rules
@@ -516,6 +552,18 @@ jobs:
 
       - name: Run release_notes.sh tests
         run: sh scripts/release_notes_test.sh
+
+  # check-gateway-linkage.sh runs only at release time, so without this job a
+  # regression in it would show only on a release.
+  gateway-linkage-script:
+    name: check-gateway-linkage.sh tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Run check-gateway-linkage.sh tests
+        run: sh scripts/check-gateway-linkage_test.sh
 
   # `go mod tidy -diff` on every module in the repo. GOWORK=off so
   # replace directives resolve as they do in build.yaml and

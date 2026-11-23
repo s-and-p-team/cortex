@@ -60,9 +60,9 @@ One HTTP exchange through the sidecar produces two OTLP spans.
   emitting the response span was recovered by the pipeline (a WARN is logged); the response span
   was emitted but lost — the two halves enter a batching exporter an exchange apart, so a response
   can be lost after its request has flushed; or the exchange outlived a config hot-reload — old
-  pipelines stop a drain window (default 30 s) after the swap, and a response span emitted into
-  the old, already-shut-down provider is dropped, which is routine for SSE or LLM exchanges
-  longer than the window. The consumer renders it as in-flight, never as a wrong
+  pipelines stop once no request holds them or the drain window (default 10 min) expires, and a
+  response span emitted into the old, already-shut-down provider is dropped, which happens only
+  for exchanges longer than the window. The consumer renders it as in-flight, never as a wrong
   pairing. A response span whose `lineage.outcome` is absent derives with `error` NULL (honest
   unknown), never `false`.
 - **Scope of `denied`.** The lineage plugin runs after the gate plugins and the pipeline
@@ -72,9 +72,12 @@ One HTTP exchange through the sidecar produces two OTLP spans.
   Spans for gate-denied traffic are a named follow-up, not current behaviour.
 - **Bypass.** Requests whose path matches a `bypass_paths` glob, and outbound requests whose
   host matches a `bypass_hosts` glob (both `path.Match`; hosts port-stripped and case folded,
-  paths query-stripped and normalized), produce no spans
-  (defaults in §6). `bypass_hosts` is outbound-only: an inbound `Host` is the caller's own header,
-  so honouring it there would let a caller suppress the record of its own request.
+  paths canonical only), produce no spans
+  (defaults in §6). A path with a dot segment, a doubled slash, or a `;`, `\`, `%` or `?`
+  after decoding never matches, and a trailing slash matches only a glob that ends in one,
+  so such a request produces spans. `bypass_hosts` is outbound-only: an inbound `Host` is the
+  caller's own header, so honouring it there would let a caller suppress the record of its own
+  request.
 
 ## 3. Trace context on the wire
 
@@ -274,7 +277,7 @@ construction.
 | `max_attr_bytes` | `256` | cap on every variable-content string attribute and the span name (§4), except the two identity facts `lineage.self.id` and `lineage.self.namespace`, which are operator configuration and never truncated; same `0` / `-1` / negative semantics as `max_payload_bytes` |
 | `export_delay_ms` | `0` | the longest a recorded span waits in the batch exporter before it is sent, `0` or unset the SDK's own 5000 ms; a negative value is refused at start. Spans and wire unchanged: it sets only when a span leaves |
 | `mint_traceparent` | `true` | §3.3; `false` = a pure observer that never writes a `traceparent` |
-| `bypass_paths` | `/.well-known/*`, `/healthz`, `/readyz`, `/health` | path globs (`path.Match`; `*` does not cross `/`) that produce no spans, matched by the shared bypass package (query stripped, path normalized) — the same key and semantics as `jwt-validation` and `sparc` |
+| `bypass_paths` | `/.well-known/*`, `/healthz`, `/readyz`, `/health` | path globs (`path.Match`; `*` does not cross `/`) that produce no spans, matched by the shared bypass package (query stripped, canonical paths only, as in §2) — the same key and semantics as `jwt-validation` and `sparc` |
 | `bypass_hosts` | `otel-collector`, `otel-collector.*`, `jaeger`, `jaeger.*`, `zipkin`, `zipkin.*`, `prometheus`, `prometheus.*` | outbound host globs that produce no spans |
 | `self_id` | — | this workload's identity (§4: reduced to its last `/`-segment); a blank value, or one with no non-empty `/`-segment (`/`), is refused at start — no name, no subject |
 | `self_id_file` | `/shared/client-id.txt` | read when `self_id` is empty. Until it is readable and carries an identity the producer is not ready — every exchange skipped, nothing written to the wire — and it re-reads the file in the background, the sidecar's `/readyz` naming it meanwhile (a pod whose readiness probe uses `/readyz` stays out of rotation until the file lands — the `Readier` contract for a mounted credential, and in the stock chain `jwt-validation` already holds readiness on this same file); the process starts regardless, so the plugin never takes the sidecar's other plugins down over a late mount. Refused at start only when `self_id` is also empty |

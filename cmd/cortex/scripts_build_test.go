@@ -18,10 +18,10 @@ import (
 // writer, so a script that only reads responses must not count as a request reader.
 func TestLocalChain_BuildsWithEachKindOfScript(t *testing.T) {
 	for name, handshake := range map[string]string{
-		"response reader": `{"cortex":1,"hooks":["response"]}`,
-		"response writer": `{"cortex":1,"hooks":["response"],"rewrite_response":true}`,
-		"request script":  `{"cortex":1,"hooks":["request"]}`,
-		"both hooks":      `{"cortex":1,"hooks":["request","response"]}`,
+		"response reader": `{"cortex":2,"hooks":["response"]}`,
+		"response writer": `{"cortex":2,"hooks":["response"],"rewrite_response":true}`,
+		"request script":  `{"cortex":2,"hooks":["request"]}`,
+		"both hooks":      `{"cortex":2,"hooks":["request","response"]}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			home := t.TempDir()
@@ -64,8 +64,8 @@ func TestLocalChain_BuildsWithAResponseRewritingSlotAdded(t *testing.T) {
 	t.Setenv("SHELL", "")
 	root := filepath.Join(home, ".cortex", "plugins")
 	scripts := map[string]string{
-		filepath.Join(root, "watch"):                 `{"cortex":1,"hooks":["response"]}`,
-		filepath.Join(root, "moca-sandbox", "guard"): `{"cortex":1,"hooks":["request","response"],"enforce":true,"rewrite_response":true}`,
+		filepath.Join(root, "watch"):                 `{"cortex":2,"hooks":["response"]}`,
+		filepath.Join(root, "moca-sandbox", "guard"): `{"cortex":2,"hooks":["request","response"],"enforce":true,"rewrite_response":true}`,
 	}
 	for path, handshake := range scripts {
 		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
@@ -104,8 +104,8 @@ func TestLocalChain_ADefaultSlotRewriterBeforeANamedReader(t *testing.T) {
 	t.Setenv("SHELL", "")
 	root := filepath.Join(home, ".cortex", "plugins")
 	scripts := map[string]string{
-		filepath.Join(root, "rewrite"):        `{"cortex":1,"hooks":["response"],"rewrite_response":true}`,
-		filepath.Join(root, "audit", "watch"): `{"cortex":1,"hooks":["response"]}`,
+		filepath.Join(root, "rewrite"):        `{"cortex":2,"hooks":["response"],"rewrite_response":true}`,
+		filepath.Join(root, "audit", "watch"): `{"cortex":2,"hooks":["response"]}`,
 	}
 	for path, handshake := range scripts {
 		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
@@ -143,5 +143,40 @@ func TestLocalChain_ADefaultSlotRewriterBeforeANamedReader(t *testing.T) {
 	}
 	if err := build(chain(audit, config.PluginEntry{Name: "script"})); err != nil {
 		t.Errorf("the default slot listed after the named reader did not build: %v", err)
+	}
+}
+
+// #1814: in praxis mode the shipped local config, run through buildPipelines'
+// steps (ApplyPreset, addScriptSlot, Validate), passes. cortex-gateway runs no
+// outbound plugin, so a script slot there could only fail open.
+func TestLocalChain_PraxisValidates(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("SHELL", "")
+	p, err := writeBuiltinConfig(filepath.Join(home, ".cortex"), filepath.Join(home, ".cortex", "ca"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(p, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("\npraxis:\n  enabled: true\n"); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	cfg, err := config.Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.ApplyPreset(cfg)
+	addScriptSlot(cfg, true)
+	if err := config.Validate(cfg); err != nil {
+		t.Fatalf("Validate = %v", err)
+	}
+	for _, e := range cfg.Pipeline.Outbound.Plugins {
+		if e.Name == scriptPlugin {
+			t.Errorf("praxis chain has a script slot: %+v", cfg.Pipeline.Outbound.Plugins)
+		}
 	}
 }

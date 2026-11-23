@@ -1,10 +1,13 @@
 package forwardproxy
 
 import (
+	"bufio"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -153,4 +156,91 @@ func TestBytes_UnbufferedResponseReportsTheFullCount(t *testing.T) {
 		t.Errorf("response row ↓%d, want ↓%d — the row is recorded after the copy, so the count is complete when the figure is read",
 			respRow.BytesDown, len(`{"never":"buffered"}`))
 	}
+}
+
+// TestStream_CountsArePublishedWhileTheResponseIsOpen pins the forward proxy's
+// half of the live tok/s estimate (#1861): the store holds the open inference
+// response's byte counter while the body streams, so the Timeline can read it,
+// and the entry is gone once the relay ends.
+func TestStream_CountsArePublishedWhileTheResponseIsOpen(t *testing.T) {
+	const first = "data: {\"type\":\"message_start\"}\n\n"
+	const second = "data: {\"type\":\"message_stop\"}\n\n"
+
+	more := make(chan struct{})
+	var once sync.Once
+	release := func() { once.Do(func() { close(more) }) }
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, first)
+		w.(http.Flusher).Flush()
+		<-more
+		_, _ = io.WriteString(w, second)
+		w.(http.Flusher).Flush()
+	}))
+	t.Cleanup(backend.Close)
+	// backend.Close waits on the handler, which waits on more. Cleanups run in
+	// reverse, so release runs before backend.Close, and a failed assertion does
+	// not hang the test.
+	t.Cleanup(release)
+
+	p, err := pipeline.New([]pipeline.Plugin{inferenceTag{}})
+	if err != nil {
+		t.Fatalf("pipeline.New: %v", err)
+	}
+	store := session.New(5*time.Minute, 100, 0)
+	defer store.Close()
+	srv := &Server{OutboundPipeline: pipeline.NewHolder(p), Sessions: store, Client: http.DefaultClient}
+	// served receives once the proxy's handler for the request has returned.
+	served := make(chan struct{}, 1)
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		srv.Handler().ServeHTTP(w, r)
+		served <- struct{}{}
+	}))
+	t.Cleanup(proxy.Close)
+
+	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(mustParseURL(proxy.URL))}}
+	resp, err := client.Get(backend.URL + "/v1/messages")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	defer resp.Body.Close()
+	br := bufio.NewReader(resp.Body)
+	// Both lines of the first frame: the whole block reached the client, so the
+	// relay has read it and the count already includes it.
+	for i := 0; i < 2; i++ {
+		if _, err := br.ReadString('\n'); err != nil {
+			t.Fatalf("first frame, line %d: %v", i+1, err)
+		}
+	}
+
+	id := requestIDOf(t, store)
+	if n, ok := store.StreamBytes(id); !ok || n < int64(len(first)) {
+		t.Fatalf("StreamBytes(%q) = (%d, %v) while the response streams, want at least the %d bytes sent",
+			id, n, ok, len(first))
+	}
+
+	release()
+	if _, err := io.Copy(io.Discard, br); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	// The untrack runs as the serving goroutine returns.
+	<-served
+	if _, ok := store.StreamBytes(id); ok {
+		t.Fatalf("StreamBytes(%q) still answers after the relay ended", id)
+	}
+}
+
+// requestIDOf waits for the request row and returns its ID.
+func requestIDOf(t *testing.T, store *session.Store) string {
+	t.Helper()
+	var id string
+	eventually(t, store, func() bool {
+		if v := store.View(session.DefaultSessionID); v != nil && len(v.Events) > 0 {
+			id = v.Events[0].RequestID
+		}
+		return id != ""
+	}, "the request row")
+	return id
 }

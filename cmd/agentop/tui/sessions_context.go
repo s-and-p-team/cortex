@@ -161,3 +161,9 @@ func contextGauge(promptTokens, width int) string {
 // TestSessionsPicker_CachedMarkerRendersIntact, which exists because a styled cell had its
 // escape bytes measured against the column width and came out mangled.
 const cachedMarker = "cached"
+
+// importedMarker starts the TITLE cell of a session that an import wrote.
+const importedMarker = "(*) "
+
+// childMarker starts the TITLE cell of a session that another session started (#1991).
+const childMarker = "↳ "

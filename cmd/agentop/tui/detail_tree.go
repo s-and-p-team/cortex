@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/rossoctl/cortex/cmd/agentop/tui/find"
+	coremodel "github.com/rossoctl/cortex/core/model"
 )
 
 // The event detail pane renders an event as a tree, so that the parts of it a reader does not
@@ -33,23 +35,27 @@ const (
 	kindString
 	kindObject
 	kindArray
-	kindGroup // the messages before this turn's, under one head
+	kindGroup    // the messages before this turn's, under one head
+	kindSection  // one half of an exchange on the detail page (#1681): a title, header lines, the event
+	kindSections // the detail page's root: its sections, one after another
 )
 
 // node is one JSON value. path names it for the fold state: "inference.messages[3].content".
 type node struct {
-	kind    nodeKind
-	path    string
-	key     string
-	hasKey  bool
-	plain   string // a scalar's or a string's text, unstyled: what a search matches
-	text    string // a scalar's text, styled
-	kids    []*node
-	count   int // elements or keys in the JSON value (a group changes len(kids), not this)
-	size    int // the value's JSON length in bytes, near enough to label it
-	fold    bool
-	defOpen bool
-	label   string // a closed head's text, when it is not the count and the size
+	kind        nodeKind
+	path        string
+	key         string
+	hasKey      bool
+	plain       string // a scalar's or a string's text, unstyled: what a search matches
+	text        string // a scalar's text, styled
+	kids        []*node
+	count       int // elements or keys in the JSON value (a group changes len(kids), not this)
+	size        int // the value's JSON length in bytes, near enough to label it
+	fold        bool
+	defOpen     bool
+	label       string   // a closed head's text, when it is not the count and the size
+	heads       []string // a section's header lines, drawn under its title
+	noQueryOpen bool     // a search never opens this fold: the raw capture
 }
 
 // foldState is what decides which folds render open. open holds the reader's own choices.
@@ -91,6 +97,53 @@ func treeFromJSON(data []byte) (*node, error) {
 	return root, nil
 }
 
+// sectionTree builds one half of the detail page (#1681). path is "request" or "response",
+// and it prefixes every node's path, so the halves' folds and the cursor's path never meet.
+// heads are the half's header lines (TLS, timing, …), drawn under the title. With data nil
+// the half is missing, and the section shows note instead of a tree.
+func sectionTree(path, title string, heads []string, data []byte, note string) (*node, error) {
+	s := &node{kind: kindSection, path: path, fold: true, defOpen: true, label: title, heads: heads}
+	if data == nil {
+		s.heads = append(heads[:len(heads):len(heads)], note)
+	} else {
+		dec := json.NewDecoder(bytes.NewReader(data))
+		dec.UseNumber()
+		var v any
+		if err := dec.Decode(&v); err != nil {
+			return nil, err
+		}
+		ev := buildTree(v, path, "", false)
+		ev.fold = false // The section folds. The event's object does not fold a second time.
+		foldDefaults(ev)
+		s.kids = []*node{ev}
+	}
+	// A search for a header's text must find it in a closed section too.
+	s.plain = strings.Join(s.heads, "\n")
+	return s, nil
+}
+
+// sectionsRoot is the root renderTree draws for a detail page: the sections in order.
+func sectionsRoot(secs ...*node) *node {
+	return &node{kind: kindSections, kids: secs}
+}
+
+// sectionOf names the section a tree path belongs to. Every path in the response section
+// starts with "response". Everything else — the request's paths, and "" — is the request's.
+func sectionOf(path string) string {
+	if path == "response" || strings.HasPrefix(path, "response.") || strings.HasPrefix(path, "response[") {
+		return "response"
+	}
+	return "request"
+}
+
+// toolArgsPath and toolOutputPath are a tool call's arguments and a tool result's content in an
+// event's inference, where the detail view puts them. They are the fields that sessionapi's
+// details search decodes, so a string in the capture, in MCP, or in a decoded value stays a string.
+var (
+	toolArgsPath   = regexp.MustCompile(`^((request|response)\.)?inference\.(messages\[\d+\]\.)?(toolCalls|historyToolCalls)\[\d+\]\.arguments$`)
+	toolOutputPath = regexp.MustCompile(`^((request|response)\.)?inference\.(messages\[\d+\]\.)?toolResults\[\d+\]\.content$`)
+)
+
 func buildTree(v any, path, key string, hasKey bool) *node {
 	n := &node{path: path, key: key, hasKey: hasKey}
 	scalar := func(s string, style func(...string) string) {
@@ -108,6 +161,22 @@ func buildTree(v any, path, key string, hasKey bool) *node {
 	case int, int64, int32:
 		scalar(strconv.FormatInt(toInt64(x), 10), styleJSONNumber.Render)
 	case string:
+		// A tool call's arguments are a JSON object sent as a string, and a tool's output is
+		// often compact JSON: show the value.
+		var val any
+		ok := false
+		switch {
+		case toolArgsPath.MatchString(path):
+			val, ok = coremodel.ToolArgumentsJSON(x)
+		case toolOutputPath.MatchString(path):
+			val, ok = coremodel.ToolOutputJSON(x)
+		}
+		if ok {
+			// A large value starts closed, as the string did, so it does not fill the turn.
+			t := buildTree(val, path, key, hasKey)
+			t.defOpen = len(x) <= clipBytes
+			return t
+		}
 		n.kind, n.plain, n.size = kindString, x, len(x)+2
 		n.fold = strings.Count(x, "\n") >= clipLines || len(x) > clipBytes
 	case []any:
@@ -182,6 +251,20 @@ func foldDefaults(root *node) {
 				e.label = name + " · " + formatBytes(int64(e.size))
 			}
 		}
+	}
+	// The exact capture: large, and opened when it is the point. A search does not open it
+	// either: see isOpen.
+	if raw := root.child("raw"); raw != nil && raw.fold {
+		raw.defOpen, raw.noQueryOpen = false, true
+	}
+	// The captured headers: 20 to 30 lines on real traffic. A search opens them.
+	if h := root.child("headers"); h != nil && h.fold {
+		h.defOpen = false
+	}
+	// Every plugin's invocation, skips included, was half of a short request (#1681). The
+	// section title names the plugins that acted, so the full list starts closed.
+	if inv := root.child("invocations"); inv != nil && inv.fold {
+		inv.defOpen = false
 	}
 	for _, p := range [][2]string{{"mcp", "params"}, {"mcp", "result"}, {"a2a", "parts"}} {
 		if c := root.child(p[0]).child(p[1]); c != nil && c.fold && c.size > clipBytes {
@@ -296,14 +379,20 @@ func (r *renderer) isOpen(n *node) bool {
 	if c, ok := r.fs.open[n.path]; ok && (c.open || r.fs.query == "" || c.query == r.fs.query || !r.hasMatch(n)) {
 		return c.open
 	}
-	if r.fs.query != "" && r.hasMatch(n) {
+	// Not the raw capture (noQueryOpen): it holds a second copy of the conversation and up to 10 MiB of
+	// response, so nearly every query matches in it, and drawing it took over a second a
+	// keystroke. It opens when the reader opens it, or for a details match only it holds
+	// (openRawMatch).
+	if r.fs.query != "" && !n.noQueryOpen && r.hasMatch(n) {
 		return true
 	}
 	return n.defOpen
 }
 
 // hasMatch says whether the query occurs anywhere in n: its key, its text, its label, or
-// any value inside it.
+// any value inside it. It does not go into a noQueryOpen fold. A match there does not open
+// the fold, so it must not open the folds around it either, and the raw capture is too
+// large to scan on each keystroke.
 func (r *renderer) hasMatch(n *node) bool {
 	if v, ok := r.memo[n]; ok {
 		return v
@@ -313,6 +402,9 @@ func (r *renderer) hasMatch(n *node) bool {
 	for _, k := range n.kids {
 		if m {
 			break
+		}
+		if k.noQueryOpen {
+			continue
 		}
 		m = r.hasMatch(k)
 	}
@@ -329,7 +421,7 @@ func (r *renderer) head(n *node, indent int, open bool) string {
 		if open {
 			m = "▾ "
 		}
-		pad = pad[2:] + styleJSONPunct.Render(m)
+		pad = pad[2:] + styleAccent.Render(m)
 	}
 	if n.hasKey {
 		pad += styleJSONKey.Render(strconv.Quote(n.key)) + styleJSONPunct.Render(": ")
@@ -356,6 +448,30 @@ func (r *renderer) value(n *node, indent int, more bool) {
 		if open {
 			for i, k := range n.kids {
 				r.value(k, indent+1, i < len(n.kids)-1)
+			}
+		}
+	case kindSections:
+		for _, k := range n.kids {
+			r.value(k, 0, false)
+		}
+	case kindSection:
+		open := r.isOpen(n)
+		marker := "▸ "
+		if open {
+			marker = "▾ "
+		}
+		if r.fs.all {
+			marker = ""
+		}
+		r.emit(styleAccentBold.Render(marker)+styleTitle.Render(n.label), n, true, open)
+		if open {
+			for _, h := range n.heads {
+				for _, l := range strings.Split(h, "\n") {
+					r.emit("  "+l, n, false, false)
+				}
+			}
+			for _, k := range n.kids {
+				r.value(k, 0, false)
 			}
 		}
 	default:

@@ -89,6 +89,12 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		return m.serverNoticeKey(msg)
 	}
 
+	// Esc while a details search runs drops its answer. Esc again backs out.
+	if msg.String() == "esc" && m.pane == paneEvents && m.detailSearching() {
+		m.cancelDetailSearch()
+		return nil
+	}
+
 	// `/`, n and N search the pane, on every pane. Above the pickers, which handle their own
 	// keys and return. Not over the column picker or an edit, which own their keys.
 	if m.editState.phase == editPhaseDone && !(m.colPicker && m.pane == paneEvents) {
@@ -98,8 +104,7 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 			return nil
 		case "n", "N":
 			if m.surface(m.pane) != nil {
-				m.searchStep(m.pane, msg.String() == "n")
-				return nil
+				return m.searchStep(m.pane, msg.String() == "n")
 			}
 		}
 	}
@@ -139,25 +144,23 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 			m.usage.cycleWindow()
 			m.persistUsage()
 			return m.beginFetch()
-		case "b":
+		case "o":
 			// Breakdown. NOT `g` for "group": `g` is globally "go to top" (see
-			// goTop below), and shadowing a vim-style motion inside one pane is
-			// worse than picking a second-choice mnemonic.
+			// goTop below). NOT `b`, which pages up on every other pane: one letter
+			// keeps one meaning wherever the pane allows it.
 			//
 			// Ignored while viewing latency: the aggregator holds no per-label
 			// latency, so there is no per-status or per-model mean to plot. The
 			// footer and the [?] overlay both say so, which is what keeps this from
-			// reading as a broken binding — `b` reaches no other handler for this
-			// pane (pageActivePane has no paneUsage case), so breaking here simply
-			// drops it.
+			// reading as a broken binding.
 			if m.usage.metric.isLatency() {
 				break
 			}
-			// Inert under an agent scope, which the footer and the [?] overlay both say. The
-			// scope needs group=agent on the wire, so there is no axis left for this key to
+			// Inert under an agent or a project scope, which the footer and the [?] overlay both
+			// say. The scope needs group=agent (or group=project) on the wire, so there is no axis left for this key to
 			// move; dropping it here is what keeps it from refetching against an axis the
 			// scoped narrowing would immediately discard.
-			if m.agentScope != "" {
+			if m.agentScope != "" || m.projectScope != "" {
 				break
 			}
 			// Refetch: the breakdown is a server-side query parameter, not a
@@ -166,16 +169,9 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 			m.usage.cycleGroup()
 			m.persistUsage()
 			return m.beginFetch()
-		case "s":
-			// Toggle scope between this session and all sessions. Only offered
-			// when a session is selected; otherwise there is nothing to toggle to.
-			if m.usage.session != "" {
-				m.usage.session = ""
-			} else if m.selectedSess != "" {
-				m.usage.session = m.selectedSess
-			}
-			return m.beginFetch()
 		}
+		// No scope key: the pane `u` was pressed on sets it — Sessions charts every
+		// session, Events and Detail the one being read.
 	}
 
 	// `u` opens the Usage pane. Scope depends on where it was pressed: from the
@@ -185,7 +181,7 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 	//
 	// Gated on !m.colPicker as well: this handler sits above the picker block, so
 	// without it `u` reached openUsage while m.colPicker stayed true — View() drew
-	// the picker popup over the Usage pane, paneUsage's own m/w/b/s bindings went
+	// the picker popup over the Usage pane, paneUsage's own m/w/o bindings went
 	// live underneath it, and `esc` then closed the picker onto Usage instead of the
 	// events timeline the picker was opened from. (`?` above is deliberately NOT
 	// gated: it layers help over the picker without changing panes, and closing it
@@ -301,7 +297,7 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 				m.colCursor++
 			}
 			return nil
-		case " ", "x":
+		case " ":
 			// Toggle. selectedColumns falls back to the defaults when the set is
 			// empty, so turning everything off cannot leave an unrecoverable blank
 			// pane.
@@ -386,14 +382,15 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 	// Picker panes handle their own keys before session-view logic.
 	if m.pane == paneNamespaces {
 		switch msg.String() {
-		case "enter":
+		case "enter", "right", "l":
 			if cur := m.namespacesTbl.Cursor(); cur < len(m.namespaces) {
 				m.selectedNamespace = m.namespaces[cur].Name
 				m.pane = panePods
 				m.rebuildPodsTable()
 			}
 			return nil
-		case "l":
+		case "L":
+			// Capital, because lowercase `l` opens the row here as on every other list.
 			// Skip the cluster entirely and talk to whatever session API
 			// is already listening locally — an existing port-forward, an
 			// in-mesh agentop, or a tunnel from a kubeconfig that can't list
@@ -423,7 +420,7 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 
 	if m.pane == panePods {
 		switch msg.String() {
-		case "enter":
+		case "enter", "right", "l":
 			pods := m.currentPodsList()
 			if cur := m.podsTbl.Cursor(); cur < len(pods) {
 				if !pods[cur].Ready {
@@ -481,7 +478,7 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		// so anything the refetch still misses can arrive off the stream
 		// without a duplicate. NOT while paged back: a snapshot ends the
 		// paging window, so this refetch would jump an operator reading an
-		// old page to the tail — [t] does that on purpose, [p] must not.
+		// old page to the tail — [G] does that on purpose, [p] must not.
 		if id := m.watchingSessionID(); id != "" && !m.pagedBack(id) {
 			return m.snapshotCmd(id)
 		}
@@ -490,66 +487,32 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 	case "s":
 		// Toggle hiding of passthrough / skip-only messages. Default is
 		// off (show everything); turning it on focuses the timeline on
-		// plugin activity. Only meaningful while the events pane is
-		// active, but accepting the key on any pane keeps the keybinding
-		// simple and lets operators set their preference before drilling
-		// into a session. rebuildEventsTable is a no-op when no session
-		// is selected.
+		// plugin activity. Events only: on another pane it would change a
+		// table the user cannot see.
+		if m.pane != paneEvents {
+			return nil
+		}
 		m.hideInactive = !m.hideInactive
 		m.rebuildEventsTable()
 		return nil
 
 	case "esc", "left", "h":
 		// Back-out: plugin-detail → pipeline (or catalog if we came from there);
-		// detail → events; events → sessions; pipeline, catalog and usage → the
+		// detail → events; events → sessions; pipeline and usage → the
 		// pane that opened them. Sessions is the only top-level pane now, and in
 		// picker mode it backs out further to the Pods picker, tearing down PF +
 		// SSE. It is the ONLY pane that does that — a key-opened surface returning
 		// to its caller must never cost the connection.
+		from := m.pane
 		switch m.pane {
 		case panePluginDetail:
-			// Return to whichever pane invoked the detail (Pipeline or Catalog).
-			if m.previousPane == paneCatalog {
-				m.pane = paneCatalog
-				m.previousPane = paneNone
-			} else {
-				m.pane = panePipeline
-			}
+			// The pipeline is the one pane that opens a plugin, catalog rows included.
+			m.pane = panePipeline
 		case paneAgents:
 			// Leaving WITHOUT touching the scope, which is the difference between this and the
 			// Enter arm below. esc means "back out" on every other pane here, and a key that
 			// silently discarded a scope on the way out would be the one exception.
 			return m.leaveAgentsPane()
-		case paneCatalog:
-			// Return to whichever pane the user pressed `C` from.
-			//
-			// The fallback is SESSIONS, not the pipeline. It was the pipeline while the
-			// pipeline was a top-level pane; now that it is a key-opened surface, being
-			// dropped into it is being dropped somewhere the operator never asked to be,
-			// with a return pane of paneNone underneath. Sessions is the only pane that
-			// is always a defensible place to land.
-			//
-			// The branch is reachable, not just defensive: drilling catalog → plugin
-			// detail overwrites previousPane with paneCatalog and the detail's esc
-			// clears it, so the catalog backs out with no caller recorded.
-			if m.previousPane != paneNone {
-				m.pane = m.previousPane
-				m.previousPane = paneNone
-			} else {
-				m.pane = paneSessions
-			}
-			// Returning INTO Usage has to restart its polling chain. The tick
-			// that was in flight when the catalog opened was dropped by the
-			// `m.pane != paneUsage` guard, so without this nothing reschedules
-			// and the 20s auto-refresh is silently dead until the user backs all
-			// the way out and re-enters with `u` — `r` refetches once but starts
-			// no chain.
-			if m.pane == paneUsage {
-				return m.resumeUsagePolling()
-			}
-			if m.pane == paneTimeline {
-				return m.resumeTimeline()
-			}
 		case paneTimeline:
 			// esc only: the pane binds left/h to its cursor, ahead of this arm.
 			if m.timeline.returnPane != paneNone {
@@ -559,17 +522,18 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 				m.pane = paneSessions
 			}
 			m.timeline.tickGen++
-			// The timeline's session is a #1542 retention key (watchingSession),
+			// Back on the events or detail pane, the timeline follows that pane's session
+			// for its tool rows. That session is selectedSess, so it adds no retention.
+			if (m.pane == paneEvents || m.pane == paneDetail) && m.selectedSess != "" {
+				return m.followEventsTimeline()
+			}
+			// Else the timeline's session is a #1542 retention key (watchingSession),
 			// so it must not outlive the pane: left set, it would keep streaming
-			// that session's events for the rest of the run. Cleared here rather
-			// than pane-checked in the predicate — the drill-down path
-			// (openEventsAtSeq) clears it too, the session staying watched
-			// through selectedSess.
+			// that session's events for the rest of the run.
 			m.timeline.session = ""
 		case paneUsage:
 			// Return to whichever pane opened it, from usageState's own field —
-			// model.previousPane is shared with the catalog overlay and gets
-			// clobbered when the catalog is opened from here.
+			// model.previousPane is shared with other panes.
 			if m.usage.returnPane != paneNone {
 				m.pane = m.usage.returnPane
 				m.usage.returnPane = paneNone
@@ -579,9 +543,8 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 			// End the polling chain on the way out.
 			m.usage.tickGen++
 		case panePipeline:
-			// Back to the pane `P` was pressed on, from the pipeline's OWN field —
-			// model.previousPane is the catalog's and gets clobbered when the catalog
-			// is opened from here, exactly as it did for Usage.
+			// Back to the pane `P` was pressed on, from the pipeline's OWN field, as
+			// Usage does.
 			//
 			// IT USED TO BE GROUPED WITH paneSessions BELOW, which meant esc here tore
 			// down the port-forward and the SSE stream and dropped the operator at the
@@ -616,27 +579,48 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 				m.backToPodsPane()
 			}
 		}
+		// Back on the events or detail pane from a pane opened over it: the timeline tick
+		// stopped on that pane, so start it again for the tool rows.
+		if from != paneEvents && from != paneDetail && m.timelineChainLive() {
+			return m.resumeTimeline()
+		}
 		return nil
 
 	case "enter", "right", "l":
 		switch m.pane {
 		case paneAgents:
-			// Pick the agent the views are narrowed to, then LIST ITS SESSIONS: the pane is a
-			// picker, and picking an agent is asking for its sessions.
+			// On a sub-row, or a row that cannot open: pick the agent the views are narrowed to,
+			// then LIST ITS SESSIONS. A row that opens toggles instead (below).
 			//
-			// NOT A TOGGLE: Enter on the agent already scoped keeps it, and the All agents row is
-			// what clears it. See allAgentsLabel.
-			scope, ok := m.selectedAgentScope()
+			// THE SCOPE IS NOT A TOGGLE: Enter on the agent already scoped keeps it, and All agents
+			// (or its All projects sub-row, when it opens) is what clears it. See allAgentsLabel.
+			//
+			// A project sub-row also sets the project scope; every other row clears it, so the
+			// next agent's list is not narrowed to a project of the old one.
+			d, ok := m.selectedAgentRow()
 			if !ok {
 				return nil
 			}
-			m.agentScope = scope
+			// A ROW THAT OPENS IS A TOGGLE, at the reader's request: Enter opens or closes it, and
+			// its All projects sub-row is what lists the agent's sessions. Space was the only way
+			// in, and nobody found it. A row that cannot open still scopes, or it would be inert.
+			if d.kind == agentRowHeading || (d.kind == agentRowAgent && m.agentRowExpandable(d.agent)) {
+				cmd, _ := m.toggleAgentRow()
+				return cmd
+			}
+			m.agentScope, m.projectScope = d.agent, ""
+			switch d.kind {
+			case agentRowProject:
+				m.projectScope = d.project
+			case agentRowProjectOther:
+				m.projectScope = otherProjects
+			}
 			// SESSIONS, NOT THE PANE `A` WAS PRESSED ON. This used to share esc's exit and return
 			// there, and from a session's events that hid the pick: the events pane shows one
 			// session whatever the scope, so the reader landed back in the session they were
 			// reading — under a title naming an agent it might not belong to. esc keeps that exit;
 			// it changes nothing, so going back is all it can mean. previousPane is spent as
-			// leaveAgentsPane spends it, since the catalog shares the field. The spend band and
+			// leaveAgentsPane spends it, since other panes share the field. The spend band and
 			// drawer restart under the new scope, so no figure from the old one stays on screen
 			// beneath it. esc on that list comes back here.
 			m.pane = paneSessions
@@ -707,6 +691,7 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 				// typed for that session's events, and re-entering it keeps them.
 				delete(m.search, paneEvents)
 				delete(m.search, paneDetail)
+				m.resetDetailSearch()
 			}
 			m.selectedSess = id
 			m.pane = paneEvents
@@ -714,11 +699,13 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 			if !live[id] {
 				// Cached-only: there is no server-side session to snapshot, so the
 				// fetch would 404 and flash an error over the very events this
-				// change preserved.
-				return nil
+				// change preserved. Its timeline would 404 too: start only the
+				// chain, which fetches once the proxy lists the session again.
+				return m.followEventsTimeline()
 			}
+			follow := m.followEventsTimeline()
 			// Snapshot in case the stream hasn't yet delivered history.
-			return m.snapshotCmd(id)
+			return tea.Batch(m.snapshotCmd(id), follow)
 		case paneDetail:
 			// Enter is the only fold key, so → and l stay as they were: nothing.
 			if msg.String() == "enter" {
@@ -729,6 +716,9 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 			// Enter on a subagent block's header collapses/expands it, the tree
 			// convention; on a message it stays the detail drill-down. One key,
 			// the row decides — same as the pickers.
+			if m.onOlderRow() {
+				return m.loadOlderFromRow()
+			}
 			if m.toggleSubagentBlock() {
 				return nil
 			}
@@ -736,14 +726,38 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 			if !ok {
 				return nil
 			}
+			num := m.shownNum()
+			// A tool row opens the exchange that holds its call and its output (#1795).
+			m.detailAim = nil
+			if t := er.tool; t != nil {
+				var inRequest bool
+				if er, num, inRequest, ok = m.toolTarget(t); !ok {
+					return nil
+				}
+				if t.ID != "" {
+					m.detailAim = &toolAim{id: t.ID, pos: t.Pos, inRequest: inRequest}
+				}
+			}
 			// Render from the summary immediately, then fill the message bodies in
 			// when they arrive — the timeline no longer carries them. See
 			// fetchDetailEventCmd for why this is not a blocking spinner.
+			// A details match opens on its highlight: the detail search gets the same query.
+			if q := m.search[paneEvents]; m.searchDetails && q != "" && m.search[paneDetail] != q {
+				m.clearFoldQueries()
+				m.search[paneDetail] = q
+			}
+			er.raw, _ = m.heldRaw(er.event)
+			if er.resp != nil {
+				er.respRaw, _ = m.heldRaw(er.resp)
+			}
+			m.detailNum = num
 			m.showDetail(er, true)
 			m.pane = paneDetail
-			if m.needsFullEvent(er.event) && m.client != nil {
-				return fetchDetailEventCmd(m, eventSession(m.selectedSess, er.event), er.event.Seq)
+			if cmd := m.fetchDetailHalves(er); cmd != nil {
+				return cmd
 			}
+			m.openRawMatch()
+			m.revealDetailMatch()
 			return nil
 		case panePipeline:
 			p := m.selectedPlugin()
@@ -753,18 +767,20 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 			m.previousPane = panePipeline
 			m.showPluginDetail(p, true)
 			m.pane = panePluginDetail
+			if p.Direction == "" {
+				return nil // an available row is not in the chain: no counters to refresh
+			}
 			// Fetch immediately rather than waiting for the next refresh tick:
 			// opening the pane is exactly when someone wants current counters.
 			return m.loadPipelineCmd()
-		case paneCatalog:
-			p := m.selectedCatalogEntry()
-			if p == nil {
-				return nil
-			}
-			m.previousPane = paneCatalog
-			m.showPluginDetail(p, true)
-			m.pane = panePluginDetail
-			return nil
+		}
+		return nil
+
+	case "tab":
+		// The detail page's two sections (#1681): Tab is bound nowhere else, and ← already
+		// means back.
+		if m.pane == paneDetail {
+			m.jumpDetailSection()
 		}
 		return nil
 
@@ -772,7 +788,14 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		if m.pane != paneDetail || m.detailEvent == nil {
 			return nil
 		}
-		path, err := yankEventToFile(m.detailEvent)
+		half := m.detailHalf()
+		if half == nil {
+			// The section's own note says why the half is missing, and what to do.
+			lost := rowLost(m.detailRow, nil, 0, m.lostRef(m.events[m.selectedSess]))
+			m.setFlash("nothing to yank: " + missingNote(m.detailRow, sectionOf(m.detailCursorPath), lost))
+			return nil
+		}
+		path, err := yankEventToFile(half)
 		if err != nil {
 			// Sticky, like the success case: checkYankDir's message names the
 			// directory and the chmod that fixes it, which is useless if it
@@ -822,22 +845,12 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 
 	case "G":
 		m.goBottom()
+		// On a paged-back timeline the bottom is the live tail, so `G` goes back to it:
+		// one key for "the newest end", where there used to be `G` and `t`.
+		if m.pane == paneEvents && m.pagedBack(m.selectedSess) {
+			return m.returnToTail()
+		}
 		return nil
-
-	case "o":
-		// Load the page before the oldest event held. Only in the timeline: the other
-		// panes have nothing to page.
-		if m.pane != paneEvents {
-			return nil
-		}
-		return m.loadOlderPage()
-
-	case "t":
-		// Back to the live tail from a paged-back timeline.
-		if m.pane != paneEvents {
-			return nil
-		}
-		return m.returnToTail()
 
 	case "pgup", "pgdown", "pgdn", "b", "f":
 		// Page the active pane. Sessions can hold up to session.max_events
@@ -851,7 +864,9 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 	case "x":
 		// Erase the row under the cursor, after a confirmation: the highlighted session on the
 		// sessions pane, every session of the highlighted agent on the agents pane — on All agents,
-		// everything, which is X's confirmation. Off the footer, like X — the `?` overlay names it.
+		// everything (openClearConfirm). There is no second key for "everything": one key with
+		// the row deciding is one fewer Shift slip on a key that cannot be undone. Off the footer;
+		// the `?` overlay names it.
 		if m.client == nil {
 			return nil
 		}
@@ -863,15 +878,6 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		}
 		return nil
 
-	case "X":
-		// Clear all history, after a confirmation. Capital, and off the footer like `A`: a
-		// destructive key should not be one stray press of a common letter, nor advertised on
-		// the always-visible line. The `?` overlay names it.
-		if m.client == nil || m.pane != paneSessions {
-			return nil
-		}
-		return m.openClearConfirm()
-
 	case "P":
 		// Open the pipeline. `P` REPLACED `tab` HERE, and took the letter off the
 		// plugin catalog (now `C`) to do it.
@@ -880,15 +886,14 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		// other spelling of it — lowercase `p` — pauses the stream, is printed in
 		// two footers, and has no replacement worth the trade: `space` and `d` are
 		// bubbles' page-down and half-page-down, and every free letter is a worse
-		// pause mnemonic than `p` is a pipeline one. The catalog's claim on `P` was
-		// the weaker of the two (it only fit by borrowing the "Plugin" in "plugin
-		// catalog") and `C` for Catalog is a better key than it gave up.
+		// pause mnemonic than `p` is a pipeline one. The plugin catalog, once its own
+		// pane under `C`, is the pane's second section: plugins available but not run.
 		//
 		// The allowlist is the same three panes `u` opens Usage from, deliberately:
 		// two top-level surfaces reached from the same places is a rule an operator
 		// can hold, whereas two overlapping sets is a lookup. It also keeps the
-		// pipeline out of the nested-overlay cases (opened from Usage or from the
-		// catalog) where the pane to return to is ambiguous.
+		// pipeline out of the nested-overlay case (opened from Usage) where the pane
+		// to return to is ambiguous.
 		//
 		// The panes match; the CONDITIONS do not, and the difference is deliberate.
 		// `u` additionally requires a selected session on Events/Detail, because its
@@ -899,10 +904,10 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		// DO NOT MOVE THIS UP BESIDE `u` ON THE STRENGTH OF THAT SYMMETRY. `u`, `$`,
 		// `c` and `?` sit ABOVE the modal blocks and each carries explicit
 		// `!m.searching && !m.colPicker && m.editState.phase == editPhaseDone` guards
-		// to compensate. `P` and `C` carry none, and do not need to, because they sit
+		// to compensate. `P` carries none, and does not need to, because it sits
 		// BELOW all three: the column picker ends in `default: return nil`, the search
 		// prompt returns unconditionally after feeding the input, and an in-flight edit
-		// returns via handleEditKey. The safety here is POSITIONAL. Hoisting either
+		// returns via handleEditKey. The safety here is POSITIONAL. Hoisting the
 		// key above those blocks without adopting the guards would make `P` change
 		// panes under a modal popup and swallow a `P` someone was typing into the
 		// search — silently, since nothing in the type system notices.
@@ -920,7 +925,9 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		// build from already; rebuild rather than refetch. A nil pipeline renders
 		// "(loading pipeline…)" and rebuildPipelineTable is a no-op on it.
 		m.rebuildPipelineTable()
-		return nil
+		// The available-plugin rows come from /v1/plugins, fetched on every open so a
+		// rebuilt binary's plugins show without a refresh key.
+		return m.loadCatalogCmd()
 
 	case "S":
 		// Choose where the highlighted agent's new sessions go, or move the highlighted session.
@@ -939,8 +946,7 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		// Open the per-agent cost breakdown.
 		//
 		// `A` CAPITALISED, for the reason `P` is: lowercase `a` is the spend drawer's axis
-		// cycle. Available wherever `C` is — anywhere past the pickers, since it needs a
-		// connection.
+		// cycle. Available anywhere past the pickers, since it needs a connection.
 		//
 		// ALWAYS REFETCHED, never opened from cached rows: how many agents have been seen changes
 		// while agentop runs. The reply enters the pane.
@@ -959,32 +965,6 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		// reply lands the reader may have navigated elsewhere.
 		return m.fetchAgentRowsCmd(agentsOpenOnPress, m.pane)
 
-	case "C":
-		// Open the registered-plugin catalog. Available from any
-		// session-view pane; in --endpoint mode the picker fields
-		// don't matter — the catalog comes via the same /v1/* endpoint
-		// agentop is already pointed at.
-		//
-		// `C` for Catalog, moved off `P` when the pipeline took that letter. See
-		// the `P` case above for why this side of the swap is the cheap one — and
-		// note this key's own doc in globalKeys, which records that `P` was never
-		// advertised in any footer, so the muscle memory being broken is thin.
-		if m.client == nil {
-			return nil
-		}
-		switch m.pane {
-		case paneNamespaces, panePods:
-			return nil
-		}
-		m.previousPane = m.pane
-		m.pane = paneCatalog
-		// Fetch on first open; cached afterward (refresh via `r`).
-		if m.catalog == nil {
-			return m.loadCatalogCmd()
-		}
-		m.rebuildCatalogTable()
-		return nil
-
 		// Dispatch j/k/up/down to the active component's Update.
 	}
 
@@ -999,7 +979,7 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		// The operator moved the cursor: an event the Timeline asked to land on no longer applies.
 		m.revealSeq, m.revealSess = 0, ""
 		m.eventsTbl, cmd = m.eventsTbl.Update(msg)
-		m.selectedEventKey = keyOf(m.selectedEvent())
+		m.selectedEventKey = m.selectedPinKey()
 		return cmd
 	case paneDetail:
 		m.detailCursorKey(msg.String())
@@ -1022,24 +1002,15 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 			}
 		}
 		return cmd
-	case paneCatalog:
-		// `r` here refreshes the catalog (in the catalog pane only — the
-		// top-level `r` is reserved for the picker). All other keys go to
-		// the table for navigation.
-		if msg.String() == "r" {
-			return m.loadCatalogCmd()
-		}
-		var cmd tea.Cmd
-		m.catalogTbl, cmd = m.catalogTbl.Update(msg)
-		return cmd
 	case paneAgents:
 		// Without this arm the pane's navigation keys fell off the end of the switch and
 		// returned nil, while its footer printed "[↑↓] nav" and the help overlay listed
 		// "↑↓ / jk  navigate" — an advertised key that does nothing. The table is built
 		// WithFocused(true), so it drew a selection highlight on a cursor nothing could move.
 		//
-		// NO `r` BRANCH, unlike the catalog above: the rows are refetched by every `A` press,
-		// which is why the footer advertises no refresh key either.
+		// NO `r` BRANCH: the rows are refetched by every `A` press, which is why the footer
+		// advertises no refresh key either. NO SPACE BRANCH: Enter opens and closes a row, and
+		// esc backs out, so space is the table's page-down here as everywhere else.
 		var cmd tea.Cmd
 		m.agentsTbl, cmd = m.agentsTbl.Update(msg)
 		return cmd
@@ -1051,13 +1022,11 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 // empty-table guard and clamps, so goBottom does not need the row count.
 func (m *model) goTop() {
 	switch m.pane {
-	case paneCatalog:
-		setCursorVisible(&m.catalogTbl, 0)
 	case paneSessions:
 		setCursorVisible(&m.sessionsTbl, 0)
 	case paneEvents:
 		setCursorVisible(&m.eventsTbl, 0)
-		m.selectedEventKey = keyOf(m.selectedEvent())
+		m.selectedEventKey = m.selectedPinKey()
 		// `g` is an explicit "take me to the oldest end", so it also becomes where
 		// the next session opens — see EventSettings.OpenAtOldest.
 		m.setOpenAtOldest(true)
@@ -1076,14 +1045,12 @@ func (m *model) goBottom() {
 		setCursorVisible(&m.sessionsTbl, len(m.sessionsTbl.Rows())-1)
 	case paneEvents:
 		setCursorVisible(&m.eventsTbl, len(m.eventsTbl.Rows())-1)
-		m.selectedEventKey = keyOf(m.selectedEvent())
+		m.selectedEventKey = m.selectedPinKey()
 		// The mirror of `g` above: back to the tail, and that is where the next
 		// session opens.
 		m.setOpenAtOldest(false)
 	case panePipeline:
 		setCursorVisible(&m.pipelineTbl, len(m.pipelineTbl.Rows())-1)
-	case paneCatalog:
-		setCursorVisible(&m.catalogTbl, len(m.catalogTbl.Rows())-1)
 	case paneDetail:
 		m.detailCursorKey("G")
 	case panePluginDetail:
@@ -1113,13 +1080,11 @@ func (m *model) pageActivePane(msg tea.KeyMsg) tea.Cmd {
 	switch m.pane {
 	case paneEvents:
 		page(&m.eventsTbl)
-		m.selectedEventKey = keyOf(m.selectedEvent())
+		m.selectedEventKey = m.selectedPinKey()
 	case paneSessions:
 		page(&m.sessionsTbl)
 	case panePipeline:
 		page(&m.pipelineTbl)
-	case paneCatalog:
-		page(&m.catalogTbl)
 	case paneDetail:
 		m.detailCursorKey(msg.String())
 	case panePluginDetail:
@@ -1161,7 +1126,7 @@ func (m *model) persistSettings() {
 
 // persistUsage records the usage pane's view, then saves.
 //
-// Its own helper rather than three copies of the two lines: [m], [w] and [b] each
+// Its own helper rather than three copies of the two lines: [m], [w] and [o] each
 // change one of the three, and all three belong in the file together — a reader
 // returning to the pane expects the view they left, not two thirds of it.
 func (m *model) persistUsage() {
@@ -1193,11 +1158,14 @@ func (m *model) setStickyFlash(s string) {
 // enough to fit on a single row at 80 cols.
 func (m *model) helpView() string {
 	if m.searching {
+		if m.searchPane == paneEvents {
+			return "type to search · [tab] details · [enter] done · [esc] cancel"
+		}
 		return "type to search · [enter] done · [esc] cancel"
 	}
 	switch m.pane {
 	case paneNamespaces:
-		return "[↑↓/jk] nav  [↵] open  [l] " + shortHost(m.localEndpointOr()) +
+		return "[↑↓/jk] nav  [↵] open  [L] " + shortHost(m.localEndpointOr()) +
 			"  [r] reload  " + m.searchHints(m.pane) + "  [?] keys  [q] quit"
 	case panePods:
 		return "[↑↓/jk] nav  [↵] connect  [Esc] back  [r] reload  " + m.searchHints(m.pane) + "  [?] keys  [q] quit"
@@ -1229,9 +1197,8 @@ func (m *model) helpView() string {
 		// column is PLUGIN. The footer is where a key gets DISCOVERED, so it is named
 		// for what the pane shows rather than for the concept behind it; the [?]
 		// overlay, which has room, carries the precise version ("the plugin chain this
-		// proxy runs"). Not to be confused with [C], the plugin CATALOG — every plugin
-		// the proxy offers, against the chain it actually runs. That pair is only ever
-		// adjacent in the overlay, since [C] appears in no footer.
+		// proxy runs"). The pane also lists the plugins the proxy offers but does not run,
+		// under its "available" divider.
 		//
 		// MEASURED, because the intuition here is off by more than it looks: the
 		// un-drilled line is 98 columns, and [P] survives down to 34 columns at the
@@ -1278,11 +1245,9 @@ func (m *model) helpView() string {
 		if m.hideInactive && m.hiddenInactive > 0 {
 			base = fmt.Sprintf("%s  ·  %d hidden", base, m.hiddenInactive)
 		}
-		// Older events the snapshot did not ask for. Same reasoning as the hidden count
-		// one line up — a partial timeline should not read as the whole one — and it now
-		// names the key that fetches them, because there is one.
+		// The older-events row is the timeline's first row, off the screen at the tail.
 		if n := m.olderNotFetched[m.selectedSess]; n > 0 {
-			base = fmt.Sprintf("%s  ·  %d older ([o] to load)", base, n)
+			base = fmt.Sprintf("%s  ·  %d older (▲ at top)", base, n)
 		}
 		// Paging backward suspends this session's live appends, and dropping a page at
 		// the cap means the timeline no longer reaches the present. Both are states the
@@ -1290,9 +1255,9 @@ func (m *model) helpView() string {
 		// silently stopped updating is the same class of lie as one that silently
 		// omitted its beginning.
 		if st := m.paging[m.selectedSess]; st != nil {
-			note := "paged back, live paused ([t] for tail)"
+			note := "paged back, live paused ([G] for tail)"
 			if st.droppedNewer {
-				note = "paged back, newer dropped ([t] for tail)"
+				note = "paged back, newer dropped ([G] for tail)"
 			}
 			base = fmt.Sprintf("%s  ·  %s", base, note)
 		}
@@ -1304,7 +1269,16 @@ func (m *model) helpView() string {
 		}
 		return base + "  [?] keys  [q] quit"
 	case paneDetail:
-		return "[↑↓] move  [↵] fold  [y] yank  [u] usage  " + m.searchHints(m.pane) + "  [esc] back  [?] keys  [q] quit"
+		other, half := "response", "request"
+		if sectionOf(m.detailCursorPath) == "response" {
+			other, half = "request", "response"
+		}
+		yank := "  [y] yank " + half
+		if m.detailHalf() == nil {
+			yank = "" // y has nothing to write in a missing half
+		}
+		return "[↑↓] move  [↵] fold  [tab] " + other + yank + "  [u] usage  " +
+			m.searchHints(m.pane) + "  [esc] back  [?] keys  [q] quit"
 	case panePipeline:
 		// ONE SPELLING NOW, where there used to be two. The picker/bypass split
 		// existed only because esc meant different things in the two modes — "back
@@ -1330,23 +1304,16 @@ func (m *model) helpView() string {
 		if lay, ok := m.timelineLayoutNow(); ok && m.timelineScrollMax(lay) > 0 {
 			scroll = "[↑↓] rows  "
 		}
-		return "[w] window  [←→] moment  " + scroll + "[enter] events  " + m.searchHints(m.pane) + "  [esc] back  [?] keys  [q] quit"
+		_, _, _, win := m.timelineRange()
+		return "[w] " + timelineWindows[win].label + "  [←→] moment  " + scroll + "[enter] events  " + m.searchHints(m.pane) + "  [esc] back  [?] keys  [q] quit"
 	case paneUsage:
-		// [s] only appears when there is a session to scope to, so the footer
-		// never advertises a key that would do nothing.
-		scopeHint := ""
-		if m.usage.session != "" {
-			scopeHint = "  [s] all sessions"
-		} else if m.selectedSess != "" {
-			scopeHint = "  [s] this session"
-		}
-		// [b] is omitted under latency rather than shown as a no-op: a footer that
+		// [o] is omitted under latency rather than shown as a no-op: a footer that
 		// advertises an inert key is worse than a shorter footer.
-		breakdownHint := "  [b] breakdown"
-		// Omitted under an agent scope for the same reason as under latency: the scope has taken
+		breakdownHint := "  [o] breakdown"
+		// Omitted under an agent or a project scope for the same reason as under latency: the scope has taken
 		// the wire axis, so there is no second one to break down by, and a footer that advertises
 		// an inert key is worse than a shorter footer.
-		if m.agentScope != "" {
+		if m.agentScope != "" || m.projectScope != "" {
 			breakdownHint = ""
 		}
 		if m.usage.metric.isLatency() {
@@ -1354,13 +1321,9 @@ func (m *model) helpView() string {
 		}
 		// No [r]: the pane polls every 20s on its own, so a manual refresh key
 		// bought nothing but a line of footer.
-		return "[m] metric  [w] window" + breakdownHint + scopeHint +
+		usageWindow, _ := m.usage.window()
+		return "[m] metric  [w] " + formatWindowLabel(usageWindow) + breakdownHint +
 			"  " + m.searchHints(m.pane) + "  [esc] back  [?] keys  [q] quit"
-	case paneCatalog:
-		if m.catalog == nil {
-			return "loading catalog…  [esc] back  [?] keys  [q] quit"
-		}
-		return "[↑↓] nav  [↵] plugin detail  [r] refresh  [esc] back  " + m.searchHints(m.pane) + "  [?] keys  [q] quit"
 	case paneAgents:
 		// [↵] LABELLED BY WHAT IT WILL SHOW: the highlighted agent, or every agent on the All
 		// agents row.
@@ -1369,8 +1332,24 @@ func (m *model) helpView() string {
 		// duplicate the way in, and advertising it would be the inert-key problem the usage
 		// pane's breakdownHint above avoids.
 		enterHint := "  [↵] scope to this agent"
-		if scope, ok := m.selectedAgentScope(); ok && scope == "" {
-			enterHint = "  [↵] all agents"
+		if d, ok := m.selectedAgentRow(); ok {
+			switch {
+			case d.kind == agentRowProject || d.kind == agentRowProjectOther:
+				enterHint = "  [↵] scope to this project"
+			case d.kind == agentRowHeading:
+				enterHint = "  [↵] close"
+			case d.kind == agentRowAgent && m.agentRowExpandable(d.agent):
+				enterHint = "  [↵] projects"
+			case d.agent == "":
+				enterHint = "  [↵] all agents"
+			}
+		}
+		// The full project label after nav: the cell may show only a tail.
+		navHint := "[↑↓] nav"
+		if d, ok := m.selectedAgentRow(); ok {
+			if d.kind == agentRowProject {
+				navHint += "  " + sanitizeLabel(d.project)
+			}
 		}
 		escHint := "  [esc] back"
 		if m.agentsAboveSessions {
@@ -1389,212 +1368,7 @@ func (m *model) helpView() string {
 		// key gets discovered. The drawer here breaks down the row under the cursor.
 		spendHint := "  [$] spend"
 		// [w] the pane's window, which the title names; see cycleAgentsWindow.
-		return "[↑↓] nav" + enterHint + escHint + serverHint + "  [w] window" + spendHint + "  " + m.searchHints(m.pane) + "  [?] keys  [q] quit"
+		return navHint + enterHint + escHint + serverHint + "  [w] " + m.agentsWindowLabel() + spendHint + "  " + m.searchHints(m.pane) + "  [?] keys  [q] quit"
 	}
 	return "[?] keys  [q] quit"
-}
-
-// layout recomputes component sizes to fit the current terminal. Called on
-// every WindowSizeMsg. The footer reserves two lines; the title one.
-func (m *model) layout() {
-	if m.width == 0 || m.height == 0 {
-		return
-	}
-	// Reserve 3 rows: the title row and the footer's two.
-	//
-	// NOT "title + blank + footer", which is what this said and was never true — there is
-	// no blank row to borrow, and a reader who believes there is one reclaims a row the
-	// footer is standing on.
-	bodyH := m.height - 3
-	// And one for the rule that closes the top block.
-	//
-	// UNCONDITIONAL, unlike the two reservations below it: paneView draws the rule on every pane
-	// that renders a body, so there is no pane-dependent condition here to get wrong and none
-	// that can go stale between resizes.
-	//
-	// The two states that do NOT draw it — the edit overlay and `m.width == 0` — are full-screen
-	// takeovers that never read bodyHeight, so this row cannot be stranded in a body that does
-	// not exist. That is the exemption's reason, and it is narrower than "it always draws"; see
-	// renderDivider for what it means for anyone adding a third early return.
-	//
-	// TestLayout_EveryPaneFitsTheTerminal reports the reservation's absence as "one line too
-	// many", on every pane and every size.
-	bodyH -= dividerLines
-	// And one for the spend strip, which View() draws directly under the title.
-	//
-	// BY HEIGHT ALONE, deliberately blind to the pane: there is no setPane choke point to
-	// hook (the pane is assigned in twenty-odd places, and layout() runs on resizes, drawer
-	// toggles and pane transitions alike), so a reservation that read m.pane would go stale
-	// the moment the user moved between a picker and a data pane, leaving bodyHeight wrong
-	// until the next layout() — which on a pane the strip DOES draw means a body one row too
-	// tall and a footer pushed off the bottom. The cost is that the two picker panes render
-	// one row shorter than they need, which is invisible next to that. See
-	// spendStripReservesRow and spendStripVisible for the same asymmetry stated from the
-	// other side.
-	if m.spendStripReservesRow() {
-		// spendBandLines, not one row: the band stacks labels over values. paneView fills
-		// exactly this many, and the two must move together — see paneView.
-		bodyH -= spendBandLines
-	}
-	// And the drawer's rows when it is open. Reserving nothing for them made the view
-	// spendDrawerLines taller than the terminal the moment `$` was pressed, pushing the footer
-	// off the bottom on every pane — the failure the strip's own reservation exists to prevent,
-	// five rows at a time instead of one. See spendDrawerReservesRows.
-	if m.spendDrawerReservesRows() {
-		bodyH -= spendDrawerLinesFor(m.width)
-	}
-	// And one more while the search prompt is open: View() prepends searchInput above the body,
-	// so the line exists on screen whether or not the budget admits it. Unreserved, the view
-	// came out one line taller than the terminal at every size, the terminal scrolled, and the
-	// bottom row went missing for as long as the operator was typing — the same symptom as a
-	// mis-sized table, from a line nobody counted.
-	if m.searching {
-		bodyH--
-	}
-	if bodyH < 4 {
-		bodyH = 4
-	}
-
-	// Fit every fixed-width table to the terminal. Only the events table fitted itself (see
-	// fitColumns); these three declared their widths in their constructors and rendered wider
-	// than an 80-column terminal, wrapping every row. Applied from the constructors' own
-	// definitions each time rather than to the live columns, so widening the terminal back up
-	// restores what a narrower one took away.
-	// The sessions table is NOT fitted here. Its header and its rows have to change together —
-	// the money columns come and go with the width, and TITLE grows into a wide terminal's
-	// slack — and setting columns with the old rows still loaded panics inside bubbles'
-	// SetColumns. rebuildSessionsTable owns both; see its doc. It is called below, after the
-	// heights are set.
-	m.pipelineTbl.SetColumns(fitTableColumns(pipelineColumns(), m.width))
-	m.catalogTbl.SetColumns(fitTableColumns(catalogColumns(), m.width))
-	m.rebuildAgentsTable()
-
-	m.sessionsTbl.SetHeight(bodyH)
-	m.bodyHeight = bodyH
-	// AFTER the height, so the cursor-visibility maths inside it uses the new window. This is
-	// what fits the sessions header to the new width, rows included — which is also what
-	// re-truncates the TITLE cells, since rebuildSessionsTable computes the new TITLE width and
-	// passes it to sessionTitleCell. It does NOT read the live table — doing that was the
-	// stale-width bug, where a narrowing resize truncated against the previous width. An
-	// earlier revision added a second rebuild above for that, claiming nothing else
-	// reconciled them; this call already did, and only the height changes in between.
-	m.rebuildSessionsTable()
-	// Picker tables share the same body area as the session tables so the
-	// terminal real estate stays constant as the user navigates panes.
-	m.namespacesTbl.SetHeight(bodyH)
-	m.podsTbl.SetHeight(bodyH)
-	// The events table's height depends on whether the IDENTITY banner
-	// is rendered for the selected session. rebuildEventsTable() applies
-	// the banner-aware adjustment; call it so the size is correct after
-	// a window resize too.
-	m.rebuildEventsTable()
-	m.pipelineTbl.SetHeight(bodyH)
-	// The catalog table had no height set anywhere: it kept bubbles' table.New
-	// default of 20 rows for the life of the process, so on a terminal shorter than
-	// that the pane rendered past the bottom (scrolling the title away) and on a
-	// taller one it left the remaining rows unused. TestLayout_EveryPaneFitsTheTerminal
-	// covered this pane but never populated m.catalog, so it only ever measured the
-	// "loading catalog…" line.
-	m.catalogTbl.SetHeight(bodyH)
-	// The agents table had the catalog's bug, whose comment above is this one's history: nothing
-	// sized it anywhere, so it kept bubbles' table.New default for the life of the process and
-	// rendered past the bottom of any shorter terminal. The catalog's blind spot was an empty
-	// fixture; this one was a size larger, and it is the class that will recur:
-	// TestLayout_EveryPaneFitsTheTerminal enumerates the panes it measures in a HAND-WRITTEN
-	// map, and paneAgents was simply not in it — so no fixture could have helped, and adding a
-	// pane means adding it to that map too.
-	m.agentsTbl.SetHeight(bodyH)
-	m.detailVp.Width = m.width
-	m.detailVp.Height = bodyH
-	// Re-clamp the scroll offset to the new height, for the PLUGIN detail pane:
-	// nothing re-renders that one on a resize, so this is the only place its offset can
-	// be reconciled. The events detail pane is re-rendered just below and clamps itself
-	// (see showDetail), which is why this line cannot simply move down there — the
-	// re-render would land after it either way.
-	m.detailVp.SetYOffset(m.detailVp.YOffset)
-
-	m.searchInput.Width = m.width - 4
-
-	// Re-wrap the detail viewport to the new width so long JSON values continue to fit
-	// after a terminal resize. Not a scroll reset: the reader stays where they were, as
-	// in the help overlay.
-	//
-	// Only while that pane is the one on screen. detailVp is shared with the PLUGIN
-	// detail pane, and m.detailEvent outlives the pane that set it — nothing clears it
-	// on the way out, only the pod/session reset does — so read an event, esc, open a
-	// plugin, resize, and this call replaced the plugin's content with the old event's
-	// JSON under a "pipeline · tool-prune" title. The clamp above then reconciled the
-	// offset against content the operator had not asked for.
-	if m.pane == paneDetail && m.detailEvent != nil {
-		m.showDetail(m.detailRow, false)
-	}
-}
-
-// handleEditKey is the keymap that takes over while an edit is in flight.
-func (m *model) handleEditKey(msg tea.KeyMsg) tea.Cmd {
-	switch m.editState.phase {
-	case editPhaseDiff:
-		switch msg.String() {
-		case "y", "Y":
-			m.editState.phase = editPhaseApplying
-			newSubtree := m.editState.editedRaw
-			newInner := edit.Splice(
-				m.editState.fetched.InnerYAML,
-				m.editState.fetched.PipelineStart,
-				m.editState.fetched.PipelineEnd,
-				newSubtree,
-			)
-			payload, err := m.editState.store.Build(m.editState.fetched, newInner)
-			if err != nil {
-				m.editState.phase = editPhaseError
-				m.editState.err = "build payload: " + err.Error()
-				return nil
-			}
-			return withGen(m.editState.generation, edit.ApplyCmd(
-				m.ctx, m.editState.store, m.editState.fetched, payload))
-		case "n", "N", "esc":
-			m.editState = editState{phase: editPhaseDone}
-			return nil
-		}
-		return nil
-	case editPhaseError:
-		switch msg.String() {
-		case "r":
-			// If the fetch never completed (tempPath empty), retry the
-			// fetch instead of opening $EDITOR on "" (which leaves the
-			// user with nothing to edit and a misleading flow). A retry
-			// bumps gen so any straggling messages from the failed
-			// attempt are dropped.
-			if m.editState.tempPath == "" {
-				gen := m.editState.generation + 1
-				// The store the failed attempt used, not a fresh
-				// pipelineStore(): a retry is the same transaction, so
-				// re-resolving could silently retarget it.
-				store, statusURL := m.editState.store, m.editState.statusURL
-				m.editState = editState{phase: editPhaseFetching, generation: gen, store: store, statusURL: statusURL}
-				return withGen(gen, edit.FetchCmd(m.ctx, store, m.client, catalogPlugins(m.catalog)))
-			}
-			m.editState.phase = editPhaseEditing
-			return openEditorCmd(m.editState.generation, m.editState.tempPath)
-		case "esc":
-			m.editState = editState{phase: editPhaseDone}
-			return nil
-		}
-		return nil
-	}
-	// Other phases: Esc backgrounds (Waiting / Rollback) so the in-flight
-	// Cmd's eventual result lands as a footer flash, or cancels outright
-	// (Fetching / Editing / Applying — phases where the result is still
-	// safe to drop).
-	if msg.String() == "esc" {
-		switch m.editState.phase {
-		case editPhaseWaiting, editPhaseRollback:
-			m.editState.phase = editPhaseBackground
-			m.setFlash("hot-reload watch moved to background; you'll be notified")
-		default:
-			m.editState = editState{phase: editPhaseDone}
-		}
-		return nil
-	}
-	return nil
 }

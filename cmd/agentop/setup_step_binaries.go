@@ -2,21 +2,27 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 
 	"github.com/rossoctl/cortex/cmd/agentop/checklist"
+	"github.com/rossoctl/cortex/cmd/agentop/updatestatus"
+	"github.com/rossoctl/cortex/core/config"
+	"gopkg.in/yaml.v3"
 )
 
 // installerOneLiner is the fix for "nothing is installed": the documented install.
 const installerOneLiner = "curl -fsSL https://www.rossoctl.dev/cortex/install.sh | sh"
 
-// setupBinaryNames are what the binaries step installs; cortex-session-dump only
-// when the installer staged it (its fetch is never fatal).
-var setupBinaryNames = []string{"agentop", "cortex", "cortex-session-dump"}
+// setupBinaryNames are what the binaries step installs; cortex-session-dump and
+// cortex-gateway only when the installer staged them (the dump's fetch is never
+// fatal, and no release has a gateway yet).
+var setupBinaryNames = []string{"agentop", proxyBinary, "cortex-session-dump", "cortex-gateway"}
 
 type binariesStep struct{}
 
@@ -29,7 +35,7 @@ func (binariesStep) plan(env *setupEnv) (stepPlan, *problem) {
 	env.readVersions()
 	pair := "agentop, cortex " + env.installedVersion + " · " + env.tilde(env.binDir)
 	if env.fromDir == "" {
-		for _, n := range []string{"agentop", "cortex"} {
+		for _, n := range []string{"agentop", proxyBinary} {
 			if !isExecutable(filepath.Join(env.binDir, n)) {
 				return p, &problem{reason: n + " is not installed in " + env.tilde(env.binDir),
 					fix: []string{installerOneLiner}}
@@ -38,10 +44,15 @@ func (binariesStep) plan(env *setupEnv) (stepPlan, *problem) {
 		p.done, p.doneMsg = true, pair
 		return p, nil
 	}
-	for _, n := range []string{"agentop", "cortex"} {
+	for _, n := range []string{"agentop", proxyBinary} {
 		if !isExecutable(filepath.Join(env.fromDir, n)) {
 			return p, &problem{reason: n + " is missing from " + env.tilde(env.fromDir)}
 		}
+	}
+	// Here, not only in agentop update: an agentop from before the cpex removal, and
+	// install.sh, hand the default cortex to this setup with no check of their own.
+	if err := cpexConfigBlocks(env); err != nil && !installedIsCpex(filepath.Join(env.fromDir, proxyBinary)) {
+		return p, &problem{reason: err.Error()}
 	}
 	// Only binDir is asked: a ~/.cortex/previous that cannot be written fails
 	// apply, which rolls back, so it fails safe.
@@ -84,7 +95,12 @@ func (binariesStep) apply(env *setupEnv, _ *checklist.Running) (string, undo, er
 		}
 	}
 	u.fn = undoMoves(restores, env.previousDir(), prevExisted)
-	env.onSuccess = append(env.onSuccess, func() { _ = os.RemoveAll(env.previousDir()) })
+	env.onSuccess = append(env.onSuccess, func() {
+		_ = os.RemoveAll(env.previousDir())
+		// The result names the binaries just replaced. agentop update writes it again
+		// after setup; an install by other means leaves it out until the next check.
+		_ = os.Remove(filepath.Join(env.cortexDir, updatestatus.FileName))
+	})
 	names := strings.Join(stagedBinaries(env), ", ")
 	if env.freshInstall {
 		return names + " → " + env.tilde(env.binDir), u, nil
@@ -156,8 +172,8 @@ func installBinary(env *setupEnv, src, dst string) (func() error, error) {
 	return restore, copyFile(src, dst, 0o755)
 }
 
-// installedVersion is the last word of `path --version`'s first line, as
-// install.sh's installed_version reads it; "" when there is no such binary.
+// installedVersion is the last word of `path --version`'s first line, or ""
+// when there is no such binary. install.sh reads only the "(cpex)" text of that line.
 func installedVersion(path string) string {
 	f := strings.Fields(versionLine(path))
 	if len(f) == 0 {
@@ -170,6 +186,35 @@ func installedVersion(path string) string {
 // `--version` reads "cortex (cpex) <version>" — the check install.sh makes.
 func installedIsCpex(path string) bool {
 	return strings.Contains(versionLine(path), " (cpex) ")
+}
+
+// configNamesCpex reports whether the config at path puts the cpex plugin in a
+// pipeline. The default cortex has no cpex plugin and does not start on such a config.
+func configNamesCpex(path string) bool {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	var c struct {
+		Pipeline config.PipelineConfig `yaml:"pipeline"`
+	}
+	if yaml.Unmarshal(b, &c) != nil {
+		return false
+	}
+	return slices.ContainsFunc(slices.Concat(c.Pipeline.Inbound.Plugins, c.Pipeline.Outbound.Plugins),
+		func(e config.PluginEntry) bool { return e.Name == "cpex" })
+}
+
+// cpexConfigBlocks is the error for a cpex cortex whose config names the cpex plugin:
+// the default build that replaces it would not start. Setup's binaries plan refuses
+// on it. agentop update also asks first, so that it stops before the download.
+func cpexConfigBlocks(env *setupEnv) error {
+	// The config first: it is a file read, and the version is a process start.
+	if !configNamesCpex(env.configPath()) || !installedIsCpex(filepath.Join(env.binDir, proxyBinary)) {
+		return nil
+	}
+	return fmt.Errorf("the laptop cpex build is removed, and %s names the cpex plugin, which the default cortex does not have: "+
+		"remove the cpex entry from pipeline (docs/praxis-policy.md#move-from-the-cpex-plugin), then update again", env.configPath())
 }
 
 // versionLine is the first line of `path --version`; "" when there is no such

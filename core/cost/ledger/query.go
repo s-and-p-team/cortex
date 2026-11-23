@@ -10,7 +10,7 @@ import (
 	"github.com/rossoctl/cortex/core/cost/event"
 	"github.com/rossoctl/cortex/core/cost/pricing"
 	"github.com/rossoctl/cortex/core/cost/usage"
-	"github.com/rossoctl/cortex/core/pipeline"
+	"github.com/rossoctl/cortex/core/model"
 )
 
 // Window returns everything the ledger knows about [from, to]: the closed minutes on
@@ -455,7 +455,7 @@ func Groupable(group usage.Group) bool {
 	// Every axis a Row has a field for. GroupMethod is the model series under an older
 	// name — see labelFor.
 	case usage.GroupModel, usage.GroupMethod, usage.GroupEndpoint, usage.GroupAgent,
-		usage.GroupCurrency:
+		usage.GroupProject, usage.GroupCurrency:
 		return true
 	}
 	// GroupNone included: it asks for no breakdown, so there is nothing to answer and
@@ -474,7 +474,7 @@ func Groupable(group usage.Group) bool {
 //
 // NOT an agent name, and a consumer must not present it as one — the row is
 // unattributed traffic, not a program that spent money.
-const unknownAgentLabel = pipeline.UnknownClientLabel
+const unknownAgentLabel = model.UnknownClientLabel
 
 // labelFor picks the grouping key, returning ok=false when the row carries no
 // value for that axis — so an empty key never becomes a blank row, the same guard
@@ -487,9 +487,9 @@ const unknownAgentLabel = pipeline.UnknownClientLabel
 // no series is the honest answer; an empty map that a client renders as "no
 // breakdown" would be the same answer said less clearly.
 //
-// usage.GroupAgent is the ONE axis that maps an absent value to a label rather than
-// dropping the row from the series, so it returns early instead of reaching that
-// guard. See its case.
+// usage.GroupAgent and usage.GroupProject map an absent value to a label rather than
+// dropping the row from the series, so they return early instead of reaching that
+// guard. See the agent case.
 func labelFor(r Row, group usage.Group) (string, bool) {
 	var v string
 	switch group {
@@ -522,12 +522,18 @@ func labelFor(r Row, group usage.Group) (string, bool) {
 	// See Row.Agent.
 	//
 	// Versionless, as the ring keys it: the row keeps "claude-code/2.1.285" and this reads
-	// "claude-code", so rows from before the fold join the same series. See pipeline.AgentName.
+	// "claude-code", so rows from before the fold join the same series. See model.AgentName.
 	case usage.GroupAgent:
 		if r.Agent == "" {
 			return unknownAgentLabel, true
 		}
-		return pipeline.AgentName(r.Agent), true
+		return model.AgentName(r.Agent), true
+	// Project maps "" to a label for the reason Agent does: that spend belongs in the breakdown.
+	case usage.GroupProject:
+		if r.Project == "" {
+			return usage.UnknownProjectLabel, true
+		}
+		return r.Project, true
 	default:
 		return "", false
 	}
@@ -595,13 +601,13 @@ func unitSpellings(rows []Row) map[string]string {
 	return seen
 }
 
-// SeriesCurrenciesIn is usage.Snapshot.SeriesCurrencies for these rows: for group=model, endpoint
-// and agent, each series' units as CurrenciesIn reports them, keyed by the label Fold gives that
+// SeriesCurrenciesIn is usage.Snapshot.SeriesCurrencies for these rows: for group=model, endpoint,
+// agent and project, each series' units as CurrenciesIn reports them, keyed by the label Fold gives that
 // series in the capped series Fold returned. A label the cap folded away lends its rows to the
 // overflow band. Nil for every other grouping, where the field is not defined.
 func SeriesCurrenciesIn(rows []Row, group usage.Group, series map[string]usage.Counts) map[string][]string {
 	switch group {
-	case usage.GroupModel, usage.GroupMethod, usage.GroupEndpoint, usage.GroupAgent:
+	case usage.GroupModel, usage.GroupMethod, usage.GroupEndpoint, usage.GroupAgent, usage.GroupProject:
 	default:
 		return nil
 	}

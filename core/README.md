@@ -2,17 +2,17 @@
 
 The Go module every sidecar binary and both external consumers import. It holds the
 plugin framework, the listeners, the cost pipeline, the session store, and the auth
-primitives — roughly 53,000 non-test lines.
+primitives — roughly 84,000 non-test lines.
 
 It was called `authlib` and described as *"the shared auth library"*. Measured by
-non-test lines, auth is **1.6%** of it:
+non-test lines, auth is **1.1%** of it (counted 2026-11-05):
 
 | Theme | Packages | Lines | Share |
 |---|---|---|---|
-| Framework | `pipeline`, `plugins`, `listener`, `config`, `spiffe` | 30,485 | 57.1% |
-| Cost | `cost/*` | 11,288 | 21.1% |
-| Observability | `session`, `sessionapi`, `observe`, `redact` | 5,368 | 10.0% |
-| **Auth** | `auth`, `bypass`, `capabilities` | **882** | **1.6%** |
+| Framework | `pipeline`, `model`, `plugins`, `listener`, `config`, `spiffe` | 48,904 | 58.3% |
+| Cost | `cost/*` | 13,850 | 16.5% |
+| Observability | `session`, `sessionapi`, `observe`, `redact` | 11,985 | 14.3% |
+| **Auth** | `auth`, `bypass`, `capabilities` | **920** | **1.1%** |
 
 The remainder is transport, storage and integration glue — the table covers themes,
 not every package.
@@ -36,6 +36,8 @@ is an Envoy ext_proc gRPC server, and `core` has 20 direct dependencies includin
 | Package | Purpose |
 |---------|---------|
 | `pipeline/` | Plugin interface + lifecycle (`Configurable`, `Initializer`, `Shutdowner`) — see [docs/framework-architecture.md](../docs/framework-architecture.md) |
+| `model/` | Shared data types: session events, parsed requests, client labels. Imports no engine code |
+| `parse/` | Parser libraries for MCP, A2A and inference: plain values in, `core/model` types out. Import no engine code and compute no cost. The three parser plugins wrap them |
 | `plugins/` | Registry + every concrete plugin, each owning its own config — see [docs/plugin-reference.md](../docs/plugin-reference.md) |
 | `listener/` | Every listener implementation: the Envoy `extproc` gRPC server, the forward/reverse/transparent HTTP proxies |
 | `config/` | YAML config with mode presets, `${ENV_VAR}` expansion, credential-file waiters, top-level validation |
@@ -43,7 +45,7 @@ is an Envoy ext_proc gRPC server, and `core` has 20 direct dependencies includin
 | `reloader/` | fsnotify-based config hot-reload — atomic pipeline swap on ConfigMap change |
 | `capabilities/` | Capability interfaces protocol extensions implement, plus the vocabulary plugins share without importing each other — role constants, the `ContentSource` / `Fragment` shape, and `PluginCapabilities.Claims` constants |
 
-**Cost** — 21% of the module, and the part the old description omitted entirely:
+**Cost** — 17% of the module, and the part the old description omitted entirely:
 
 | Package | Purpose |
 |---------|---------|
@@ -57,12 +59,12 @@ is an Envoy ext_proc gRPC server, and `core` has 20 direct dependencies includin
 
 | Package | Purpose |
 |---------|---------|
-| `session/` | In-memory session store correlating requests, with message interning — see the chatty-traffic gotcha in [CLAUDE.md](../CLAUDE.md) |
+| `session/` | In-memory session store correlating requests, with message interning — see the session store memory limits in [`framework-architecture.md`](../docs/framework-architecture.md#operator-configuration-session) |
 | `sessionapi/` | The `:9094` HTTP API — `/v1/sessions`, `/v1/events` SSE, `/v1/pipeline` |
 | `observe/` | The `:9093` server — `/stats`, `/config`, `/reload/status` |
 | `redact/` | Best-effort stripping of sensitive values before anything is stored or served |
 
-**Auth and identity.** The theme table's 882-line Auth figure is `auth` + `bypass` +
+**Auth and identity.** The theme table's 920-line Auth figure is `auth` + `bypass` +
 `capabilities` — `capabilities` is grouped here by subject even though it is listed
 under Framework above, which is where it is used from. `spiffe` is counted under
 Framework, not here:
@@ -86,7 +88,6 @@ Framework, not here:
 | `llmclient/` | Small helper for calling OpenAI-compatible endpoints |
 | `placeholder/` | The convention for opaque credential handles. Named accurately despite reading like a TODO, and tied to the `abph_` wire prefix, which cannot change |
 | `clientstate/` | The on-disk record `agentop` writes when it points an agent at a local proxy |
-| `praxis/` | Converts a `config.Config` into a Praxis proxy config. **Paused** — ships in no image and registers no plugins, but deliberately kept compiling |
 
 **Plugin internals** worth knowing about:
 
@@ -100,7 +101,7 @@ Packages that used to live at `core/validation`, `core/exchange`, `core/cache` m
 
 ## Usage
 
-Plugins own their own configuration and construct any `auth.Auth` they need internally from their per-plugin config (see [docs/plugin-reference.md](../docs/plugin-reference.md)). Host processes (`cmd/cortex`, `cmd/cortex-envoy`, `cmd/cortex-praxis`) just load the YAML, call `plugins.Build`, run the pipelines, and let each plugin handle its own dependencies.
+Plugins own their own configuration and construct any `auth.Auth` they need internally from their per-plugin config (see [docs/plugin-reference.md](../docs/plugin-reference.md)). Host processes (`cmd/cortex`, `cmd/cortex-envoy`) just load the YAML, call `plugins.Build`, run the pipelines, and let each plugin handle its own dependencies.
 
 ```go
 import (

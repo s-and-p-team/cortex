@@ -6,12 +6,10 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/rossoctl/cortex/cmd/agentop/apiclient"
-	"github.com/rossoctl/cortex/cmd/agentop/tui/table"
 )
 
 // cursorScopeModel is a connected agents pane over navRows, cursor on claude-code's row, with
@@ -24,6 +22,9 @@ func cursorScopeModel(t *testing.T) (*model, func() []string) {
 		mu.Lock()
 		asked = append(asked, r.URL.RawQuery)
 		mu.Unlock()
+		if r.URL.Query().Has("project") {
+			t.Errorf("query %q carries project=", r.URL.RawQuery)
+		}
 		// The agent is ECHOED, as the real server does, so fetchUsageScoped does not take its
 		// old-server fallback and re-ask unscoped.
 		q := r.URL.Query()
@@ -40,9 +41,7 @@ func cursorScopeModel(t *testing.T) (*model, func() []string) {
 		agents:     navRows(),
 		agentsTbl:  newAgentsTable(),
 	}
-	m.agentsTbl.SetRows([]table.Row{
-		{"All agents"}, {"claude-code/2.1.270"}, {"bob-shell/2.0.5"},
-	})
+	m.rebuildAgentsTable()
 	setCursorVisible(&m.agentsTbl, 1)
 	return m, func() []string {
 		mu.Lock()
@@ -60,8 +59,8 @@ func pressKey(m *model, key tea.KeyMsg) {
 	runCmds(cmd)
 }
 
-// runCmds runs a command tree concurrently, giving each member a moment: a tea.Tick blocks for
-// its whole interval, and is not what these tests measure.
+// runCmds runs a command tree concurrently and returns once every member has returned. Ticks
+// fire at once in this package's tests (see TestMain).
 func runCmds(cmd tea.Cmd) {
 	var wg sync.WaitGroup
 	var run func(c tea.Cmd)
@@ -72,16 +71,10 @@ func runCmds(cmd tea.Cmd) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			done := make(chan tea.Msg, 1)
-			go func() { done <- c() }()
-			select {
-			case msg := <-done:
-				if batch, ok := msg.(tea.BatchMsg); ok {
-					for _, cc := range batch {
-						run(cc)
-					}
+			if batch, ok := c().(tea.BatchMsg); ok {
+				for _, cc := range batch {
+					run(cc)
 				}
-			case <-time.After(300 * time.Millisecond):
 			}
 		}()
 	}

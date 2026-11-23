@@ -78,7 +78,8 @@ func (m *model) openSessionErase() tea.Cmd {
 // openAgentErase is x on the agents pane: erase every session of the highlighted agent — or, on
 // All agents, everything, which is X's confirmation and X's single request.
 func (m *model) openAgentErase() tea.Cmd {
-	scope, ok := m.selectedAgentScope()
+	// Nothing on a project sub-row: it is not the whole agent.
+	scope, ok := m.selectedAgentActs()
 	if !ok {
 		return nil
 	}
@@ -160,7 +161,7 @@ func (m *model) applyClearCounts(msg clearCountsMsg) {
 			if cc.name = m.sessionTitleFor(s.ID, s.Title); cc.name == "" {
 				cc.name = sanitizeLabel(s.ID)
 			}
-		case cc.target == eraseAgent && m.sessionListed(s, cc.agent):
+		case cc.target == eraseAgent && m.sessionListed(s, cc.agent, ""):
 			cc.ids = append(cc.ids, s.ID)
 		}
 	}
@@ -333,6 +334,9 @@ func (m *model) forgetSessions(ids []string) {
 			m.detailEvent = nil
 			m.detailPlugin = nil
 		}
+		if m.timeline.session == id {
+			m.setTimelineSession("") // a #1542 retention key, like selectedSess
+		}
 	}
 	m.sessions = slices.DeleteFunc(m.sessions, func(s session.SessionSummary) bool {
 		return slices.Contains(ids, s.ID)
@@ -368,6 +372,7 @@ func (m *model) resetAfterClear() {
 	m.detailEvent = nil
 	m.detailPlugin = nil
 	m.selectedSess = ""
+	m.setTimelineSession("") // a #1542 retention key, like selectedSess
 	m.selectedEventKey = eventKey{}
 	m.visibleRows = nil
 	if m.pane != paneAgents {
@@ -442,7 +447,7 @@ func renderClearConfirm(cc *clearConfirm, width int) string {
 	const wrap = 60
 	w := min(wrap, max(width-6, 20))
 	text, hint := confirmText(cc)
-	body := lipgloss.NewStyle().Width(w).Render(text) + "\n\n" + styleHint.Render(hint)
+	body := lipgloss.NewStyle().Width(w).Render(text) + "\n\n" + renderHints(hint)
 	box := styleBorder.Padding(0, 2)
 	if width > styleBorder.GetHorizontalBorderSize() {
 		box = box.MaxWidth(width)

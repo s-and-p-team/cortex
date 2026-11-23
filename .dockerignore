@@ -10,6 +10,7 @@
 # slash to stay anchored.
 .git
 .worktrees
+.claude/worktrees
 .superpowers
 bin
 dist
@@ -39,7 +40,6 @@ cortex
 cortex-envoy
 cortex-cpex
 authbridge-lite
-cortex-praxis
 profile-tags
 readme-demo
 cmd/agentop/agentop

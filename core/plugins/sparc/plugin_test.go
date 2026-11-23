@@ -73,7 +73,8 @@ func mcpPctx() *pipeline.Context {
 	pctx := &pipeline.Context{
 		Direction: pipeline.Outbound, Method: "POST", Scheme: "http",
 		Host: "finance-mcp.team1.svc", Path: "/mcp", Headers: http.Header{},
-		Session: &pipeline.SessionView{ID: "s1", Events: []pipeline.SessionEvent{inferenceEvent()}},
+		Session:   &pipeline.SessionView{ID: "s1", Events: []pipeline.SessionEvent{inferenceEvent()}},
+		SessionID: "s1",
 	}
 	pctx.Extensions.MCP = &pipeline.MCPExtension{
 		Method: "tools/call", RPCID: "rpc-1", IsAction: true,
@@ -362,5 +363,21 @@ func TestCapabilities(t *testing.T) {
 	}
 	if len(caps.RequiresAny) == 0 {
 		t.Error("expected RequiresAny parsers")
+	}
+}
+
+// The listener's facts win over the view: with FactNone set for LastInference, sparc has no
+// context and skips, also when the view still holds an inference request.
+func TestMCP_SetFactNoneSkips(t *testing.T) {
+	fr := &fakeReflector{verdict: ReflectVerdict{Decision: DecisionReject}}
+	p := configured(t, "", fr) // default fail_policy: open
+	pctx := mcpPctx()          // the view holds an inference request
+	none := pipeline.SessionFact{State: pipeline.FactNone}
+	pctx.SetSessionFacts(pipeline.SessionFacts{LastIntent: none, LastInference: none})
+	if act := invokeReq(p, pctx); act.Type != pipeline.Continue {
+		t.Fatalf("no context (fail_open) should Continue, got %+v", act)
+	}
+	if fr.calls != 0 {
+		t.Errorf("reflector called %d times, want 0", fr.calls)
 	}
 }

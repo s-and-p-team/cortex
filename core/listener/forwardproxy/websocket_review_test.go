@@ -8,7 +8,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/rossoctl/cortex/core/config"
 	"github.com/rossoctl/cortex/core/listener/internal/wsframe"
@@ -155,6 +154,9 @@ func TestResponsesWebSocket_ReloadAddingAnUncarriablePluginEndsTheSocket(t *test
 	if n != 0 {
 		t.Errorf("origin received %d response.create; the turn must not be sent without its plugin", n)
 	}
+	if n := fresh.Held(); n != 0 {
+		t.Errorf("the refused turn still holds the pipeline %d times", n)
+	}
 }
 
 // A turn over the 32 MiB a request body may be ends the socket with 1009, as HTTPS
@@ -162,7 +164,6 @@ func TestResponsesWebSocket_ReloadAddingAnUncarriablePluginEndsTheSocket(t *test
 func TestResponsesWebSocket_OverLimitTurnEndsTheSocket(t *testing.T) {
 	h := newWSHarness(t, config.ResponsesWebSocketsParse, &turnDenier{})
 	c := h.dial(t, nil)
-	_ = c.conn.SetDeadline(time.Now().Add(60 * time.Second))
 	half := strings.Repeat("x", (wsClientMessageLimit/2)+1)
 	_, _ = c.conn.Write(fragmentFrame(wsframe.OpText, false, []byte(half)))
 	_, _ = c.conn.Write(fragmentFrame(wsframe.OpContinuation, true, []byte(half)))
@@ -220,6 +221,46 @@ func TestResponsesWebSocket_EachTurnSeesTheSessionSoFar(t *testing.T) {
 	}
 }
 
+// Each turn's pctx.SessionID is the id of the view it is given.
+func TestResponsesWebSocket_TurnSessionIDIsTheViewID(t *testing.T) {
+	seen := &sessionLenRecorder{}
+	h := newWSHarness(t, config.ResponsesWebSocketsParse, seen)
+	c := h.dial(t, nil)
+	c.send(responseCreate("one"))
+	c.readUntil("response.completed")
+	c.close()
+	h.events(t, codexSID, true)
+	seen.mu.Lock()
+	defer seen.mu.Unlock()
+	if n := len(seen.ids); n == 0 || seen.ids[n-1][0] != codexSID {
+		t.Fatalf("ids seen = %v; the last request is the turn, on %q", seen.ids, codexSID)
+	}
+	for i, p := range seen.ids {
+		if want := strings.TrimPrefix(p[0], "-"); p[1] != want {
+			t.Errorf("request %d: view id %q, SessionID %q; want SessionID %q", i, p[0], p[1], want)
+		}
+	}
+}
+
+// Each turn gets the store's InferenceHosts table, which a view cannot give: the second turn sees
+// the row of the first.
+func TestResponsesWebSocket_EachTurnGetsTheHostsFact(t *testing.T) {
+	seen := &sessionLenRecorder{}
+	h := newWSHarness(t, config.ResponsesWebSocketsParse, seen)
+	c := h.dial(t, nil)
+	c.send(responseCreate("one"))
+	c.readUntil("response.completed")
+	c.send(responseCreate("two"))
+	c.readUntil("response.completed")
+	c.close()
+	h.events(t, codexSID, true)
+	seen.mu.Lock()
+	defer seen.mu.Unlock()
+	if n := len(seen.hosts); n < 2 || seen.hosts[n-1] != 1 {
+		t.Errorf("InferenceHosts rows seen = %v (-1: unknown); the second turn should see the first turn's row", seen.hosts)
+	}
+}
+
 // An origin's refusal is relayed whole: the handshake's deadline must not cut its body.
 func TestResponsesWebSocket_OriginRefusalBodyIsRelayedWhole(t *testing.T) {
 	h := newWSHarness(t, config.ResponsesWebSocketsParse)
@@ -269,6 +310,10 @@ func (redirector) OnResponse(context.Context, *pipeline.Context) pipeline.Action
 type sessionLenRecorder struct {
 	mu  sync.Mutex
 	got []int
+	// ids holds the view's id and pctx.SessionID at each request. A nil view gives "-".
+	ids [][2]string
+	// hosts is how many InferenceHosts rows pctx.InferenceHosts() gave at each request, -1 for unknown.
+	hosts []int
 }
 
 func (*sessionLenRecorder) Name() string { return "session-len-recorder" }
@@ -278,11 +323,18 @@ func (*sessionLenRecorder) Capabilities() pipeline.PluginCapabilities {
 func (r *sessionLenRecorder) OnRequest(_ context.Context, pctx *pipeline.Context) pipeline.Action {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	n := -1
+	n, id := -1, "-"
 	if pctx.Session != nil {
-		n = pctx.Session.Len()
+		n, id = pctx.Session.Len(), pctx.Session.ID
 	}
 	r.got = append(r.got, n)
+	r.ids = append(r.ids, [2]string{id, pctx.SessionID})
+	h, known := pctx.InferenceHosts()
+	if !known {
+		r.hosts = append(r.hosts, -1)
+	} else {
+		r.hosts = append(r.hosts, len(h))
+	}
 	return pipeline.Action{Type: pipeline.Continue}
 }
 func (*sessionLenRecorder) OnResponse(context.Context, *pipeline.Context) pipeline.Action {
@@ -301,21 +353,15 @@ func TestResponsesWebSocket_UnansweredPrewarmIsNotFinishedTwice(t *testing.T) {
 	count := &finishCounter{}
 	logs := captureLogs(t)
 	h := newWSHarness(t, config.ResponsesWebSocketsParse, count)
+	received := make(chan bool, 1)
 	scriptedOrigin(h, func(read func() *wsframe.Frame, write func(string)) {
-		read() // the prewarm, never answered
+		received <- read() != nil // the prewarm, never answered
 	})
 	c := h.dial(t, nil)
 	c.send(`{"type":"response.create","generate":false,"model":"gpt-6-luna","input":[]}`)
-	// Wait until the origin has the prewarm, so the close lands while it is queued.
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		h.origin.mu.Lock()
-		n := len(h.origin.creates)
-		h.origin.mu.Unlock()
-		if n > 0 || time.Now().After(deadline) {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
+	// The close lands once the origin has the prewarm, while it is still queued.
+	if !<-received {
+		t.Fatal("the origin's socket closed before the prewarm reached it")
 	}
 	c.close()
 	events := h.events(t, codexSID, true)

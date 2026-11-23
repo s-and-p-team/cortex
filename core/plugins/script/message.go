@@ -9,26 +9,24 @@ import (
 	"unicode/utf8"
 
 	"github.com/rossoctl/cortex/core/pipeline"
+	"github.com/rossoctl/cortex/core/redact"
 	"golang.org/x/net/http/httpguts"
 )
 
 // secretHeaders never reach a script. A script is the user's own code, but its
 // output lands in logs and on the timeline, and a credential has no business in
 // either.
-var secretHeaders = map[string]bool{
-	"authorization":       true,
-	"proxy-authorization": true,
-	"cookie":              true,
-	"set-cookie":          true,
-	"x-api-key":           true,
-	"api-key":             true,
-	"x-goog-api-key":      true,
-}
+var secretHeaders = redact.SecretHeaders
 
 // requestMessage is what a script's request hook receives. The parsed extensions
 // keep their own JSON tags — the shape GET /v1/sessions/{id} serves — so a script
 // tested by replaying recorded events sees exactly what live traffic gives it.
-func requestMessage(pctx *pipeline.Context) map[string]any {
+//
+// The body and the inference extension go in more, not in the message: the
+// script fetches them when a hook reads them. On a long conversation each one is
+// about the size of the request, and a script that only reads the host or a
+// header should not cost two copies of it per request.
+func requestMessage(pctx *pipeline.Context) (msg, more map[string]any) {
 	req := map[string]any{
 		"direction": pctx.Direction.String(),
 		"method":    pctx.Method,
@@ -36,9 +34,12 @@ func requestMessage(pctx *pipeline.Context) map[string]any {
 		"path":      pctx.Path,
 		"headers":   flatten(pctx.Headers),
 	}
-	putBody(req, pctx.Body)
+	more = map[string]any{}
+	if pctx.Body != nil {
+		more["body"] = lazyBody(pctx.Body)
+	}
 	if e := pctx.Extensions.Inference; e != nil {
-		req["inference"] = e
+		more["inference"] = e
 	}
 	if e := pctx.Extensions.MCP; e != nil {
 		req["mcp"] = e
@@ -50,13 +51,24 @@ func requestMessage(pctx *pipeline.Context) map[string]any {
 		"hook":    "request",
 		"session": sessionOf(pctx),
 		"request": req,
-	}
+	}, more
+}
+
+// lazyBody encodes as the object putBody builds, so the copy to a string is made
+// only when a script fetches the body.
+type lazyBody []byte
+
+func (b lazyBody) MarshalJSON() ([]byte, error) {
+	m := map[string]any{}
+	putBody(m, b)
+	return json.Marshal(m)
 }
 
 func sessionOf(pctx *pipeline.Context) map[string]any {
 	s := map[string]any{"request_id": pctx.RequestID()}
+	// Key on the view, not the id: a view with an empty id still sends "id": "".
 	if pctx.Session != nil {
-		s["id"] = pctx.Session.ID
+		s["id"] = pctx.SessionID
 	}
 	return s
 }

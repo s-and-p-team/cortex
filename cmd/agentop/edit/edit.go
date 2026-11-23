@@ -121,25 +121,31 @@ func FetchCmd(
 // AppliedMsg is the result of ApplyCmd.
 type AppliedMsg struct {
 	ApplyTime time.Time
-	Err       error
+	// BaselineFailed is reloads_failed read before the write, for PollCmd.
+	BaselineFailed int64
+	Err            error
 }
 
 // ApplyCmd returns a tea.Cmd that writes the supplied payload back through
-// store and emits AppliedMsg with the apply timestamp.
+// store and emits AppliedMsg with the apply timestamp. Before the write it reads
+// the reload failure count from statusURL (see ReloadBaseline).
 //
 // orig is the fetch this payload was derived from. When the store implements
 // ConflictChecker, it is consulted first and a concurrent write aborts the apply
 // instead of overwriting it. Checked here rather than at the keypress so the
 // re-read happens off the Update loop, next to the write it guards.
-func ApplyCmd(ctx context.Context, store Store, orig *FetchedPipeline, payload []byte) tea.Cmd {
+func ApplyCmd(ctx context.Context, store Store, statusURL string, orig *FetchedPipeline, payload []byte) tea.Cmd {
 	return func() tea.Msg {
+		// Read before the conflict check: this GET can take 2s, so keep it out of
+		// the window between the check and the write.
+		baseline := ReloadBaseline(ctx, statusURL)
 		if cc, ok := store.(ConflictChecker); ok && orig != nil {
 			if err := cc.CheckUnchanged(ctx, orig); err != nil {
 				return AppliedMsg{Err: err}
 			}
 		}
 		at, err := store.Apply(ctx, payload)
-		return AppliedMsg{ApplyTime: at, Err: err}
+		return AppliedMsg{ApplyTime: at, BaselineFailed: baseline, Err: err}
 	}
 }
 
@@ -174,13 +180,9 @@ type PolledMsg struct {
 }
 
 // ClusterPollDeadline bounds a ConfigMap edit's wait: the worst-case kubelet
-// sync (~60s) plus the framework's drain window (30s) plus jitter.
-//
-// The drain does NOT actually delay the verdict — the reloader records success
-// synchronously right after the Holder swap and drains the old pipelines in a
-// goroutine — so this is generous rather than tight. Kept at 120s regardless,
-// because for a cluster the kubelet sync is the real variable and it is not
-// worth shaving.
+// sync (~60s) plus jitter, doubled. The verdict does not wait on the drain —
+// the reloader records success right after the Holder swap and drains the old
+// pipelines in a goroutine.
 const ClusterPollDeadline = 120 * time.Second
 
 // LocalPollDeadline bounds a local file edit's wait. The proxy is already
@@ -201,11 +203,11 @@ const LocalPollDeadline = 30 * time.Second
 // Takes the whole Target rather than a growing list of scalars — the deadline
 // and the unreachable wording both come from it, and passing it entire keeps
 // them from being sourced from different stores.
-func PollCmd(ctx context.Context, statusURL string, applyTime time.Time, tg Target) tea.Cmd {
+func PollCmd(ctx context.Context, statusURL string, applyTime time.Time, baselineFailed int64, tg Target) tea.Cmd {
 	return func() tea.Msg {
 		c, cancel := context.WithTimeout(ctx, tg.Deadline())
 		defer cancel()
-		return PolledMsg{Result: PollUntilReloaded(c, statusURL, applyTime, tg.UnreachableHint)}
+		return PolledMsg{Result: PollUntilReloaded(c, statusURL, applyTime, baselineFailed, tg.UnreachableHint)}
 	}
 }
 

@@ -8,11 +8,13 @@ import (
 	"strings"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/rossoctl/cortex/cmd/agentop/money"
 	"github.com/rossoctl/cortex/cmd/agentop/tui/table"
 	"github.com/rossoctl/cortex/core/pipeline"
+	"github.com/rossoctl/cortex/core/session/timeline"
 )
 
 // eventKey pins a row to a specific event across rebuilds, so the
@@ -25,6 +27,13 @@ type eventKey struct {
 	direction pipeline.Direction
 	phase     pipeline.SessionPhase
 	requestID string
+	// isTool, tool, toolAgent and toolSeq pin a tool row: its tool ID, agent and response seq.
+	// The seq tells apart two calls with one ID: some local models send call_0 on every turn,
+	// and some send no ID. toolPos tells apart two calls with no ID in one response.
+	isTool          bool
+	tool, toolAgent string
+	toolSeq         uint64
+	toolPos         int
 }
 
 func keyOf(e *pipeline.SessionEvent) eventKey {
@@ -34,13 +43,37 @@ func keyOf(e *pipeline.SessionEvent) eventKey {
 	return eventKey{at: e.At.UnixNano(), direction: e.Direction, phase: e.Phase, requestID: e.RequestID}
 }
 
-func findByKey(rows []eventRow, k eventKey) int {
-	for i, r := range rows {
-		if keyOf(r.event) == k {
-			return i
-		}
+// pinKeyOf is the pin key of row er: its tool for a tool row, else its event.
+func pinKeyOf(er eventRow) eventKey {
+	if er.tool != nil {
+		return eventKey{isTool: true, tool: er.tool.ID, toolAgent: er.tool.Agent, toolSeq: er.tool.Seq, toolPos: er.tool.Pos}
 	}
-	return -1
+	return keyOf(er.event)
+}
+
+// selectedPinKey is the pin key of the row under the cursor.
+func (m *model) selectedPinKey() eventKey {
+	return pinKeyOf(m.selectedRowOn(m.eventsTbl.Cursor()))
+}
+
+// findByKey is the row that holds the event with key k, by either half (#1681). A pin can
+// name a response: a response-only row is keyed by it, and the row merges with its request
+// when the older page with the request loads.
+func findByKey(rows []eventRow, k eventKey) int {
+	if k.isTool {
+		return slices.IndexFunc(rows, func(r eventRow) bool {
+			return r.tool != nil && r.tool.ID == k.tool && r.tool.Agent == k.toolAgent && r.tool.Seq == k.toolSeq &&
+				r.tool.Pos == k.toolPos
+		})
+	}
+	return slices.IndexFunc(rows, func(r eventRow) bool {
+		return rowHolds(r, func(e *pipeline.SessionEvent) bool { return keyOf(e) == k })
+	})
+}
+
+// rowHolds reports whether either half of row r satisfies match.
+func rowHolds(r eventRow, match func(*pipeline.SessionEvent) bool) bool {
+	return (r.event != nil && match(r.event)) || (r.resp != nil && match(r.resp))
 }
 
 // newEventsTable builds an empty events table. Uses the shared tableStyles like every other pane.
@@ -59,32 +92,44 @@ func newEventsTable() table.Model {
 		// beside the widths that actually decide, in eventColumns.
 		// No sort column: the table is chronological until a model says otherwise.
 		table.WithColumns(tableColumns(selectedColumns(defaultColumnSelection()), "", false)),
+		table.WithCellStyle(eventCellStyle(selectedColumns(defaultColumnSelection()), nil)),
 		table.WithFocused(true),
 	)
 	t.SetStyles(tableStyles())
 	return t
 }
 
-// eventRow is one display row — exactly one network message. The cartesian
-// "row per plugin invocation" model is gone: a message touched by N plugins
-// is a single row, with the per-plugin breakdown available in the detail
-// pane. tunnel, when non-nil, is a CONNECT tunnel-open event folded into a
-// TLS-bridged request (see buildEventRows); it contributes a summary line to
-// the detail pane but no separate row.
+// eventRow is one display row: one exchange (#1681). event is the row's first event — the
+// request, or the only event of a row with one half: a denial, a request no answer reached,
+// a response whose request is not held. resp is the response or denial that mergeExchanges
+// folded in. tunnel, when non-nil, is a CONNECT tunnel-open event folded into a TLS-bridged
+// request (see buildEventRows). It contributes a summary line to the detail pane but no
+// separate row.
 type eventRow struct {
 	event  *pipeline.SessionEvent
 	tunnel *pipeline.SessionEvent
+	resp   *pipeline.SessionEvent
+	// raw and respRaw are the exact captures of event and resp, set on the row the detail
+	// pane fetched them for.
+	raw     *pipeline.RawCapture
+	respRaw *pipeline.RawCapture
+	// tool is set on a tool row (#1776), which has no event. last is set on the last tool
+	// of its exchange.
+	tool *toolRow
+	last bool
 }
 
-// invocations returns every plugin invocation the row's ACTION/PLUGIN cell and
-// the inactive filter should consider: the event's own, plus any folded
-// CONNECT tunnel's gate invocations — so a bridged row reflects activity on the
-// tunnel-open (e.g. an egress gate that allowed the CONNECT) and isn't wrongly
-// hidden or under-reported.
+// invocations returns every plugin invocation the row's ACTION/PLUGIN cell and the inactive
+// filter should consider: both halves of the exchange, plus any folded CONNECT tunnel's gate
+// invocations — so a bridged row reflects activity on the tunnel-open (e.g. an egress gate
+// that allowed the CONNECT) and isn't wrongly hidden or under-reported.
 func (er eventRow) invocations() []pipeline.Invocation {
 	invs := allInvocations(er.event)
 	if er.tunnel != nil {
 		invs = append(invs, allInvocations(er.tunnel)...)
+	}
+	if er.resp != nil {
+		invs = append(invs, allInvocations(er.resp)...)
 	}
 	return invs
 }
@@ -115,11 +160,17 @@ func (m *model) rebuildEventsTable() {
 		if h < 3 {
 			h = 3
 		}
-		m.eventsTbl.SetHeight(h)
+		// SetHeight draws the page again, and SetRows below draws it anyway; skip it when
+		// the height holds. Height() leaves out the one-line header.
+		if m.eventsTbl.Height() != h-1 {
+			m.eventsTbl.SetHeight(h)
+		}
 	}
 
 	prevRow := m.eventsTbl.Cursor()
-	wasAtEnd := prevRow >= len(m.eventsTbl.Rows())-1
+	// A tool pin that waits for its timeline left the cursor on a stand-in row, not at the end.
+	pinWaits := m.selectedEventKey.isTool && findByKey(m.visibleRows, m.selectedEventKey) < 0
+	wasAtEnd := prevRow >= len(m.eventsTbl.Rows())-1 && !pinWaits
 
 	// One display row per network message. CONNECT tunnel-opens are folded
 	// into the decrypted inner request that immediately follows them (TLS
@@ -131,6 +182,9 @@ func (m *model) rebuildEventsTable() {
 	// integer repeated across a request/response exchange, which is how an
 	// exchange is read off the timeline.
 	ids, partner := computeEventPairs(eventRows)
+	// One row per exchange (#1681). ids stays the pass above's: it is keyed by event pointer,
+	// so a merged row keeps the number its request had, and # reads as it always did.
+	eventRows, partner = mergeExchanges(eventRows, partner)
 
 	// One cellContext per row of the SESSION, before hideInactive drops any. The
 	// fitsContent columns are measured over all of them (see measureColumns), and the row
@@ -141,6 +195,7 @@ func (m *model) rebuildEventsTable() {
 	// then hides, which the loop used to skip. Each is evaluated once per row, which is
 	// what showing every row pays on every rebuild anyway, so hiding rows never makes a
 	// rebuild dearer than showing them.
+	ref := m.lostRef(events)
 	ctxs := make([]cellContext, len(eventRows))
 	for i, er := range eventRows {
 		// One invocations and one rowAction per row: hideInactive below reads invs,
@@ -150,8 +205,8 @@ func (m *model) rebuildEventsTable() {
 		invs := er.invocations()
 		action, plugin := rowAction(er, invs)
 		ctxs[i] = cellContext{
-			m: m, rows: eventRows, partner: partner, i: i, row: er, ids: ids,
-			invs: invs, action: action, plugin: plugin,
+			m: m, row: er, ids: ids,
+			invs: invs, action: action, plugin: plugin, lost: rowLost(er, partner, i, ref),
 		}
 	}
 
@@ -167,6 +222,16 @@ func (m *model) rebuildEventsTable() {
 	rows := make([]table.Row, 0, len(eventRows))
 	m.visibleRows = m.visibleRows[:0]
 	m.hiddenInactive = 0
+
+	// The older-events row goes first, with no event under it, like a subagent header.
+	// lead is how many rows precede the events: the sort below must not move this one.
+	lead := 0
+	older := m.olderNotice()
+	if older != "" {
+		rows = append(rows, table.Row{older})
+		m.visibleRows = append(m.visibleRows, eventRow{})
+		lead = 1
+	}
 
 	// Subagent blocks (#1047), only while CHRONOLOGICAL: under a sort the row
 	// order is a ranking, and pulling a subagent's rows under a header would
@@ -218,10 +283,8 @@ func (m *model) rebuildEventsTable() {
 	}
 	// keys is the sort value for each row that survived the filters, parallel to
 	// rows and m.visibleRows. Collected inside the loop because the sortKey funcs
-	// take the same cellContext the cells do — including the chronological index the
-	// TOKENS and COST keys need to reach their paired response — and that context
-	// only exists here. nil when no sort is active, so the default path allocates
-	// nothing.
+	// take the same cellContext the cells do, and that context only exists here.
+	// nil when no sort is active, so the default path allocates nothing.
 	var keys []rowKey
 	var sortCol *eventColumn
 	if m.sortCol != "" {
@@ -233,17 +296,35 @@ func (m *model) rebuildEventsTable() {
 			}
 		}
 	}
+	// Tool rows (#1776) join an exchange by its response's seq, only for the session the
+	// timeline is for: a linked bucket's events carry seqs of another session.
+	var tools map[uint64][]toolRow
+	if m.timeline.session == m.selectedSess {
+		tools = m.timeline.tools
+	}
+	toolsOf := func(er eventRow) []toolRow {
+		resp := exchangeResp(er)
+		if len(tools) == 0 || resp == nil || resp.Seq == 0 || eventSession(m.selectedSess, resp) != m.selectedSess {
+			return nil
+		}
+		return tools[resp.Seq]
+	}
+	now := m.clock()
 	q := m.searchQuery(paneEvents)
 	var full []table.SearchRow
 	var droppedCols []eventColumn
 	if q != "" {
 		droppedCols = droppedColumns(selectedColumns(m.eventColumns), cols)
+		for range lead {
+			full = append(full, table.SearchRow{NoMatch: true})
+		}
 	}
 	// renderEventRow appends one event's cells to every parallel structure the
 	// pane keeps — the table's rows, visibleRows, and the search rows — so the
 	// two places a row can render from (its own loop turn, or its block's
-	// expansion below) cannot drift apart.
-	renderEventRow := func(j int) {
+	// expansion below) cannot drift apart. The exchange's tool rows follow it, and it
+	// returns them.
+	renderEventRow := func(j int) []toolRow {
 		cc := ctxs[j]
 		row := make(table.Row, 0, len(cols))
 		for _, c := range cols {
@@ -264,6 +345,17 @@ func (m *model) rebuildEventsTable() {
 		if q != "" {
 			full = append(full, eventSearchRow(cols, droppedCols, cc))
 		}
+		ts := toolsOf(cc.row)
+		for i := range ts {
+			tr := eventRow{tool: &ts[i], last: i == len(ts)-1}
+			cells, sr := toolCells(cols, cc, tr, now)
+			rows = append(rows, cells)
+			m.visibleRows = append(m.visibleRows, tr)
+			if q != "" {
+				full = append(full, sr)
+			}
+		}
+		return ts
 	}
 	for j, cc := range ctxs {
 		// hideInactive (the `s` toggle) is off by default — every message is
@@ -294,7 +386,7 @@ func (m *model) rebuildEventsTable() {
 		if b := m.subagentBlocks[cc.row.event.Subagent]; b != nil {
 			if !b.anchored {
 				b.anchored = true
-				text := b.headerText(m.subagentLabel(b.id), m.blockOpen(b.id, q != ""))
+				text := b.headerText(m.subagentLabel(b.id, b.subtask, b.bob), m.blockOpen(b.id, b.subtask, q != ""))
 				rows = append(rows, table.Row{text})
 				m.visibleRows = append(m.visibleRows, eventRow{})
 				if m.headerRows == nil {
@@ -304,7 +396,7 @@ func (m *model) rebuildEventsTable() {
 				if q != "" {
 					full = append(full, table.SearchRow{Cells: []string{text}})
 				}
-				if m.blockOpen(b.id, q != "") {
+				if m.blockOpen(b.id, b.subtask, q != "") {
 					// b.rows holds exactly the member rows that survived the
 					// inactive filter, in arrival order — the same population the
 					// loop below renders — so nothing is double-counted or skipped.
@@ -318,37 +410,39 @@ func (m *model) rebuildEventsTable() {
 			continue
 		}
 
-		renderEventRow(j)
+		ts := renderEventRow(j)
 		// Keyed from the SAME cellContext that just rendered the row, so the value
 		// sorted on and the value displayed cannot come apart. cc.width stays zero
 		// here — render takes its own copy — and no sortKey reads it.
 		//
-		// exchange is the row's own ARRIVAL index, carried beside the key so the sort
-		// can group a pair without consulting a second slice. j indexes ctxs, which is
-		// every row before hideInactive drops any, so it is the one index that means
-		// the same thing in `partner` as it does here. The sort never reads it as a
-		// position in `keys` — only compares two of them — so the filter's gaps are
-		// harmless.
+		// Each row is one exchange (#1681), so exchange is the row's own arrival
+		// index. j indexes ctxs, which is every row before hideInactive drops any.
+		// The sort never reads it as a position in `keys` — only compares two of
+		// them — so the filter's gaps are harmless.
+		//
+		// The exchange's tool rows take its key and its exchange (#1805). All three
+		// tiers of sortEventRows then tie, and the row position keeps the tools
+		// directly under the exchange, in timeline order. With keys of their own, the
+		// tools left their exchange, and on a column with no tool value they all
+		// collected at one end of the table.
 		//
 		// Member rows take the block branch above and never reach this — safe
 		// because blocks exist only while no sort is active (see the collection
 		// above), so a row the sort needs cannot be skipped by a block.
 		if sortCol != nil {
-			keys = append(keys, rowKey{val: sortCol.sortKey(cc), exchange: j})
+			k := rowKey{val: sortCol.sortKey(cc), exchange: j}
+			for range len(ts) + 1 {
+				keys = append(keys, k)
+			}
 		}
 	}
 	// Sort the OUTPUT, never the input. buildEventRows' tunnel fold, the backward
-	// walk in computeEventPairs and the partner-index lookups in the TOKENS/COST
-	// cells all require arrival order, and every one of them has already run by the
-	// time we get here — so reordering the finished rows leaves the exchange
-	// numbering and the paired figures exactly as they were.
+	// walk in computeEventPairs and mergeExchanges all require arrival order, and
+	// every one of them has already run by the time we get here — so reordering the
+	// finished rows leaves the exchange numbering and the merged figures exactly as
+	// they were.
 	if sortCol != nil {
-		// Pairs fold only where the column asks for it. See eventColumn.pairFold for
-		// why DURATION and STATUS do and TOKENS and COST must not.
-		if sortCol.pairFold {
-			foldPairKeys(keys, partner)
-		}
-		sortEventRows(rows, m.visibleRows, full, keys, m.sortDesc)
+		sortEventRows(rows[lead:], m.visibleRows[lead:], full[min(lead, len(full)):], keys, m.sortDesc)
 	}
 	// Columns are re-set only when they actually differ, and in an order that keeps
 	// every intermediate state renderable.
@@ -369,6 +463,18 @@ func (m *model) rebuildEventsTable() {
 	// or narrowing as figures arrive, which can push a column off the terminal or
 	// let one back on. The third happens mid-stream with no keystroke behind it, so
 	// none of them may re-anchor the pane under an operator who is reading it.
+	kinds := make([]eventRowKind, len(rows))
+	for i, vr := range m.visibleRows[:min(len(m.visibleRows), len(rows))] {
+		if vr.tool != nil {
+			kinds[i] = eventRowTool
+		}
+	}
+	for i := range m.headerRows {
+		if i < len(kinds) {
+			kinds[i] = eventRowHeader
+		}
+	}
+	m.eventsTbl.SetCellStyle(eventCellStyle(cols, kinds))
 	newCols := tableColumns(cols, m.sortCol, m.sortDesc)
 	switch oldCols := m.eventsTbl.Columns(); {
 	case slices.Equal(oldCols, newCols):
@@ -421,7 +527,7 @@ func (m *model) rebuildEventsTable() {
 	// zero-valued: a real pin, including one the eviction branch below deliberately
 	// cleared, must not be overwritten.
 	if m.sortCol != "" && m.selectedEventKey == (eventKey{}) {
-		m.selectedEventKey = keyOf(m.selectedEventOn(prevRow))
+		m.selectedEventKey = pinKeyOf(m.selectedRowOn(prevRow))
 	}
 
 	// An OPENING, not a refresh: the session under the table changed. This is the
@@ -462,95 +568,29 @@ func (m *model) rebuildEventsTable() {
 	// operator actually wants followed.
 	case wasAtEnd && m.sortCol == "":
 		target = len(rows) - 1
+		// Move a tool pin to the new last row: a pin left on an older tool row pulls the cursor
+		// back to it when a later timeline lands, and ends tail-follow.
+		if m.selectedEventKey.isTool {
+			m.selectedEventKey = pinKeyOf(m.selectedRowOn(target))
+		}
 	case m.selectedEventKey != (eventKey{}):
 		if idx := findByKey(m.visibleRows, m.selectedEventKey); idx >= 0 {
 			target = idx
-		} else {
-			// Event evicted — clamp to the oldest surviving row (row 0),
+		} else if !m.selectedEventKey.isTool || m.toolsLoaded() {
+			// Event evicted — clamp to the oldest surviving row,
 			// the nearest edge to where the pin was, and drop the stale
 			// key so internal state matches what the operator sees.
-			target = 0
+			target = lead
 			m.selectedEventKey = eventKey{}
 		}
 	}
 	setCursorVisible(&m.eventsTbl, target)
 }
 
-// foldPairKeys gives both rows of one exchange the SAME sort key, so a sort can
-// never separate a request from its response (#1251).
-//
-// THE PROBLEM IS NOT THE SORT, IT IS THAT THE TWO ROWS CARRY DIFFERENT DATA. A
-// response row holds the figures the proxy only knows once the call returned —
-// DURATION, STATUS, the response token count — and the request row holds none of
-// them. So sorting by DURATION put every response in the ordered region and sank
-// every request into the zero group, and an operator reading the slowest call saw
-// its response eleven rows above the request that caused it. The reporter asked
-// whether the sorting was wrong; it was faithfully sorting rows that should not
-// have been ranked independently.
-//
-// THE EXCHANGE IS THE UNIT A READER SORTS BY. "The slowest call" names an
-// exchange, not one of its two rows, so the fix is to rank exchanges and keep each
-// one's rows together — which is what the # column has always claimed by giving a
-// request and its response one number.
-//
-// ONLY FOR THE COLUMNS THAT ASK — eventColumn.pairFold, today DURATION and STATUS.
-// TOKENS and COST deliberately do not: each of their rows already carries a real
-// figure of its own (prompt on the request, completion on the response), so folding
-// them would make the sort disagree with the number on screen.
-//
-// MAX, not the response's key. On a pairFold column the request's key is the zero
-// one, so the max IS the response's — but writing it as max keeps this function
-// honest for any future column where the request holds the larger figure, and means
-// it cannot invent a number neither row had.
-//
-// UNPAIRED ROWS ARE LEFT ALONE: a fire-and-forget request with no response, a
-// response whose request was evicted, and an opaque tunnel's two rows when
-// computeEventPairs could not match them. Each keeps its own key and ranks on its
-// own, which is right — there is no exchange to speak for.
-//
-// A FOLDED PAIR ALSO SHARES ONE exchange, the REQUEST's arrival index, and that is
-// what keeps the two rows adjacent. Equal keys alone do not: two exchanges that tie
-// — overlapping 200s on STATUS, the common case, since almost everything is 200 —
-// would keep arrival order and interleave as req/req/resp/resp. sortEventRows
-// tie-breaks on exchange, so rows of one exchange sort as a block whatever else
-// ties with them, and request-before-response inside the block is a third tier that
-// a descending sort does not reverse.
-//
-// KEYED BY `partner`'s INDEX SPACE, NOT BY POSITION IN keys. partner counts over
-// every row the session has; keys holds only the rows that survived hideInactive. A
-// single hidden row makes those two disagree, and folding by position then merged
-// the wrong rows' keys — a complete hidden pair happens to shift by two and give the
-// right answer, which is why a fixture of whole pairs cannot catch it. byExchange
-// maps an arrival index to its row, so a filtered-out row is simply absent.
-func foldPairKeys(keys []rowKey, partner map[int]int) {
-	byExchange := make(map[int]int, len(keys))
-	for pos := range keys {
-		byExchange[keys[pos].exchange] = pos
-	}
-	for i, j := range partner {
-		// partner is bidirectional, so every pair appears twice. Fold on the lower
-		// index only: doing it from both ends is harmless with max, but doing it once
-		// makes the single write obvious and halves the work.
-		if i >= j {
-			continue
-		}
-		// Either row may have been filtered out, and a half-visible pair has no
-		// exchange to speak for: the visible row keeps its own key and its own
-		// arrival index, exactly as an unpaired row does.
-		pi, iOK := byExchange[i]
-		pj, jOK := byExchange[j]
-		if !iOK || !jOK {
-			continue
-		}
-		folded := keys[pi].val
-		if folded.less(keys[pj].val) {
-			folded = keys[pj].val
-		}
-		// i is the lower arrival index of the two, which for a request/response pair
-		// is the request — the exchange's identity, and min(i, partner[i]).
-		keys[pi] = rowKey{val: folded, exchange: i}
-		keys[pj] = rowKey{val: folded, exchange: i}
-	}
+// toolsLoaded reports that the events pane's session has its timeline, or that its fetch
+// failed. Until then a tool pin that matches no row is kept.
+func (m *model) toolsLoaded() bool {
+	return m.timeline.session == m.selectedSess && (m.timeline.tl != nil || m.timeline.err != nil)
 }
 
 // sortEventRows reorders the rendered rows by their sort keys (#865).
@@ -582,18 +622,13 @@ func sortEventRows(rows []table.Row, visible []eventRow, full []table.SearchRow,
 	// THREE TIERS, and only the first one reverses.
 	//
 	//  1. the column's key, flipped for descending — what the operator asked for.
-	//  2. the exchange, ascending always. Rows of one exchange share it (foldPairKeys
-	//     gives both the request's arrival index), so they sort as a block and nothing
-	//     that merely ties on the key can land between them. Equal keys are the norm
-	//     rather than the exception — on STATUS almost everything is 200 — so without
-	//     this two overlapping exchanges interleave as req/req/resp/resp.
-	//  3. arrival order within the block, ascending always: request, then response.
+	//  2. the exchange, ascending always. Each row is one exchange (#1681), so
+	//     exchange is the row's own arrival index. Ties keep arrival order.
+	//  3. the row's position, ascending always. Only an exchange and its tool rows
+	//     tie on the first two tiers, so this keeps the tools under the exchange.
 	//
-	// Tiers 2 and 3 do NOT flip, and that is the point rather than an oversight. An
-	// exchange reads request-then-response at both ends of the sort, because the
-	// pair's internal order is a fact about the exchange and not a ranking the
-	// operator reversed. Descending flips which exchange comes first, never what an
-	// exchange looks like.
+	// Tiers 2 and 3 do NOT flip. Descending flips which exchange comes first, never
+	// the order of rows that tie.
 	//
 	// Both tiers compare arrival indexes without indexing anything by them, so the
 	// gaps hideInactive leaves in that numbering cost nothing.
@@ -631,18 +666,18 @@ func sortEventRows(rows []table.Row, visible []eventRow, full []table.SearchRow,
 	}
 }
 
-// selectedEventOn returns the event at an arbitrary row of the rows just built, or
-// nil when the row is out of range.
+// selectedRowOn returns the row at an arbitrary row of the rows just built, or the zero
+// eventRow when the row is out of range.
 //
-// Distinct from selectedEvent, which reads the TABLE's cursor: during a rebuild the
+// Distinct from selectedEventRow, which reads the TABLE's cursor: during a rebuild the
 // table has already been handed the new rows but the cursor has not been restored
 // yet, so the only meaningful row index is the one carried over from before the
 // rebuild. Used to seed the sort pin from that row.
-func (m *model) selectedEventOn(row int) *pipeline.SessionEvent {
+func (m *model) selectedRowOn(row int) eventRow {
 	if row < 0 || row >= len(m.visibleRows) {
-		return nil
+		return eventRow{}
 	}
-	return m.visibleRows[row].event
+	return m.visibleRows[row]
 }
 
 // selectedEvent returns the event at the cursor row, or nil. The cursor
@@ -694,6 +729,113 @@ func buildEventRows(events []pipeline.SessionEvent) []eventRow {
 		rows = append(rows, eventRow{event: e})
 	}
 	return rows
+}
+
+// mergeExchanges folds each response or denial into the row of the request it answers
+// (#1681): one row per exchange, at the request's position, so a response changes its row
+// instead of adding one.
+//
+// ONLY AN EXACT PAIR MERGES — one partner joined by RequestID. The heuristic pass in
+// computeEventPairs can pair a response with another call's request, and a merged row would
+// then show that call's status and duration as this one's. A guessed pair stays two rows.
+//
+// Returns the merged rows and the partner map re-indexed onto them. Only guessed pairs are
+// left in it, which is what rowInactiveHidden still needs to keep such a pair together.
+func mergeExchanges(rows []eventRow, partner map[int]int) ([]eventRow, map[int]int) {
+	out := make([]eventRow, 0, len(rows))
+	at := make(map[int]int, len(rows)) // index in rows → index in out
+	for i, r := range rows {
+		if j, ok := partner[i]; ok && exactPair(rows, i, j) {
+			if r.event.Phase != pipeline.SessionRequest {
+				continue // it went out with its request
+			}
+			r.resp = rows[j].event
+		}
+		at[i] = len(out)
+		out = append(out, r)
+	}
+	left := make(map[int]int)
+	for i, j := range partner {
+		if !exactPair(rows, i, j) {
+			left[at[i]] = at[j]
+		}
+	}
+	return out, left
+}
+
+// exactPair reports that rows i and j share a RequestID: the pair computeEventPairs made from
+// the proxy's stamp, not from its guess.
+func exactPair(rows []eventRow, i, j int) bool {
+	a, b := rows[i].event, rows[j].event
+	return a.RequestID != "" && a.RequestID == b.RequestID
+}
+
+// answer is the event that holds row r's outcome — STATUS, DURATION, the response's bytes:
+// the merged response when there is one, else the row's own event (a denial, a response
+// whose request is not held, or a request no answer reached yet).
+func answer(r eventRow) *pipeline.SessionEvent {
+	if r.resp != nil {
+		return r.resp
+	}
+	return r.event
+}
+
+// exchangeResp is the response that speaks for row r: the merged one, or the row's own event
+// when the row is a response. Nil while no answer arrived. A guessed pair's request row gets
+// nil too, because its response stays on a row of its own.
+func exchangeResp(r eventRow) *pipeline.SessionEvent {
+	if r.resp != nil {
+		return r.resp
+	}
+	if r.event != nil && r.event.Phase == pipeline.SessionResponse {
+		return r.event
+	}
+	return nil
+}
+
+// exchangeBytes is what row r carried: the request's body up and the response's down. An
+// opaque tunnel's close row counts both directions itself, so it answers alone.
+func exchangeBytes(r eventRow) (up, down int64) {
+	if r.resp == nil || r.resp.Tunnel {
+		a := answer(r)
+		return a.BytesUp, a.BytesDown
+	}
+	return r.event.BytesUp, r.resp.BytesDown
+}
+
+// lostRef is the instant the lost rule measures against: the later of now and the newest
+// event held. It is the ref Timeline.LoseUnanswered uses, so the two panes call the same
+// request lost. The newest event matters when the clock is behind the session's clock. The
+// README demo runs a shifted clock.
+func (m *model) lostRef(events []pipeline.SessionEvent) time.Time {
+	ref := m.clock()
+	for i := range events {
+		if events[i].At.After(ref) {
+			ref = events[i].At
+		}
+	}
+	return ref
+}
+
+// rowLost reports that row i is a request no answer will reach (#1681): no response, and
+// older than timeline.HostLostAfter at ref. On real traffic 52 such requests sat among
+// answered ones, and a blank STATUS would have said "on its way" forever.
+//
+// A tunnel open is never lost. It carries no status, and a passthrough tunnel stays open for
+// hours (6.4 hours measured), so age says nothing about it. A guessed pair's request is not
+// lost either: its response is on a row of its own. A guessed pair can only form around a
+// request with no RequestID, so such a request is never lost here. The Timeline judges
+// outbound requests with a host only, so an inbound or hostless one is never lost here either.
+func rowLost(r eventRow, partner map[int]int, i int, ref time.Time) bool {
+	e := r.event
+	if r.resp != nil || e == nil || e.Direction != pipeline.Outbound || e.Host == "" ||
+		e.Phase != pipeline.SessionRequest || e.Tunnel || e.RequestID == "" {
+		return false
+	}
+	if _, ok := partner[i]; ok {
+		return false
+	}
+	return ref.Sub(e.At) > timeline.HostLostAfter
 }
 
 // isTunnelOpen reports whether e is a CONNECT / transparent-redirect
@@ -821,25 +963,26 @@ func actionRank(a pipeline.InvocationAction) int {
 	return 0
 }
 
-// topInvocation returns the highest-ranked invocation satisfying keep and how
-// many tied at that top rank. winner is the zero Invocation (Action "", rank 0)
-// when none satisfy keep.
+// topInvocation returns the highest-ranked invocation satisfying keep and how many distinct
+// plugins tied at that top rank. Distinct, because a row is an exchange (#1681): the same
+// two plugins observe both halves of most inference calls, and counting invocations read
+// "4 plugins". winner is the zero Invocation (Action "", rank 0) when none satisfy keep.
 func topInvocation(invs []pipeline.Invocation, keep func(pipeline.Invocation) bool) (pipeline.Invocation, int) {
 	best := -1
-	count := 0
 	var winner pipeline.Invocation
+	var names []string
 	for _, iv := range invs {
 		if !keep(iv) {
 			continue
 		}
 		switch r := actionRank(iv.Action); {
 		case r > best:
-			best, count, winner = r, 1, iv
-		case r == best:
-			count++
+			best, winner, names = r, iv, []string{iv.Plugin}
+		case r == best && !slices.Contains(names, iv.Plugin):
+			names = append(names, iv.Plugin)
 		}
 	}
-	return winner, count
+	return winner, len(names)
 }
 
 // shadowFlagged reports whether any invocation is a shadow deny/modify — a
@@ -995,23 +1138,6 @@ func shortDirection(d pipeline.Direction) string {
 	return "out"
 }
 
-func shortPhase(p pipeline.SessionPhase) string {
-	switch p {
-	case pipeline.SessionRequest:
-		return "req"
-	case pipeline.SessionResponse:
-		return "resp"
-	case pipeline.SessionDenied:
-		// A denied event is a request that didn't reach the response
-		// phase. The terminal-deny semantics are already conveyed by
-		// the ACTION column ("deny") and STATUS column (4xx/5xx);
-		// rendering "deny" in PHASE too is duplicative. Show "req" so
-		// PHASE always communicates lifecycle position.
-		return "req"
-	}
-	return "?"
-}
-
 // eventMethodValue is the raw, untruncated method/model for an event — the A2A
 // method, inference model, or MCP method. Used for logic (pairing, filtering)
 // where truncation would conflate distinct names sharing a 22-char prefix or
@@ -1046,42 +1172,16 @@ func statusCell(e pipeline.SessionEvent) string {
 	return fmt.Sprintf("%d", e.StatusCode)
 }
 
-// generatedTokensCell shows what a response generated. Deliberately the output
-// count and not TotalTokens: for a long-running agent the prompt dominates the
-// aggregate so completely (cache reads in the hundreds of thousands) that
-// TotalTokens barely moves between turns, hiding the one component that actually
-// varies. The prompt side is on the request row, so between them the two rows
-// account for the whole exchange without either repeating the other.
-//
-// They usually also ADD UP to TotalTokens, but that is not guaranteed and is not
-// relied on: TokenUsage.Fill prefers the provider's own reported total when it
-// sends one, which need not equal the parts. Each row reports its own measured
-// half, so the display stays honest either way.
-//
-// The CompletionTokens fallback cannot currently fire — Fill sets it from the
-// same Output value read above — and is kept only for symmetry with promptTokens.
-func generatedTokensCell(e *pipeline.SessionEvent) string {
-	if e.Inference == nil {
-		return ""
-	}
-	n := e.Inference.OutputTokens
-	if n == 0 {
-		n = e.Inference.CompletionTokens
-	}
-	if n <= 0 {
-		return ""
-	}
-	return formatCount(n)
-}
-
 // bytesCell renders a row's byte counts, up (client to destination) then down.
 //
 // A tunnel's close row is the one that reports BOTH, and it keeps the pair rendering
 // even where one side is zero: the counts are absent on the wire when zero, so a
 // genuine zero one way is shown only once the other side proves the row carries
-// counts at all. Every other row reports a single side — a request knows what it
-// forwarded, a response what came back — so printing the pair there would put a
-// fabricated "↓0B" next to every request size.
+// counts at all. A merged row reports both too (exchangeBytes): the request's ↑ and
+// the response's ↓. Each of its sides shows only when it is not zero. A row with one
+// half reports a single side — a request knows what it forwarded, a response what
+// came back — so printing the pair there would put a fabricated "↓0B" next to every
+// request size.
 //
 // Blank when nothing was counted, which is NOT the same as a body of zero bytes:
 // an unbuffered body is relayed unmeasured and reads here exactly as a body-less GET
@@ -1170,7 +1270,7 @@ func padLeft(s string, width int) string {
 //   - ids: a small integer per event, shared across a (request, response)
 //     exchange and freshly minted for unpaired rows. Drives the # column.
 //   - partner: a bidirectional row-index map (partner[i]=j and partner[j]=i)
-//     for matched pairs. Drives the PHASE-column span glyphs.
+//     for matched pairs. mergeExchanges folds the exact ones into one row.
 //
 // Each response row is matched to the closest preceding unpaired request row
 // sharing direction + host (port-normalized) + method. The method component
@@ -1180,7 +1280,9 @@ func padLeft(s string, width int) string {
 //
 // Pairing prefers SessionEvent.RequestID, which the proxy stamps on both the
 // request and response event of the same exchange. That is exact, including
-// under concurrency.
+// under concurrency. A denial with the request's RequestID answers it too, as
+// in the Timeline: the egress allow list refuses a redirect target after the
+// request row landed.
 //
 // The closest-preceding heuristic below remains for events with no RequestID —
 // an older proxy, or a listener that has not been taught to stamp it. It matches
@@ -1211,7 +1313,7 @@ func computeEventPairs(rows []eventRow) (map[*pipeline.SessionEvent]int, map[int
 	}
 	for j := range rows {
 		e := rows[j].event
-		if e.RequestID == "" || e.Phase != pipeline.SessionResponse {
+		if e.RequestID == "" || (e.Phase != pipeline.SessionResponse && e.Phase != pipeline.SessionDenied) {
 			continue
 		}
 		i, ok := reqByID[e.RequestID]
@@ -1299,6 +1401,37 @@ var identityBannerStyle = lipgloss.NewStyle().
 // extra screen rows that the events table had already claimed. Rows fell off the bottom, which
 // is indistinguishable from the cursor bug this pane also had.
 const identityBannerHeight = 6
+
+// olderNotice is the text of the timeline's first row when the session holds events the
+// snapshot did not load. Enter on that row loads the page before them. Empty when nothing
+// is missing. Plain text: the table truncates a row by its width in runes.
+func (m *model) olderNotice() string {
+	n := m.olderNotFetched[m.selectedSess]
+	if n <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("▲ press Enter to load %d older event%s", n, plural(n))
+}
+
+// onOlderRow reports whether the events cursor is on the older-events row.
+func (m *model) onOlderRow() bool {
+	return m.eventsTbl.Cursor() == 0 && m.olderNotice() != ""
+}
+
+// loadOlderFromRow is Enter on the older-events row. It pins the cursor to the first row
+// that has an event, so the page lands above it and the operator keeps their place. A
+// subagent header has no event, so it cannot be the pin. It pins only when a load starts:
+// a pin from a refused load moves the cursor on the next rebuild.
+func (m *model) loadOlderFromRow() tea.Cmd {
+	cmd := m.loadOlderPage()
+	if cmd == nil {
+		return nil
+	}
+	if i := slices.IndexFunc(m.visibleRows, func(r eventRow) bool { return r.event != nil }); i >= 0 {
+		m.selectedEventKey = keyOf(m.visibleRows[i].event)
+	}
+	return cmd
+}
 
 // identityBannerHeightFor is how many rows layout must give up for the banner: the height of
 // the thing that will actually be rendered, at the width it will be rendered at. Zero when
@@ -1402,114 +1535,50 @@ func truncateScopes(scopes []string, n int) string {
 	return strings.Join(scopes[:n], ", ") + fmt.Sprintf(" +%d more", len(scopes)-n)
 }
 
-// pairedResponse resolves the response row belonging to a request row, or nil
-// when there isn't one yet.
-//
-// Extracted because the TOKENS and COST cells both need it and the id guard must
-// not drift between them: only a response that pairs by RequestID may be used. A
-// heuristically-matched response can belong to a different request, and its cache
-// tier would then pick the wrong rate — a 12.5x error presented as a measurement.
-func pairedResponse(rows []eventRow, partner map[int]int, i int, ev *pipeline.SessionEvent) *pipeline.SessionEvent {
-	j, ok := partner[i]
-	if !ok || j < 0 || j >= len(rows) {
-		return nil // no response yet: the ratio and tier are not known
+// outputTokens is what a response generated. CompletionTokens is the older field for the same
+// count.
+func outputTokens(inf *pipeline.InferenceExtension) int {
+	if inf.OutputTokens > 0 {
+		return inf.OutputTokens
 	}
-	resp := rows[j].event
-	if resp == nil || resp.Phase != pipeline.SessionResponse {
-		return nil
-	}
-	if ev.RequestID == "" || resp.RequestID != ev.RequestID {
-		return nil
-	}
-	return resp
+	return inf.CompletionTokens
 }
 
-// tokensCell renders the TOKENS column, split so the two rows of an exchange sum
-// to the billed total rather than one repeating the other:
-//
-//   - a REQUEST row shows the prompt tokens it sent, with what tool-prune kept
-//     off them in parentheses — which is where the plugin's `modify` invocation
-//     already sits;
-//   - a RESPONSE row shows the tokens generated.
-//
-// The prompt count lives on the response event because the provider is the only
-// party that tokenizes, but it is a request-side quantity — which is what lets a
-// request row show a total at all. So a request row looks forward to its pair.
-func (m *model) tokensCell(rows []eventRow, partner map[int]int, i int, ev *pipeline.SessionEvent) string {
-	switch ev.Phase {
-	case pipeline.SessionResponse:
-		return generatedTokensCell(ev)
-	case pipeline.SessionRequest:
-		resp := pairedResponse(rows, partner, i, ev)
-		if resp == nil {
-			return ""
-		}
-		var saved float64
-		var projected, estimated bool
-		if s, ok := pruneSavingFor(resp); ok {
-			saved, projected, estimated = float64(s.TokensAvoided), s.Projected, s.Estimated
-		}
-		return formatTokensWithSaving(pipeline.PromptTokensOf(resp.Inference), saved, projected, estimated)
-	default:
+// exchangeTokensCell renders an exchange's TOKENS as prompt → output, each compact, with what
+// tool-prune kept off the prompt in parentheses: "70.6k(−3.1k)→9" (#1681). The provider is
+// the only party that tokenizes, so both figures are on the response, and the cell is blank
+// until it arrives.
+func exchangeTokensCell(r eventRow) string {
+	resp := exchangeResp(r)
+	if resp == nil || resp.Inference == nil {
 		return ""
 	}
+	prompt, out := pipeline.PromptTokensOf(resp.Inference), outputTokens(resp.Inference)
+	if prompt <= 0 && out <= 0 {
+		return ""
+	}
+	cell := formatCompact(float64(prompt))
+	if s, ok := pruneSavingFor(resp); ok && s.TokensAvoided > 0 {
+		cell += "(" + savingSign(s.Projected) + formatCompact(float64(s.TokensAvoided)) + ")"
+	}
+	return cell + "→" + formatCompact(float64(out))
 }
 
-// costCell renders the COST column.
-//
-// EVERY CELL IS ROW-LOCAL: what that one row cost, never a running total. Read with
-// TOKENS, which is row-local too, each row divides into its own rate.
-//
-//   - a REQUEST row shows what its prompt cost, modelled per-tier, with the saving in
-//     parentheses.
-//   - a RESPONSE row shows what its generated tokens cost, at the output rate.
-//
-// Both halves come off litellm-budget-track's record as separate figures (prompt_usd,
-// output_usd) rather than being derived here. The response cell used to show the
-// exchange TOTAL, which put a cumulative figure in a per-row column: against a 641k-token
-// cache-heavy turn it rendered $3.0652 beside 1,075 output tokens, implying an output rate
-// of $2,851/MTok to anyone reading the row on its own, and inviting the total to be summed
-// again with the request row above it.
-//
-// The two are still NOT two halves of one sum, unlike TOKENS. They are two breakdowns of
-// one call: the total may be the gateway's own post-discount figure while both halves are
-// always the rate table's, so their sum is the table's opinion of the call and not what
-// was charged. The total remains on the record for the detail view and for the drift
-// check in core/cost/settle.
-//
-// Every figure in this column is therefore a model, and none is marked as one — the
-// distinction the column used to blur (one cell authoritative, one modelled) is gone now
-// that both halves come from the table. costEvent.Source and .Provenance carry it for
-// anyone who needs it.
-//
-// A cell is blank when no figure was published, which reads as "not reported". Blank is
-// specifically not backfilled with the total: an older proxy sends no output_usd, and
-// showing the exchange total there would reintroduce exactly the cumulative reading this
-// column no longer has.
-func (m *model) costCell(rows []eventRow, partner map[int]int, i int, ev *pipeline.SessionEvent) string {
-	switch ev.Phase {
-	case pipeline.SessionResponse:
-		usd, ok := outputCost(ev)
-		if !ok {
-			return ""
-		}
-		return money.Relabel(formatUSDCell(usd), recordUnit(ev), 0)
-	case pipeline.SessionRequest:
-		resp := pairedResponse(rows, partner, i, ev)
-		if resp == nil {
-			return ""
-		}
-		total, ok := promptCost(resp)
-		if !ok {
-			return ""
-		}
-		var savedUSD float64
-		var projected bool
-		if s, ok := pruneSavingFor(resp); ok {
-			savedUSD, projected = s.USD, s.Projected
-		}
-		return money.Relabel(formatUSDWithSaving(total, savedUSD, projected), recordUnit(resp), 0)
-	default:
+// exchangeCostCell renders an exchange's COST: its total, with what tool-prune saved in
+// parentheses. Blank when no figure was published, which reads as "not reported".
+func exchangeCostCell(r eventRow) string {
+	resp := exchangeResp(r)
+	if resp == nil {
 		return ""
 	}
+	usd, ok := exchangeCost(resp)
+	if !ok {
+		return ""
+	}
+	var saved float64
+	var projected bool
+	if s, ok := pruneSavingFor(resp); ok {
+		saved, projected = s.USD, s.Projected
+	}
+	return money.Relabel(formatUSDWithSaving(usd, saved, projected), recordUnit(resp), 0)
 }

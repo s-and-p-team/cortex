@@ -6,6 +6,84 @@ To get started, kindly read through this document and familiarize yourself with 
 
 We can't wait to collaborate with you!
 
+## Build, test, lint, run
+
+Run these commands from the repository root, unless a label names a different directory.
+[Prerequisites](#prerequisites) lists the tools that you must install first.
+
+Build `agentop` and `cortex` into `./bin/`:
+
+```bash
+make agentop
+make cortex                # PROFILE=full (default), PROFILE=lite or PROFILE=local
+```
+
+Install and run the two binaries as the local Cortex service:
+
+```bash
+make dev-install           # runs ./bin/agentop setup --from ./bin --yes --no-modify-path --restart
+```
+
+> [!WARNING]
+> `make dev-install` restarts the shared local Cortex proxy each time. This stops every
+> agent session that is attached to the proxy.
+
+Setup installs the binaries into `~/.local/bin` and does not edit your shell profile.
+It tells you when that directory is not on your `PATH`.
+
+Test `cmd/agentop` while you change code. `-short` skips the setup, service, doctor and
+uninstall scenes, so a run takes about 20 s:
+
+```bash
+scripts/dev/go-test-shards.sh -short cmd/agentop
+```
+
+Test one module, from the module directory:
+
+```bash
+GOWORK=off go test -race ./...
+```
+
+The 7 modules are `core`, `core/storage/redis`, `cmd/cortex`, `cmd/cortex-envoy`,
+`cmd/agentop`, `scripts/profile-tags` and `scripts/readme-demo`. To test the modules
+that ship in a binary (all but the two `scripts/` modules):
+
+```bash
+make test                  # -short by default. TEST_FLAGS= runs the full suite.
+```
+
+Lint one module, from the module directory. Always give `gofmt` a path:
+
+```bash
+go vet ./...
+gofmt -l .
+```
+
+Run all pre-commit hooks on all files:
+
+```bash
+make lint                  # runs pre-commit run --all-files
+```
+
+Install the hooks one time:
+
+```bash
+pre-commit install --hook-type pre-commit --hook-type commit-msg   # or: make pre-commit
+```
+
+Build, lint and test praxis mode, from `praxis/`. [`praxis/README.md`](praxis/README.md)
+has the details:
+
+```bash
+rustup toolchain install
+cargo fmt --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked
+```
+
+To make the README demo `docs/assets/cortex-demo.svg` again, read
+[`scripts/readme-demo/README.md`](scripts/readme-demo/README.md).
+
 ## Contributing Code
 
 Please follow the [Contribution guide](https://github.com/rossoctl/rossoctl/blob/main/CONTRIBUTING.md#contributing-to-this-project) as found in the Rossoctl Repository for instructions on how to contribute to our repositories.
@@ -17,6 +95,10 @@ Comment `/claim` on an issue to have it automatically assigned to you. Issues la
 ## Prerequisites
 
 - **Go 1.26.10+** (matches `go.work`)
+- **Xcode Command Line Tools on macOS** (`xcode-select --install`). `/usr/bin/make` is a
+  shim for them, so without them `make` fails before it reads the Makefile. In a sandbox
+  that blocks `/var/select/`, the same `xcode-select: error` shows even when the tools are
+  installed. There, run the Makefile's `go build` commands directly.
 - **Python 3.12+** (for `keycloak_sync.py` and the demo setup scripts)
 - **Docker or Podman** (for building container images)
 - **pre-commit** (for local hooks)
@@ -29,23 +111,17 @@ git clone https://github.com/rossoctl/cortex.git
 cd cortex
 
 # Install pre-commit hooks
-pre-commit install
-
-# Build the proxy-init image (one-target Makefile in deploy/proxy-init/).
-# For every image at once, use scripts/dev/local-build-and-test.sh —
-# see "Testing against a local cluster" below.
-cd deploy/proxy-init && make docker-build-init
+pre-commit install --hook-type pre-commit --hook-type commit-msg
 ```
 
-Most day-to-day work needs no cluster: `make agentop` / `make cortex`
-build to `./bin/`, and `make dev-install` builds both and runs
-`./bin/agentop setup --from ./bin --yes --no-modify-path --restart` — the same
-setup a release install hands off to. It installs them to `~/.local/bin` without
-editing your shell profile; setup says so when that directory is not on your PATH.
-Note that `--restart` restarts the shared local Cortex service every time, which
-cuts every attached session.
-
 ## Testing against a local cluster
+
+What works today: install the platform, build your `:local` images and load them
+into Kind, run `verify-spire-keycloak.sh`, and deploy a demo. What does not work:
+the platform does not run your `:local` images. Step 1 installs released image tags,
+and an image in the node store does not change what a running Deployment uses. The
+overlay that changed the images was removed from `rossoctl`. Look in that repo's
+current guide for the supported procedure before you rely on step 2.
 
 For changes that need a real Kubernetes environment (SPIRE identity, the
 operator's sidecar injection, token exchange against Keycloak), the loop is a
@@ -86,11 +162,14 @@ one, all tagged `:local`. Confirm with
 under Podman). On Podman the script also loads via tar archives, because
 `kind load docker-image` does not work with Podman's image store.
 
-> **This step is inert on its own.** Step 1 installs released image tags, and
-> loading images into the node store does not change what a running Deployment
-> uses. Making the platform *run* your `:local` builds needs an image-override
-> values file, and the overlay that used to do that was removed from `rossoctl` —
-> so check that repo's current guide for the supported way before relying on this.
+To build only the `proxy-init` image, from the repository root:
+
+```bash
+make build-proxy-init
+```
+
+This builds `proxy-init:latest`, not `:local`, and does not load it into Kind. To load
+it, run `make -C deploy/proxy-init load-image`.
 
 **3. Verify the platform came up.**
 
@@ -106,7 +185,7 @@ out to be one of these six.
 
 **4. Deploy a workload.** Use a demo rather than hand-written manifests; they
 are kept current, and the manual path is not. Start from
-[`demos/README.md`](demos/README.md).
+[`cortex-demos/README.md`](https://github.com/rossoctl/cortex-demos/blob/main/README.md).
 
 ## Installing an unreleased build
 
@@ -239,6 +318,25 @@ there you get a stopped service rather than a looping one. Either way the proxy 
 missing plugin and the set it does have, and `agentop service status` shows the last log
 lines; the default `full` avoids the question.
 
+### Stopping a bad release
+
+To stop a bad release, mark the previous release as Latest on GitHub.
+
+- Auto-updaters that installed the bad release go back at their next check, within about 6
+  hours with the default `update.check_every`.
+- The others never install it, because it is no longer Latest.
+
+The 24-hour wait (`update.wait`) gives time to do this before most users install the
+bad release.
+
+The go-back needs two things from the bad release:
+
+- Its proxy runs for 10 minutes, because only the running proxy starts the updater.
+- Its `agentop update --auto` works, because that command installs the older release.
+
+A release that breaks either one does not go back by itself. Its users must run the
+one-liner again.
+
 ## Release candidates
 
 A tag with `-rc`, `-alpha` or `-beta` in it publishes a **prerelease**: binaries and
@@ -339,7 +437,8 @@ The prefix also decides where the PR appears in the release notes, which
 `scripts/release_notes.sh` builds from the PRs merged since the previous
 release: `Feat`/`Feature` under New features, `Fix`/`Bug fix`/`Perf` under Bug
 fixes, `Breaking change` (or a `!` before the colon) under Breaking changes,
-and everything else under a collapsed Other changes.
+`(deps)` titles and dependabot PRs under a folded Dependency updates, and
+everything else under a collapsed Other changes.
 
 ## Pull Requests
 
@@ -355,24 +454,30 @@ Smaller pull requests are typically easier to review and merge. If your pull req
 ## Code Style
 
 ### Go Code
-- Before pushing, run `go vet ./...` and `gofmt -l .` from each module you touched.
-  Always give `gofmt` a path — a bare `gofmt -l` reads stdin, so it scans nothing
-  and exits 0. `gofmt -l .` also lists any pre-existing offenders, so check the
-  names it prints are yours.
-- `go vet` is gated: all five `Go CI (…)` jobs run it, and a finding fails the job.
+- [Build, test, lint, run](#build-test-lint-run) has the commands. A bare `gofmt -l`
+  reads stdin, so it scans nothing and exits 0. `gofmt -l .` also lists files that
+  were bad before your change, so make sure that the names it prints are yours.
+- `go vet` is gated: every `Go CI (…)` job runs it, on all 7 modules, and a finding fails the job.
   `gofmt` is not — CI's lint step runs `go fmt`, which rewrites files and exits 0,
   so unformatted code still goes green. There are no Go hooks in pre-commit either.
-- Run per-module with `GOWORK=off` — how the root Makefile builds, and how every
-  CI job but core runs.
+- Use `GOWORK=off` because the root Makefile builds that way, and every CI job but
+  core runs that way.
 - If your change deletes a package or its last import of a dependency, also run
   `go mod tidy -diff` in every module — CI gates on it, and `build`/`vet`/`test`
   all pass while it fails.
+- A sequential run of the `cmd/agentop` tests takes about 6 minutes on a Mac.
+  `scripts/dev/go-test-shards.sh` runs them as parallel processes (about 2 minutes),
+  and tests only the root package. Before you push, and when you change the code that
+  the setup, service, doctor and uninstall scenes test, run
+  `scripts/dev/go-test-shards.sh -race cmd/agentop`. Then, from `cmd/agentop`, run
+  `go test -race $(go list ./... | grep -v 'agentop$')`. CI always runs
+  `go test -race ./...`.
 - Apache 2.0 license header in all Go files
 
-### Python Code (keycloak_sync.py, sparc-service, demo scripts)
+### Python Code (keycloak_sync.py, sparc-service)
 - Python 3.12+ syntax (type hints with `str | None`)
-- Dependencies declared in `requirements.txt` — exact pins for the
-  langchain/pydantic stack, bounded ranges elsewhere
+- Dependencies of the root scripts go in `requirements.txt` as bounded
+  ranges. `sparc-service` declares its own in `deploy/sparc-service/pyproject.toml`
 
 ## Licensing
 

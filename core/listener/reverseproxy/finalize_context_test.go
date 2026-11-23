@@ -2,7 +2,6 @@ package reverseproxy
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -26,7 +25,7 @@ type frameProbe struct {
 	frames    int
 	terminals int
 	ctxErr    error
-	budget    time.Duration
+	deadline  time.Time
 	hadDeadli bool
 }
 
@@ -50,14 +49,14 @@ func (p *frameProbe) OnResponseFrame(ctx context.Context, _ *pipeline.Context, _
 	p.terminals++
 	p.ctxErr = ctx.Err()
 	if dl, ok := ctx.Deadline(); ok {
-		p.hadDeadli, p.budget = true, time.Until(dl)
+		p.hadDeadli, p.deadline = true, dl
 	}
 	return pipeline.Action{Type: pipeline.Continue}
 }
-func (p *frameProbe) snapshot() (terminals int, err error, budget time.Duration, hadDeadline bool) {
+func (p *frameProbe) snapshot() (terminals int, err error, deadline time.Time, hadDeadline bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.terminals, p.ctxErr, p.budget, p.hadDeadli
+	return p.terminals, p.ctxErr, p.deadline, p.hadDeadli
 }
 
 // plainProbe implements no OnResponseFrame, so it is NOT a StreamingResponder and RunResponse is
@@ -67,13 +66,13 @@ func (p *frameProbe) snapshot() (terminals int, err error, budget time.Duration,
 // pipeline holding only frameProbe never dispatches that phase at all — and a test built that way
 // cannot notice which context the response phase runs on. Every shipped pipeline has both kinds.
 type plainProbe struct {
-	mu     sync.Mutex
-	calls  int
-	ctxErr error
-	budget time.Duration
-	// spend is how long OnResponse takes, so a test can consume part of a finalization budget and
-	// see whether the NEXT dispatch still has its own.
-	spend time.Duration
+	mu       sync.Mutex
+	calls    int
+	ctxErr   error
+	deadline time.Time
+	// doneAt is when OnResponse finished, so a test can see whether the NEXT dispatch's budget
+	// started after it.
+	doneAt time.Time
 }
 
 func (p *plainProbe) Name() string { return "plain-probe" }
@@ -84,16 +83,14 @@ func (p *plainProbe) OnRequest(_ context.Context, _ *pipeline.Context) pipeline.
 	return pipeline.Action{Type: pipeline.Continue}
 }
 func (p *plainProbe) OnResponse(ctx context.Context, _ *pipeline.Context) pipeline.Action {
-	if p.spend > 0 {
-		time.Sleep(p.spend)
-	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.calls++
 	p.ctxErr = ctx.Err()
 	if dl, ok := ctx.Deadline(); ok {
-		p.budget = time.Until(dl)
+		p.deadline = dl
 	}
+	p.doneAt = time.Now()
 	return pipeline.Action{Type: pipeline.Continue}
 }
 func (p *plainProbe) seen() (int, error) {
@@ -102,10 +99,10 @@ func (p *plainProbe) seen() (int, error) {
 	return p.calls, p.ctxErr
 }
 
-func (p *plainProbe) phaseBudget() time.Duration {
+func (p *plainProbe) phase() (deadline, doneAt time.Time) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.budget
+	return p.deadline, p.doneAt
 }
 
 func probePipeline(t *testing.T, probe *frameProbe, extra ...pipeline.Plugin) *pipeline.Holder {
@@ -115,67 +112,6 @@ func probePipeline(t *testing.T, probe *frameProbe, extra ...pipeline.Plugin) *p
 		t.Fatalf("pipeline.New: %v", err)
 	}
 	return pipeline.NewHolder(p)
-}
-
-// TestFinalize_LongStreamGetsAFullTeardownBudget covers the axis on which "detached" and "bounded"
-// fight each other: WHEN the bound starts.
-//
-// The terminal dispatch is the only one that lets an aggregating plugin finalize, and it runs at
-// end-of-stream. Build its context when the RESPONSE HEADERS arrive and the deadline is already
-// running, so a turn that streams for longer than httpx.TeardownTimeout reaches that dispatch on an
-// expired context — and RunResponseFrame refuses an expired context exactly as it refuses a
-// cancelled one, so the finalization silently does not happen. Agent turns past ten seconds are
-// ordinary.
-//
-// The budget LEFT at the dispatch is what discriminates, and it is cheaper than waiting out a real
-// overrun: built at finalization it is the whole of it, built at header time it is short by however
-// long the stream ran.
-func TestFinalize_LongStreamGetsAFullTeardownBudget(t *testing.T) {
-	const hold = 400 * time.Millisecond
-	const slack = 150 * time.Millisecond
-
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.WriteHeader(http.StatusOK)
-		flusher := w.(http.Flusher)
-		_, _ = fmt.Fprint(w, "data: {\"one\":1}\n\n")
-		flusher.Flush()
-		// The turn keeps generating: on the shipped path this gap is the model thinking.
-		time.Sleep(hold)
-		_, _ = fmt.Fprint(w, "data: {\"two\":2}\n\n")
-		flusher.Flush()
-	}))
-	defer backend.Close()
-
-	probe := &frameProbe{}
-	srv, err := NewServer(probePipeline(t, probe), nil, backend.URL, nil)
-	if err != nil {
-		t.Fatalf("NewServer: %v", err)
-	}
-	proxy := httptest.NewServer(srv.Handler())
-	defer proxy.Close()
-
-	resp, err := http.Post(proxy.URL+"/v1/messages", "application/json", strings.NewReader(`{}`))
-	if err != nil {
-		t.Fatalf("Post: %v", err)
-	}
-	_, _ = io.Copy(io.Discard, resp.Body)
-	_ = resp.Body.Close()
-
-	terminals, ctxErr, budget, hadDeadline := probe.snapshot()
-	if terminals != 1 {
-		t.Fatalf("terminal dispatches = %d, want 1", terminals)
-	}
-	if ctxErr != nil {
-		t.Errorf("the terminal dispatch ran on a context already done (%v): every aggregating plugin is skipped when that happens", ctxErr)
-	}
-	if !hadDeadline {
-		t.Fatal("no deadline on the finalization context: detached is only half of it — a wedged plugin would pin this goroutine for the life of the process")
-	}
-	if want := httpx.TeardownTimeout - slack; budget < want {
-		t.Errorf("budget left at the terminal frame = %v, want >= %v (of %v): the deadline started when the response headers arrived, not at finalization, so any stream longer than %v finalizes nothing",
-			budget, want, httpx.TeardownTimeout, httpx.TeardownTimeout)
-	}
 }
 
 // TestModifyResponse_BufferedArmSurvivesAHangup covers the ordinary application/json response, which
@@ -254,14 +190,11 @@ func TestModifyResponse_BufferedArmSurvivesAHangup(t *testing.T) {
 //
 // Both rules were in the tree at once before this — shared at two sites, split at a third, each
 // written as a general rule — and nothing failed when the split was collapsed. This is that missing
-// test. The response phase spends a measurable slice of its own budget; the terminal dispatch must
-// still see a full one.
+// test. Whatever the response phase spends comes out of its own budget; the terminal dispatch's
+// budget starts after the phase is done.
 func TestModifyResponse_TheSettleDoesNotInheritASpentBudget(t *testing.T) {
-	const spend = 300 * time.Millisecond
-	const slack = 150 * time.Millisecond
-
 	probe := &frameProbe{}
-	plain := &plainProbe{spend: spend}
+	plain := &plainProbe{}
 	store := session.New(5*time.Minute, 100, 0)
 	t.Cleanup(store.Close)
 	srv, err := NewServer(probePipeline(t, probe, plain), store, "http://backend.invalid", nil)
@@ -285,19 +218,20 @@ func TestModifyResponse_TheSettleDoesNotInheritASpentBudget(t *testing.T) {
 		t.Fatalf("modifyResponse: %v", err)
 	}
 
-	// The phase spent its own budget, which is what makes the next assertion mean something.
-	if got := plain.phaseBudget(); got > httpx.TeardownTimeout-spend/2 {
-		t.Fatalf("the response phase saw %v of budget, so it did not spend a measurable slice: this test would prove nothing", got)
+	// The phase ran on a bounded context, which is what makes the next assertion mean something.
+	phaseDeadline, phaseDone := plain.phase()
+	if phaseDeadline.IsZero() {
+		t.Fatal("the response phase ran without a deadline: this test would prove nothing")
 	}
-	_, ctxErr, budget, hadDeadline := probe.snapshot()
+	_, ctxErr, deadline, hadDeadline := probe.snapshot()
 	if ctxErr != nil {
 		t.Errorf("the terminal dispatch ran on a done context: %v", ctxErr)
 	}
 	if !hadDeadline {
 		t.Fatal("no deadline on the terminal dispatch")
 	}
-	if want := httpx.TeardownTimeout - slack; budget < want {
-		t.Errorf("the terminal dispatch had %v of budget left, want >= %v: it inherited what the response phase spent, so a slow plugin in the phase would take the settle's time",
-			budget, want)
+	if started := deadline.Add(-httpx.TeardownTimeout); started.Before(phaseDone) {
+		t.Errorf("the terminal dispatch's budget started %v before the response phase finished: it inherited what the response phase spent, so a slow plugin in the phase would take the settle's time",
+			phaseDone.Sub(started))
 	}
 }

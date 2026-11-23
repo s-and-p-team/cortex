@@ -12,8 +12,9 @@
 // changes to unreloadable fields like mode / listener addresses),
 // builds fresh pipelines via the caller-supplied PipelineBuilder,
 // runs their Start hooks under a bounded context, and Stores them
-// into the Holders. The old pipelines keep running until a drain
-// window expires, then Stop is invoked in a background goroutine.
+// into the Holders. Each old pipeline keeps running until no request
+// holds it, the drain window expires, or Close is called, then Stop is
+// invoked in a background goroutine. Close also Stops the live pipelines.
 //
 // Validation failure at any stage leaves the current pipelines
 // untouched and records the error in Status so operators can see
@@ -30,6 +31,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -53,8 +55,10 @@ type PipelineBuilder func() (inbound, outbound *pipeline.Pipeline, cfg *config.C
 // Option configures a Reloader at construction time.
 type Option func(*Reloader)
 
-// WithDrainWindow overrides the delay before old pipelines are Stopped
-// after a successful swap. Default 30s. Tests pass 0 to avoid sleeping.
+// WithDrainWindow overrides the longest an old pipeline waits for the
+// requests still pinned to it before it is Stopped anyway. Default 10m,
+// so a tunnel left open for hours cannot keep its plugins alive. Tests
+// pass 0 to stop at once.
 func WithDrainWindow(d time.Duration) Option { return func(r *Reloader) { r.drainWindow = d } }
 
 // WithDebounce overrides the debounce interval used to coalesce rapid
@@ -108,6 +112,11 @@ type Reloader struct {
 	drainWindow  time.Duration
 	debounce     time.Duration
 	startTimeout time.Duration
+	// afterFunc arms the debounce timer: time.AfterFunc, or a test's own.
+	afterFunc func(time.Duration, func()) debounceTimer
+	// attempts, when set, receives after each reload attempt, without blocking; a test
+	// waits on it.
+	attempts chan struct{}
 	// onCommit is run after a reload is accepted; see WithOnCommit.
 	onCommit func(*config.Config)
 	// extraDirs and fingerprint widen what a reload depends on; see WithExtraWatch.
@@ -131,6 +140,17 @@ type Reloader struct {
 	lastHash string
 	// startData is the config file as New read it.
 	startData []byte
+
+	// cancelLoop and loopDone stop and await the watch goroutine; set by Start.
+	cancelLoop context.CancelFunc
+	loopDone   chan struct{}
+	// Close sets closeCtx, then closes closing, to stop every old pipeline still
+	// draining on closeCtx; drains counts their goroutines. commitMu orders a
+	// reload's commit against Close.
+	closing  chan struct{}
+	closeCtx context.Context
+	drains   sync.WaitGroup
+	commitMu sync.Mutex
 }
 
 // New constructs a Reloader. initialCfg must be the config the caller
@@ -142,9 +162,11 @@ func New(configPath string, inbound, outbound *pipeline.Holder, build PipelineBu
 		inbound:      inbound,
 		outbound:     outbound,
 		build:        build,
-		drainWindow:  30 * time.Second,
+		drainWindow:  10 * time.Minute,
 		debounce:     250 * time.Millisecond,
 		startTimeout: 60 * time.Second,
+		afterFunc:    func(d time.Duration, f func()) debounceTimer { return time.AfterFunc(d, f) },
+		closing:      make(chan struct{}),
 	}
 	for _, opt := range opts {
 		opt(r)
@@ -166,7 +188,7 @@ func New(configPath string, inbound, outbound *pipeline.Holder, build PipelineBu
 
 // Start arms the watcher. Blocks until the watcher is ready or fails
 // to arm (invalid directory, fsnotify init error). Returns nil on
-// success; the watch goroutine then runs until ctx is cancelled.
+// success; the watch goroutine then runs until ctx is cancelled or Close.
 //
 // Safe to call at most once. A Reloader whose Start returned an error
 // is not usable — construct a new one.
@@ -236,7 +258,12 @@ func (r *Reloader) Start(ctx context.Context) error {
 		r.seedHash()
 	}
 
-	go r.watchLoop(ctx, watcher)
+	ctx, r.cancelLoop = context.WithCancel(ctx)
+	r.loopDone = make(chan struct{})
+	go func() {
+		defer close(r.loopDone)
+		r.watchLoop(ctx, watcher)
+	}()
 	slog.Info("reloader: watching for config changes",
 		"path", r.configPath, "dir", dir, "drainWindow", r.drainWindow)
 	return nil
@@ -284,6 +311,12 @@ func (r *Reloader) ConfigProvider() func() *config.Config {
 	return func() *config.Config { return r.activeCfg.Load() }
 }
 
+// debounceTimer is the part of *time.Timer the debounce uses.
+type debounceTimer interface {
+	Reset(time.Duration) bool
+	Stop() bool
+}
+
 // watchLoop drains fsnotify events, debounces them, and dispatches
 // each debounced burst to reloadOnce. Exits when ctx is cancelled or
 // the watcher channel closes.
@@ -291,7 +324,7 @@ func (r *Reloader) watchLoop(ctx context.Context, watcher *fsnotify.Watcher) {
 	defer watcher.Close()
 
 	base := filepath.Base(r.configPath)
-	var timer *time.Timer
+	var timer debounceTimer
 	defer func() {
 		if timer != nil {
 			timer.Stop()
@@ -334,7 +367,7 @@ func (r *Reloader) watchLoop(ctx context.Context, watcher *fsnotify.Watcher) {
 			// Debounce: reset the timer on every event. Fire once when
 			// the burst quiesces for `debounce`.
 			if timer == nil {
-				timer = time.AfterFunc(r.debounce, func() {
+				timer = r.afterFunc(r.debounce, func() {
 					select {
 					case trigger <- struct{}{}:
 					default:
@@ -350,6 +383,12 @@ func (r *Reloader) watchLoop(ctx context.Context, watcher *fsnotify.Watcher) {
 			// backends send no event while holding the lock Add takes, so this
 			// cannot block on the channel this loop drains.
 			r.reloadOnce(ctx, watcher)
+			if r.attempts != nil {
+				select {
+				case r.attempts <- struct{}{}:
+				default:
+				}
+			}
 		}
 	}
 }
@@ -401,7 +440,7 @@ func (r *Reloader) reloadOnce(parent context.Context, watcher *fsnotify.Watcher)
 	}
 	if err := newOut.Start(startCtx); err != nil {
 		// Inbound started cleanly; unwind it before bailing.
-		unwindCtx, unwindCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		unwindCtx, unwindCancel := r.stopCtx()
 		defer unwindCancel()
 		newIn.Stop(unwindCtx)
 		r.recordFailure(attempt, fmt.Errorf("outbound Start: %w", err))
@@ -411,12 +450,23 @@ func (r *Reloader) reloadOnce(parent context.Context, watcher *fsnotify.Watcher)
 	// Commit: swap Holders and update active-config snapshot. From
 	// here on, requests drain onto the new pipelines; old in-flight
 	// requests keep their existing *Pipeline reference.
+	r.commitMu.Lock()
+	select {
+	case <-r.closing:
+		r.commitMu.Unlock()
+		newOut.Stop(r.closeCtx)
+		newIn.Stop(r.closeCtx)
+		return
+	default:
+	}
 	oldIn := r.inbound.Load()
 	oldOut := r.outbound.Load()
 	r.inbound.Store(newIn)
 	r.outbound.Store(newOut)
 	r.activeCfg.Store(newCfg)
 	r.lastHash = hash
+	r.drains.Add(1)
+	r.commitMu.Unlock()
 
 	// After the swap, so a hook cannot observe a config that was refused, and before the log line, so
 	// "pipelines swapped" means everything this reload applies has been applied.
@@ -428,20 +478,25 @@ func (r *Reloader) reloadOnce(parent context.Context, watcher *fsnotify.Watcher)
 		"sha256", hash[:12],
 		"drainWindow", r.drainWindow)
 
-	// Drain old pipelines in the background. Using context.Background
-	// deliberately: parent may cancel during shutdown, and we still
-	// want a bounded Stop on the old plugins so they flush cleanly.
+	// Drain old pipelines in the background, on their own Stop budget rather than
+	// parent's; Close cuts the drain short at shutdown.
 	go func() {
-		if r.drainWindow > 0 {
-			time.Sleep(r.drainWindow)
+		defer r.drains.Done()
+		deadline := time.Now().Add(r.drainWindow)
+		var remaining atomic.Int64
+		var wg sync.WaitGroup
+		for _, p := range []*pipeline.Pipeline{oldIn, oldOut} {
+			if p != nil {
+				wg.Go(func() { remaining.Add(r.stopWhenUnheld(p, deadline)) })
+			}
 		}
-		stopCtx, stopCancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer stopCancel()
-		if oldIn != nil {
-			oldIn.Stop(stopCtx)
-		}
-		if oldOut != nil {
-			oldOut.Stop(stopCtx)
+		wg.Wait()
+		if n := remaining.Load(); n > 0 {
+			// Routine while a client keeps a CONNECT tunnel or WebSocket open: the
+			// connection holds its pipeline until it closes.
+			slog.Warn("reloader: stopped old pipelines with requests still on them",
+				"sha256", hash[:12], "requests", n, "drainWindow", r.drainWindow)
+			return
 		}
 		slog.Info("reloader: drained old pipelines", "sha256", hash[:12])
 	}()
@@ -450,6 +505,67 @@ func (r *Reloader) reloadOnce(parent context.Context, watcher *fsnotify.Watcher)
 		r.watchExtra(watcher, r.extraDirs(newCfg))
 	}
 	r.recordSuccess(attempt, hash)
+}
+
+// stopWhenUnheld Stops p once no request holds it, at deadline, or on Close, and
+// returns how many requests still held it then.
+func (r *Reloader) stopWhenUnheld(p *pipeline.Pipeline, deadline time.Time) int64 {
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	var n int64
+	select {
+	case <-p.Drained():
+	case <-timer.C:
+		n = p.Held()
+	case <-r.closing:
+		n = p.Held()
+	}
+	ctx, cancel := r.stopCtx()
+	defer cancel()
+	p.Stop(ctx)
+	return n
+}
+
+// stopCtx is the budget for a Stop: Close's ctx once Close has begun, else 15s.
+func (r *Reloader) stopCtx() (context.Context, context.CancelFunc) {
+	select {
+	case <-r.closing:
+		return r.closeCtx, func() {}
+	default:
+		return context.WithTimeout(context.Background(), 15*time.Second)
+	}
+}
+
+// Close stops reloading, then Stops the live pipelines and every old one still
+// draining; a reload still building Stops its pipelines instead. It returns when
+// they are stopped or ctx is done, whichever is first; a plugin still shutting
+// down then finishes in the background. Call it once, after the listeners have
+// stopped.
+func (r *Reloader) Close(ctx context.Context) {
+	r.closeCtx = ctx
+	r.commitMu.Lock()
+	close(r.closing)
+	liveIn, liveOut := r.inbound.Load(), r.outbound.Load()
+	r.commitMu.Unlock()
+	if r.cancelLoop != nil {
+		r.cancelLoop()
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		var live sync.WaitGroup
+		live.Go(func() { liveOut.Stop(ctx) })
+		live.Go(func() { liveIn.Stop(ctx) })
+		live.Wait()
+		r.drains.Wait()
+		if r.loopDone != nil {
+			<-r.loopDone
+		}
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+	}
 }
 
 // hash is what decides whether a reload has anything to do: the config's bytes,
@@ -471,6 +587,13 @@ func (r *Reloader) hash(data []byte) string {
 // validateReloadable returns an error when a newly-loaded config
 // differs from the active one on a field that cannot be reloaded
 // under the running listeners.
+func updateCheckEvery(c *config.Config) string {
+	if c.Update == nil {
+		return ""
+	}
+	return c.Update.CheckEvery
+}
+
 func validateReloadable(active, next *config.Config) error {
 	if active == nil {
 		return nil // first load
@@ -542,6 +665,21 @@ func validateReloadable(active, next *config.Config) error {
 	// the "worse than a refusal" shape an operator reads as confirmation (#1541).
 	if !reflect.DeepEqual(active.Memory, next.Memory) {
 		diffs = append(diffs, "memory.*")
+	}
+	// stats.* too: the stats listener binds stats.address once at boot
+	// (config.PlanListeners). An accepted edit makes /config serve an address where
+	// nothing listens, and agentop reads that address from the file and probes it.
+	if !reflect.DeepEqual(active.Stats, next.Stats) {
+		diffs = append(diffs, "stats.*")
+	}
+	// update.check_every too: the update trigger reads it once at boot. update.auto
+	// and update.wait reload, because agentop reads them on each run.
+	if updateCheckEvery(active) != updateCheckEvery(next) {
+		diffs = append(diffs, "update.check_every")
+	}
+	// praxis.* too: praxis mode decides at boot which listeners and routes exist.
+	if !reflect.DeepEqual(active.Praxis, next.Praxis) {
+		diffs = append(diffs, "praxis.*")
 	}
 	if len(diffs) > 0 {
 		return fmt.Errorf("unreloadable field changed, pod restart required: %v", diffs)

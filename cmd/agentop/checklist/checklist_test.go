@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -29,7 +30,7 @@ func TestPlainLines(t *testing.T) {
 	u.Advise("PATH", "not on PATH", `export PATH="/h/.local/bin:$PATH"`)
 	u.Fail("started", "never answered", "see ~/.cortex/proxy.log")
 	u.Note("rolled back", "the changes above are undone")
-	u.Next("Open a new terminal, then:", "agentop", "watch your agent traffic live")
+	u.Next("Open a new terminal, then:", Step{"agentop configure claude-code enable", "connect your agent (or opencode, codex, bob, pi)"}, Step{"agentop observe", "watch your agent traffic live"})
 	u.Close()
 	want := strings.Join([]string{
 		"  rosso cortex · setup   dev · darwin/arm64",
@@ -46,7 +47,8 @@ func TestPlainLines(t *testing.T) {
 		"",
 		"  Open a new terminal, then:",
 		"",
-		"    agentop        # watch your agent traffic live",
+		"    agentop configure claude-code enable        # connect your agent (or opencode, codex, bob, pi)",
+		"    agentop observe" + strings.Repeat(" ", 21+8) + "# watch your agent traffic live",
 		"",
 	}, "\n")
 	if b.String() != want {
@@ -112,8 +114,16 @@ func TestAnimatedRunningLineResolvesAndRestoresTheCursor(t *testing.T) {
 	noForcedColour(t)
 	var b bytes.Buffer
 	u := New(&b, true)
+	// Start reads the clock first; every later read is 250ms on.
+	start := time.Unix(1000, 0)
+	var reads atomic.Int32
+	u.now = func() time.Time {
+		if reads.Add(1) == 1 {
+			return start
+		}
+		return start.Add(250 * time.Millisecond)
+	}
 	r := u.Start("started")
-	time.Sleep(250 * time.Millisecond)
 	r.Done("healthy")
 	u.Close()
 	out := b.String()
@@ -150,16 +160,16 @@ func (l *lockedBuffer) String() string {
 func TestCloseStopsARunningSpinnerAndClearsItsLine(t *testing.T) {
 	var b lockedBuffer
 	u := New(&b, true)
-	u.Start("started")
-	time.Sleep(150 * time.Millisecond)
+	r := u.Start("started")
 	u.Close()
 	out := b.String()
 	if !strings.HasSuffix(out, "\r\x1b[K\x1b[?25h") {
 		t.Errorf("Close did not clear the running line before showing the cursor: %q", out)
 	}
-	time.Sleep(250 * time.Millisecond)
-	if after := b.String(); after != out {
-		t.Errorf("the spinner kept drawing after Close: %q", strings.TrimPrefix(after, out))
+	select {
+	case <-r.stopped:
+	default:
+		t.Error("the spinner is still running after Close")
 	}
 }
 
@@ -203,7 +213,6 @@ func TestEndingASecondTimeIsSafe(t *testing.T) {
 			var b lockedBuffer
 			u := New(&b, true)
 			r := u.Start("started")
-			time.Sleep(20 * time.Millisecond)
 			c.finish(u, r)
 			out := b.String()
 			if n := strings.Count(out, "\x1b[?25h"); n != 1 {
@@ -249,7 +258,6 @@ func TestRunningAdviseEndsAsUIAdviseDraws(t *testing.T) {
 	var b lockedBuffer
 	a := New(&b, true)
 	r := a.Start("PATH")
-	time.Sleep(150 * time.Millisecond)
 	r.Advise("edited; left as it is", "delete the two lines")
 	a.Close()
 	out := b.String()

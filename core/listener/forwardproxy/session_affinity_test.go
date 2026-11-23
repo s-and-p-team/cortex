@@ -66,10 +66,10 @@ func TestClientAffinity_InClusterResolutionIsUnchanged(t *testing.T) {
 						h.Set(session.ClaudeCodeSessionHeader, tc.header)
 					}
 				}
-				if got := s.resolvePluginSessionID(h, nil); got != tc.wantPlugin {
+				if got, _ := s.attribute(h, nil).PluginSession("", s.activeSession); got != tc.wantPlugin {
 					t.Errorf("affinity=%v: plugin identity = %q, want %q", affinity, got, tc.wantPlugin)
 				}
-				if got := s.resolveOutboundSessionID(h, nil); got != tc.wantRecord {
+				if got := s.recordingSessionID("", h, nil); got != tc.wantRecord {
 					t.Errorf("affinity=%v: recording bucket = %q, want %q", affinity, got, tc.wantRecord)
 				}
 			})
@@ -192,7 +192,7 @@ func TestClientAffinity_SeparatesBobFromClaudeCode(t *testing.T) {
 		}
 	}
 	// The axios call is recorded under default but its PLUGINS hear no identity, the same
-	// answer resolvePluginSessionID gives when nothing is known. Handing them "default"
+	// answer attribution.PluginSession gives when nothing is known. Handing them "default"
 	// would satisfy sessionbudget's opt-in DefaultSessionFallback.
 	if got := probe.sawID[len(probe.sawID)-1]; got != "" {
 		t.Errorf("plugins saw %q for an unknown client beside two live agents, want \"\"", got)
@@ -246,7 +246,7 @@ func TestClientAffinity_OffKeepsTodaysAttribution(t *testing.T) {
 	s := &Server{Sessions: store, SessionIDHeaders: []string{session.ClaudeCodeSessionHeader, session.BobSessionHeader}}
 	store.Append("claude-1", pipeline.SessionEvent{At: time.Now(), Direction: pipeline.Outbound, Phase: pipeline.SessionRequest})
 	h := http.Header{"User-Agent": []string{"bob-shell/2.0.5"}}
-	if got := s.resolveOutboundSessionID(h, nil); got != "claude-1" {
+	if got := s.recordingSessionID("", h, nil); got != "claude-1" {
 		t.Fatalf("knob off: Bob's header-less probe = %q, want claude-1 (today's ActiveSession answer)", got)
 	}
 }
@@ -259,7 +259,7 @@ func TestClientAffinity_NeedsHeaderBucketing(t *testing.T) {
 	defer store.Close()
 	s := &Server{Sessions: store, SessionIDHeaders: []string{}, ClientAffinity: true}
 	h := http.Header{"User-Agent": []string{"bob-shell/2.0.5"}}
-	if got := s.resolveOutboundSessionID(h, nil); got != session.DefaultSessionID {
+	if got := s.recordingSessionID("", h, nil); got != session.DefaultSessionID {
 		t.Fatalf("id_headers: [] with client_affinity = %q, want %q (affinity inert)", got, session.DefaultSessionID)
 	}
 }
@@ -305,20 +305,15 @@ func TestClientAffinity_TunnelRowsKeepTodaysSessionWhenTheOwnerIsAmbiguous(t *te
 	}
 	waitFor := func(id string, want int) {
 		t.Helper()
-		for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		eventually(t, store, func() bool {
 			n := 0
 			for _, e := range store.View(id).Events {
 				if e.HTTPMethod == http.MethodConnect {
 					n++
 				}
 			}
-			if n >= want {
-				return
-			}
-			if time.Now().After(deadline) {
-				t.Fatalf("%s holds %d tunnel rows, want %d; default holds %v", id, n, want, store.View(session.DefaultSessionID))
-			}
-		}
+			return n >= want
+		}, id+"'s tunnel rows")
 	}
 	connect := func(uaLine string) {
 		t.Helper()

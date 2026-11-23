@@ -322,6 +322,8 @@ type fakeStore struct {
 	mu   sync.Mutex
 	vals map[string]string
 	ttls map[string]time.Duration
+	// onSet, when set, sees every write after it lands.
+	onSet func(k, v string)
 }
 
 func (f *fakeStore) Get(_ context.Context, k string) (string, error) {
@@ -336,6 +338,9 @@ func (f *fakeStore) Set(_ context.Context, k, v string, ttl time.Duration) error
 		f.vals, f.ttls = map[string]string{}, map[string]time.Duration{}
 	}
 	f.vals[k], f.ttls[k] = v, ttl
+	if f.onSet != nil {
+		f.onSet(k, v)
+	}
 	return nil
 }
 func (f *fakeStore) Incr(context.Context, string, int64) (int64, error)             { return 0, nil }
@@ -403,6 +408,13 @@ func TestInit_FetchesEachServersModelsAndKeepsThem(t *testing.T) {
 
 	st := &fakeStore{}
 	_ = st.Set(context.Background(), catalogPrefix+"glm", `["rits/zai-org/glm-5-3"]`, 0)
+	fetched := make(chan struct{})
+	var once sync.Once
+	st.onSet = func(k, v string) {
+		if k == catalogPrefix+"glm" && strings.Contains(v, "glm-6") {
+			once.Do(func() { close(fetched) })
+		}
+	}
 	r := New()
 	r.SetStore(st)
 	r.client = srv.Client()
@@ -415,15 +427,11 @@ func TestInit_FetchesEachServersModelsAndKeepsThem(t *testing.T) {
 	}
 	defer func() { _ = r.Shutdown(context.Background()) }()
 
-	deadline := time.Now().Add(5 * time.Second)
-	for routerconfig.Resolve("glm", r.catalogs.get("glm")) != "rits/zai-org/glm-6" {
-		if time.Now().After(deadline) {
-			t.Fatalf("list = %v, want the fetched one", r.catalogs.get("glm"))
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if v, _ := st.Get(context.Background(), catalogPrefix+"glm"); !strings.Contains(v, "glm-6") {
-		t.Errorf("stored list = %s, want the fetched one kept", v)
+	// Wait for the durable copy: the fetch writes it after the in-memory one, so
+	// seeing it in the store means both are done.
+	<-fetched
+	if got := routerconfig.Resolve("glm", r.catalogs.get("glm")); got != "rits/zai-org/glm-6" {
+		t.Errorf("list = %v, want the fetched one", r.catalogs.get("glm"))
 	}
 }
 
@@ -700,6 +708,46 @@ func TestResend_AModelRefusalThenALimitRefusalAreBothAbsorbed(t *testing.T) {
 	}
 }
 
+// A request is resent for a limit once: a second limit refusal reaches the agent,
+// even one that states a lower limit the router could fit.
+func TestResend_ALimitIsResentOncePerRequest(t *testing.T) {
+	store := newStore(t)
+	_, p := buildRouter(t, wordConfig(`"opencode": "glm"`))
+	pctx := chat(store, "opencode.ai", "/zen/v1/chat/completions", opencodeUA, "s1", glmMain, true)
+	withOutput(t, pctx, 256000)
+	run(t, p, pctx)
+
+	if !resend(p, pctx, http.StatusBadRequest, bedrockCap) {
+		t.Fatal("the first limit refusal was not resent")
+	}
+	if resend(p, pctx, http.StatusBadRequest, strings.ReplaceAll(bedrockCap, "128000", "64000")) {
+		t.Error("a second limit refusal was resent; it must reach the agent")
+	}
+	if got := gjson.GetBytes(pctx.Body, "max_completion_tokens").Int(); got != 128000 {
+		t.Errorf("max_completion_tokens = %d, want 128000 from the first refusal", got)
+	}
+}
+
+// A limit refusal of a request the router did not switch teaches no limit: the agent
+// sized the request for the model it chose.
+func TestResend_ALimitRefusalOfARequestThatWasNotSwitchedTeachesNothing(t *testing.T) {
+	store := newStore(t)
+	r, p := buildRouter(t, wordConfig(`"opencode": "glm"`))
+	pctx := chat(store, "glm.example.com:8443", "/v1/chat/completions", opencodeUA, "s1", glmMain, true)
+	withOutput(t, pctx, 256000)
+	run(t, p, pctx)
+	if !pctx.Redirected() {
+		t.Fatal("the request was not routed; the test needs a routed request that was not switched")
+	}
+
+	if resend(p, pctx, http.StatusBadRequest, bedrockCap) {
+		t.Error("a limit refusal of a request that was not switched was resent")
+	}
+	if got := r.loadLimits(pctx, "glm", glmMain); got != (limits{}) {
+		t.Errorf("limits = %+v, want none learned", got)
+	}
+}
+
 func TestRouter_LeavesARequestItDidNotRouteAlone(t *testing.T) {
 	store := newStore(t)
 	r, p := buildRouter(t, wordConfig(`"opencode": "glm"`))
@@ -866,6 +914,7 @@ func TestRefusesModel_ReadsEachLocalServersWording(t *testing.T) {
 		{"vllm messages", 404, "premium-ide", "{\"type\":\"error\",\"error\":{\"type\":\"NotFoundError\",\"message\":\"The model `premium-ide` does not exist.\"}}"},
 		{"litellm, a team-restricted key", 403, "exo-free", refusal},
 		{"litellm, an unrestricted key", 400, "exo-free", `{"error":{"message":"/chat/completions: Invalid model name passed in model=exo-free."}}`},
+		{"anthropic messages api", 404, "claude-nope", `{"type":"error","error":{"type":"not_found_error","message":"model: claude-nope"}}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if !refusesModel(tc.status, []byte(tc.body), tc.model) {
@@ -896,6 +945,8 @@ func TestRefusesModel_OtherAnswersAreNotRefusals(t *testing.T) {
 		{"ollama's phrase at a status not recorded", 500, "premium-ide", ollama},
 		{"vllm's phrase at a status not recorded", 400, "premium-ide", vllm},
 		{"no model sent", 404, "", `{"error":{"message":"model '' not found"}}`},
+		{"anthropic, a name the refused one starts with", 404, "claude", `{"type":"error","error":{"type":"not_found_error","message":"model: claude-opus-5-5"}}`},
+		{"anthropic's message at 400", 400, "claude-nope", `{"type":"error","error":{"type":"not_found_error","message":"model: claude-nope"}}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if refusesModel(tc.status, []byte(tc.body), tc.model) {
@@ -918,6 +969,45 @@ func TestResend_TreatsALocalServersMissingModelAsARefusal(t *testing.T) {
 	}
 	assertRecord(t, pctx, pipeline.ActionModify, "resent",
 		map[string]string{"server": "glm", "model": "exo-free", "substitute": glmMain})
+}
+
+// Anthropic's refusal of a model it does not have is resent with the server's own model.
+func TestResend_TreatsAnthropicsMissingModelAsARefusal(t *testing.T) {
+	_, p := buildRouter(t, wordConfig(`"opencode": "glm"`))
+	pctx := chat(newStore(t), "opencode.ai", "/zen/v1/chat/completions", opencodeUA, "s1", "exo-free", true)
+	run(t, p, pctx)
+	if !resend(p, pctx, http.StatusNotFound, `{"type":"error","error":{"type":"not_found_error","message":"model: exo-free"}}`) {
+		t.Fatal("Resend = false for Anthropic's refusal of the model sent")
+	}
+	if got := sentModel(t, pctx); got != glmMain {
+		t.Errorf("model = %q, want %s", got, glmMain)
+	}
+	assertRecord(t, pctx, pipeline.ActionModify, "resent",
+		map[string]string{"server": "glm", "model": "exo-free", "substitute": glmMain})
+}
+
+// Decision 23: a Codex request with no output field, translated to an Anthropic
+// server, carries the encoder's 64000. The router has no field to cap, so the
+// server's output-cap refusal reaches Codex.
+func TestResend_ALimitRefusalOfATranslatedCodexRequestWithNoOutputField(t *testing.T) {
+	p := build(t, `{
+		"servers": {"s": {"url": "https://s.example.com", "key": "s-key", "main": "claude-sonnet-5", "helper": "claude-haiku-5", "api": {"anthropic-messages": "/v1/messages"}}},
+		"agents": {"codex": "s"}
+	}`)
+	pctx := request(newStore(t), "chatgpt.com", "codex-tui/0.162.1 (Mac OS 26.3.0; arm64) xterm-256color (codex-tui; 0.162.1)", "s1")
+	pctx.Path = "/backend-api/codex/responses"
+	pctx.Body = []byte(`{"model":"claude-sonnet-5","stream":true,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],"store":false}`)
+	pctx.Extensions.Inference = &pipeline.InferenceExtension{Model: "claude-sonnet-5"}
+	run(t, p, pctx)
+	if _, tgt, _, ok := pctx.TranslateTarget(); !ok || tgt != "anthropic-messages" {
+		t.Fatalf("TranslateTarget = %q %v, want anthropic-messages", tgt, ok)
+	}
+
+	if resend(p, pctx, http.StatusBadRequest, `{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens: 64000 > 32000, which is the maximum allowed number of output tokens for claude-sonnet-5"}}`) {
+		t.Error("Resend = true, want the refusal to reach Codex: the body has no output field to cap")
+	}
+	assertRecord(t, pctx, pipeline.ActionSkip, "limit_not_fitted",
+		map[string]string{"server": "s", "model": "claude-sonnet-5", "limit": "output", "value": "32000", "stated": "true"})
 }
 
 // A substitute the server refuses too ends there, whether it was resent or chosen up
@@ -992,4 +1082,51 @@ func TestResend_ALocalServersRefusalIsAnsweredFromItsOwnList(t *testing.T) {
 	if got := sentModel(t, pctx); got != "granite3.3:8b" {
 		t.Errorf("model = %q, want ollama's granite3.3:8b", got)
 	}
+}
+
+// On a host two servers share, Resend reads the server from the routed record, not from the
+// host: a limit and a model refusal are kept under the server the request went to.
+func TestResend_SharedHost(t *testing.T) {
+	const shared = `{
+		"servers": {
+			"team-a": {"url": "https://gw.example.com/litellm", "key": "team-a-key", "main": "glm", "helper": "nemotron"},
+			"team-b": {"url": "https://gw.example.com/litellm", "key": "team-b-key", "main": "glm", "helper": "nemotron"}
+		},
+		"agents": {"opencode": "team-b"}
+	}`
+	ask := func(t *testing.T) (*Router, *pipeline.Pipeline, *pipeline.Context) {
+		r, p := buildRouter(t, shared)
+		r.catalogs.set("team-a", glmModels)
+		r.catalogs.set("team-b", glmModels)
+		pctx := chat(newStore(t), "opencode.ai", "/zen/v1/chat/completions", opencodeUA, "s1", glmMain, true)
+		return r, p, pctx
+	}
+	t.Run("limit", func(t *testing.T) {
+		r, p, pctx := ask(t)
+		withOutput(t, pctx, 256000)
+		run(t, p, pctx)
+		if !resend(p, pctx, http.StatusBadRequest, bedrockCap) {
+			t.Fatal("Resend = false for a stated output cap")
+		}
+		assertRecord(t, pctx, pipeline.ActionModify, "resent", map[string]string{"server": "team-b", "limit": "output"})
+		if got := r.loadLimits(pctx, "team-b", glmMain); got.Output != 128000 {
+			t.Errorf("team-b limits = %+v, want Output 128000", got)
+		}
+		if got := r.loadLimits(pctx, "team-a", glmMain); got != (limits{}) {
+			t.Errorf("team-a limits = %+v, want none", got)
+		}
+	})
+	t.Run("model", func(t *testing.T) {
+		r, p, pctx := ask(t)
+		pctx.Body = []byte(`{"model":"exo-free","messages":[{"role":"user","content":"hi"}]}`)
+		pctx.Extensions.Inference.Model = "exo-free"
+		run(t, p, pctx)
+		if !resend(p, pctx, http.StatusForbidden, refusal) {
+			t.Fatal("Resend = false for a refused model")
+		}
+		assertRecord(t, pctx, pipeline.ActionModify, "resent", map[string]string{"server": "team-b", "model": "exo-free"})
+		if !r.isRefused(pctx, "team-b", "exo-free") || r.isRefused(pctx, "team-a", "exo-free") {
+			t.Error("the refusal is not kept under team-b alone")
+		}
+	})
 }

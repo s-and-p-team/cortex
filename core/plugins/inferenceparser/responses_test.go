@@ -8,8 +8,8 @@ import (
 	"testing"
 
 	"github.com/klauspost/compress/zstd"
+	"github.com/rossoctl/cortex/core/internal/parsercommon"
 	"github.com/rossoctl/cortex/core/pipeline"
-	"github.com/rossoctl/cortex/core/plugins/internal/parsercommon"
 )
 
 func TestInferenceParser_ResponsesAPI_Request(t *testing.T) {
@@ -89,7 +89,7 @@ func TestInferenceParser_ResponsesAPI_Request(t *testing.T) {
 }
 
 // A request whose path ends in "/responses" but whose body carries no input array is not
-// an inference request — the same backstop parseOpenAIRequest and parseAnthropicRequest
+// an inference request — the same backstop core/parse/inference.parseOpenAIRequest and parseAnthropicRequest
 // have for their own loose suffix match.
 func TestInferenceParser_ResponsesAPI_NonInferenceBodyIgnored(t *testing.T) {
 	p := NewInferenceParser()
@@ -105,7 +105,7 @@ func TestInferenceParser_ResponsesAPI_NonInferenceBodyIgnored(t *testing.T) {
 
 // Codex's real request arrives zstd-compressed. A corrupt or absent decompression step
 // would leave json.Unmarshal failing on compressed bytes, so this pins decode-before-parse
-// rather than relying on parseResponsesRequest's nil-on-bad-JSON fallback to mask it.
+// rather than relying on core/parse/inference's nil-on-bad-JSON fallback to mask it.
 func TestInferenceParser_ResponsesAPI_ZstdCompressedRequest(t *testing.T) {
 	plain := []byte(`{"model":"gpt-6-luna","stream":true,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`)
 	enc, err := zstd.NewWriter(nil)
@@ -190,7 +190,7 @@ func TestInferenceParser_ResponsesAPI_StreamFoldsEvents(t *testing.T) {
 // (the buffered-fallback shape, same as any other listener-buffered SSE body) but under
 // Content-Type: application/json rather than text/event-stream — the mislabeling
 // confirmed on live traffic. settle.IsEventStream(pctx) reads that (wrong) header and
-// says no; carriesSSEFraming(frame) reads the actual bytes and says yes. This pins that
+// says no; inference.CarriesSSEFraming(frame) reads the actual bytes and says yes. This pins that
 // the fallback engages: parsing must not silently fail just because the header lied.
 func TestInferenceParser_ResponsesAPI_BufferedFallback_MislabeledContentType(t *testing.T) {
 	p := NewInferenceParser()
@@ -212,7 +212,7 @@ func TestInferenceParser_ResponsesAPI_BufferedFallback_MislabeledContentType(t *
 
 	ext := pctx.Extensions.Inference
 	if ext.Completion != "hello" {
-		t.Errorf("Completion = %q, want hello — carriesSSEFraming fallback did not engage", ext.Completion)
+		t.Errorf("Completion = %q, want hello — inference.CarriesSSEFraming fallback did not engage", ext.Completion)
 	}
 	if ext.TotalTokens != 11 {
 		t.Errorf("TotalTokens = %d, want 11", ext.TotalTokens)
@@ -394,7 +394,7 @@ func TestInferenceParser_ResponsesAPI_StreamFoldsFunctionCall(t *testing.T) {
 }
 
 // The non-streaming path reads output_item entries whole too, same as the streaming
-// path's response.output_item.done — this pins that parseResponsesJSON extracts both the
+// path's response.output_item.done — this pins that core/parse/inference.parseResponsesJSON extracts both the
 // text and the tool call from the same output array.
 func TestInferenceParser_ResponsesAPI_NonStreamingToolCall(t *testing.T) {
 	p := NewInferenceParser()
@@ -467,6 +467,37 @@ func TestInferenceParser_ResponsesRequest_ToolResults(t *testing.T) {
 	}
 	if ext.Messages[0].Content != "list the files" || ext.Messages[1].Content != "thanks" {
 		t.Errorf("Messages = %+v, want conversation text unchanged", ext.Messages)
+	}
+}
+
+// Codex declares its tools as custom (freeform) tools, so its tool results arrive as
+// custom_tool_call_output items, with the output as a list of input_text parts. They
+// are read the same way as function_call_output. The body is trimmed from a captured
+// Codex 0.167 request.
+func TestInferenceParser_ResponsesRequest_CustomToolResults(t *testing.T) {
+	p := NewInferenceParser()
+	pctx := &pipeline.Context{
+		Path: "/backend-api/codex/responses",
+		Body: []byte(`{"model":"gpt-5","input":[
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"print a.txt"}]},
+			{"type":"custom_tool_call","call_id":"call_x","name":"exec","input":"const r = await tools.exec_command({cmd:\"cat a.txt\"});\ntext(r.output);\n"},
+			{"type":"custom_tool_call_output","call_id":"call_x","output":[
+				{"type":"input_text","text":"Script completed\nOutput:\n"},
+				{"type":"input_text","text":"hello\n"}]}
+		]}`),
+	}
+	p.OnRequest(context.Background(), pctx)
+
+	ext := pctx.Extensions.Inference
+	if ext == nil {
+		t.Fatal("Extensions.Inference is nil")
+	}
+	want := pipeline.InferenceToolResult{ToolUseID: "call_x", Content: "Script completed\nOutput:\n\nhello\n"}
+	if len(ext.ToolResults) != 1 || ext.ToolResults[0] != want {
+		t.Fatalf("ToolResults = %+v, want [%+v]", ext.ToolResults, want)
+	}
+	if len(ext.Messages) != 1 || ext.Messages[0].Content != "print a.txt" {
+		t.Errorf("Messages = %+v, want the user message only", ext.Messages)
 	}
 }
 

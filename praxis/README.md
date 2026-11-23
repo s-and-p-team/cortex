@@ -1,0 +1,211 @@
+# praxis
+
+This is the Rust workspace for praxis mode (#1714). It has two crates:
+
+- `cortex-praxis-filters` (`filters/`): the Cortex filters that run inside
+  Praxis, ports of the Go inference, MCP and A2A parsers (`parse`), and the row builder and
+  emitter that send rows to Cortex (`record`).
+- `cortex-gateway` (`server/`): the Praxis server with the Cortex filters
+  registered (#1719).
+
+The workspace is outside `go.work`.
+
+## Run the tests
+
+From this directory:
+
+```sh
+rustup toolchain install
+cargo fmt --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked
+```
+
+`rust-toolchain.toml` pins the toolchain (Rust 1.96.0, with `rustfmt` and
+`clippy`). `rustup toolchain install`, run in this directory, installs it, as CI does.
+
+## Release build (#1723)
+
+- To build the release binary locally, from the repo root (the second command
+  gives the static Linux binary):
+
+  ```sh
+  VERSION=dev sh scripts/build-gateway.sh
+  podman run --rm -v "$PWD:/src" -w /src -e VERSION=dev \
+    docker.io/library/rust:1.96.0-alpine sh scripts/build-gateway.sh
+  ```
+
+  Each writes `dist/cortex-gateway` and runs `scripts/check-gateway-linkage.sh`.
+- OpenSSL is vendored (`openssl-src`). Upstream Praxis links the system
+  OpenSSL, so a plain build does not run on a host without that library.
+- Cortex owns OpenSSL security updates for `cortex-gateway`: an OpenSSL CVE
+  needs an `openssl-src` bump (Dependabot proposes it) and a release.
+- There is no FIPS claim for this binary.
+
+## Run the gateway
+
+```sh
+cargo run --locked -p cortex-gateway -- -c gateway.yaml
+```
+
+The config path comes from `-c <path>`, then `PRAXIS_CONFIG`, then
+`praxis.yaml` in the current directory. In praxis mode, `cortex -supervise`
+writes `gateway.yaml` and starts the gateway (#1720). To run the gateway by
+hand, write the file yourself.
+
+A policy needs `praxis.policy.config_path` in `config.yaml`. The supervisor writes
+the `policy` filter into `gateway.yaml` from that path. See
+[policy in praxis mode](../docs/praxis-policy.md).
+
+`--exit-on-stdin-eof` makes the gateway exit when its stdin closes. The
+supervisor uses it. Without the flag, a gateway that you start with
+`</dev/null` keeps running.
+
+The binary registers two filters. Put them first in the chain, in this order,
+and add `access_log` after them:
+
+- `cortex_attribution` (`token_file`): refuses a request without the token in
+  `X-Cortex-Token` with 403. Before the upstream, it removes every hop header
+  but `X-Cortex-Dest` and `X-Cortex-Token`, which the Cortex egress listener
+  reads and then removes. So the upstream must be the egress listener, never an
+  origin (decision 20).
+- `cortex_observe` (`token_file`, `ingest` as `host:port`): records the request
+  and response rows and streams them to `POST /v1/ingest`.
+
+Without `access_log` in the chain, Praxis does not call the hook that records
+an aborted or refused request, so that request has no response row.
+`server/tests/testdata/gateway.yaml.tmpl` is a full example.
+
+`server/tests/gateway.rs` starts the real binary between a mock origin and a
+mock ingest endpoint. Run it with `cargo test --locked -p cortex-gateway`.
+
+## Gateway decisions (#1719)
+
+The plan `docs/superpowers/plans/2026-11-09-praxis-mode-2-gateway-and-ingest.md`
+gives the full text.
+
+1. The filters stay thin. All logic is in `record` and `parse`, which take plain values. End-to-end tests start the real binary.
+2. Cortex reads the token file path from `CORTEX_GATEWAY_TOKEN_FILE`. The gateway reads it from the `token_file` filter config key. Cortex never creates the file.
+3. The Go `praxis` config block has only `enabled` for now.
+4. Ingest counters are at `GET /v1/ingest/stats` on the session API, in praxis mode only.
+5. `X-Cortex-Attribution` is base64url JSON without padding. A missing or bad header gives the default attribution.
+6. Fields that the gateway cannot know in v1 stay unset (`identity`, `tls`, and
+   others). Exception: the response row carries one `invocations.outbound` entry
+   when the policy file declares a plugin of kind `cortex/recorder` with
+   capability `read_headers`. The entry is
+   `{plugin: "policy", action: "allow"|"deny", reason: <violation code>}`.
+   `reason` is absent on an allow. Without a policy, or without that
+   declaration, the row does not change.
+7. `client`, `subagent` and `parentSubagent` are ported to Rust, pinned by a Go golden table.
+8. `client_canceled` and `upstream_error` messages are Rust text. Only the message differs from Go.
+9. Ingestion keeps the request id of a kept request capture for up to 1 hour, until its response line arrives.
+10. Tunnel joins land with the hop (#1721).
+11. One replay NDJSON file is the golden for both the Go ingestion and the Rust row builder.
+12. The emitter has its own thread and a current-thread Tokio runtime.
+13. `praxis-proxy` builds without default features, with vendored OpenSSL.
+14. The memory measurement is a script, not a CI gate.
+15. The filters use the Praxis 0.8.0 API. No fork, no patch.
+16. `CortexObserve` keeps its exchange in filter state as `Arc<Mutex<Exchange>>`.
+17. The ingest stream ends on Cortex shutdown, so restarts stay quick.
+18. A stream cut after the response head is `client_canceled`, also when the upstream cut it. Praxis 0.8.0 gives no error source after the head.
+19. A response row leaves out the request-only inference fields (`messages`, `tools`, `toolResults`, `historyToolCalls`, `historyThinking`). Cortex puts them back from the request row (`docs/session-api.md`, line format v1).
+20. The gateway keeps `X-Cortex-Dest` and `X-Cortex-Token` for its upstream, which is always the Cortex egress listener (#1721). The egress listener removes both before it dials the origin. The gateway must remove them before any other upstream. The request capture never has them.
+21. A buffered response body that goes over the 10 MiB cap after the response head gives a row with the upstream status, not 502. The client has that status and a cut body. Direct mode reads the body before it sends the head, so its client and its row get 502. A `Content-Length` over the cap gives 502 in both modes.
+22. On macOS, when the env does not set `SSL_CERT_FILE`, or sets it empty, the gateway sets it to `/dev/null`, so its TLS connector has no roots. Its upstream is plain HTTP (decision 20). Pingora otherwise reads the macOS trust store at startup, and panics when that read fails on a loaded host.
+
+## Accepted edge cases (#1719)
+
+These come from the PR #1717 review. This PR accepts them:
+
+1. **A restart loses the erase marks.** They are in memory. A line that the
+   gateway queued before an erase, and sends after a Cortex restart, can bring
+   the erased session back.
+2. **The erase check and the append are two steps.** An erase between them
+   lets that one line create the session again. A full fix checks under the
+   store's lock.
+3. **A stream longer than 10 minutes can record after an erase.** Its
+   response line arrives after the erase mark expired. Direct mode has the
+   same window for a response in flight at an erase.
+4. **`at` is set when Cortex appends the row.** So a request that names the
+   session, and arrives before an earlier request that is still pending, can
+   change which rows are linked to the session.
+
+## Supervision decisions (#1720)
+
+The plan `docs/superpowers/plans/2026-11-09-praxis-mode-3-supervise-gateway.md`
+gives the full text.
+
+1. `cortex -supervise` runs `cortex` and `cortex-gateway` as two siblings. Each child has its own restart loop, so a `cortex` restart does not stop the gateway.
+2. The command line is `cortex-gateway -c <dir>/gateway.yaml --exit-on-stdin-eof`. `<dir>` is the directory of the `--config` file, `~/.cortex/` for the service. The binary is in the same directory as `cortex`.
+3. The gateway's stdin is a pipe from the supervisor. When the supervisor exits for any reason, SIGKILL included, the pipe closes and the gateway exits. This is the only orphan guard, on Linux and macOS. No `Pdeathsig`.
+4. To stop the gateway, the supervisor closes the pipe. After `superviseStopGrace` it sends SIGKILL.
+5. At each start, the supervisor writes a new `gateway.token` (32 random bytes, hex, mode 0600) and `gateway.yaml`. It writes each file to a temp file and then renames it. The `cortex` child gets `CORTEX_GATEWAY_TOKEN_FILE`.
+6. The gateway gets an empty env, so no proxy variable can get to it.
+7. `gateway.yaml` listens on `praxis.listen` (default `127.0.0.1:47605`). A catch-all route sends all traffic to `praxis.egress` (default `127.0.0.1:47606`), Cortex's egress listener (#1721). `ip_acl` allows only `127.0.0.1/32` and `::1/128`.
+8. A missing gateway binary, or a gateway that exits, gets the normal backoff. The supervisor does not stop, and `cortex` keeps running.
+9. The supervisor does not stop a gateway from an earlier run. The stdin pipe ends that gateway when its supervisor exits, so a new gateway that cannot bind `praxis.listen` binds it on the next try. A config that `config.Validate` refuses starts no gateway.
+10. Not in this step: the admin metrics port, the startup probe and `gateway_unavailable` (#1721), and the version check of the gateway (#1723).
+11. Direct mode does not change. The supervisor starts only `cortex` and writes no gateway file.
+
+## Hop decisions (#1721)
+
+The plan `docs/superpowers/plans/2026-11-09-praxis-mode-4-hop-and-egress.md`
+gives the full text.
+
+1. `X-Cortex-Dest` is `<scheme>://<host>:<port>`, and the port is always there (80 for http, 443 for https).
+2. The probe is `GET /` to the gateway with `X-Cortex-Token`, `X-Cortex-Probe: 1` and `X-Cortex-Dest: cortex-probe`. The egress listener answers `204` and dials nothing.
+3. The probe runs every 1 s until one passes, then stops. After that, a failed dial to the gateway gives 503 `gateway_unavailable` for each request.
+4. For `gateway_unavailable`, the hop records the request row and a 503 response row itself.
+5. Branch point 5 is in `recordOutboundResponseEvent`: no row for a request the hop owns, and a `proxy_error` cut is kept as a cut join.
+6. The hop marks the requests it owns in a `sync.Map` keyed by `*pipeline.Context`. `pipeline.Context` does not change.
+7. The request id on the wire is `pctx.RequestID()`.
+8. `attribution.Wire` is filled from `pctx` after hydration, and the agent from the client's headers. The hop does not resolve attribution again.
+9. The gateway keeps `X-Cortex-Dest` and `X-Cortex-Token` for its upstream. Its request capture removes all twelve hop headers.
+10. The egress listener answers an egress-guard refusal with 403 and `X-Cortex-Egress-Error: destination_private`.
+11. The egress listener uses the TLS bridge's upstream transport when the bridge is on, else a new one with the same options (`egress_guard`).
+12. `HopJoins` is an interface in `core/sessionapi`. `forwardproxy` does not import `sessionapi`.
+13. The release of a dropped line's join marks the tunnel answered, so the tunnel writes no row.
+14. A join that expires settles the tunnel as in direct mode (an open row and a "carried nothing" close row).
+15. The end-to-end tests run in process in `cmd/cortex`, behind the `praxis_e2e` build tag and `CORTEX_GATEWAY_BIN`.
+16. The end-to-end tests use `startPraxis`, the same wiring function as `main`.
+17. The `Praxis` workflow builds `cortex-gateway` and runs the end-to-end tests after `cargo test`.
+
+In praxis mode, Cortex builds no outbound plugins and logs their names at Warn.
+The gateway does not run them, and a WebSocket upgrade goes direct to its
+origin, so no outbound plugin sees it. Cortex also declines the Codex Responses WebSocket, so Codex uses HTTPS.
+
+## The parity rule
+
+Go is the source of truth. A Go parser change regenerates `expected.json`,
+and this suite then shows the Rust gap. To regenerate, from this directory:
+
+```sh
+GOWORK=off go -C ../core test ./plugins/inferenceparser -run TestFixtures -update
+GOWORK=off go -C ../core test ./plugins/mcpparser -run TestFixtures -update
+GOWORK=off go -C ../core test ./plugins/a2aparser -run TestFixtures -update
+```
+
+`filters/tests/parity.rs` reads each case under
+`../core/plugins/inferenceparser/testdata/`. It feeds the body to the Rust parser
+in several ways (whole, in small chunks, gzip-coded, with CRLF line endings).
+`filters/tests/mcp_parity.rs` and `filters/tests/a2a_parity.rs` do the same for
+`../core/plugins/mcpparser/testdata/` and `../core/plugins/a2aparser/testdata/`
+(whole, and for an SSE case also in chunks and with CRLF line endings).
+Each result must equal the Go `expected.json`.
+
+When the two differ, fix the Rust code. Do not change Go behavior or a Go
+golden file to suit Rust.
+
+A Go-only parser PR gets a report from this suite, not a block. The CI job
+blocks when the PR changes `praxis/`, `docs/praxis-policy.md`, its workflow, or the
+Go side of praxis mode (`cmd/cortex/praxis*.go`, `gateway.go`, `ingest.go`, and
+`core/listener/forwardproxy/hop*.go` and `egress*.go`).
+
+## Go decode rules
+
+`filters/src/parse/inference/gojson.rs` reproduces the decode rules of Go's
+`encoding/json` on purpose. Go matches keys without case, lets a later
+duplicate key win, and reads `null` as "no change". `serde` does not. Do not
+replace it with plain `serde` derives.
+`filters/src/parse/inference/text.rs` does the same for invalid UTF-8: Go
+replaces each invalid byte with U+FFFD.

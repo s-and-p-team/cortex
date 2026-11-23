@@ -1,9 +1,11 @@
 package sessionapi
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -48,6 +50,17 @@ func restarted(t *testing.T, opts ...Option) (*httptest.Server, *session.Store, 
 		a.Close()
 	})
 	return ts, store, a
+}
+
+// settleArchive returns once a's writer has handled everything queued before the call. A
+// delete of an id the archive never held changes nothing and queues behind the rest.
+func settleArchive(t *testing.T, a *archive.Archive) {
+	t.Helper()
+	const id = "\x00settle"
+	a.Deleted(id)
+	if _, err := a.AwaitDelete(id, time.Hour); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func hostN(i int) string { return "h" + string(rune('a'+i)) }
@@ -260,26 +273,125 @@ func TestHandleGet_FillsTheGapBehindAPinnedIntent(t *testing.T) {
 
 // A session resumed after a restart lists its whole history — 10 events from before and 1 after —
 // in the default list and with ?archived=true alike. The archive marks the entry's start on its
-// own goroutine, so poll briefly for it.
+// own goroutine, so the test settles the archive first.
 func TestHandleList_AResumedSessionListsItsWholeHistory(t *testing.T) {
-	ts, store, _ := restarted(t)
+	ts, store, a := restarted(t)
 	store.Append("s1", pipeline.SessionEvent{At: time.Now(), Phase: pipeline.SessionRequest})
+	settleArchive(t, a)
 	for _, url := range []string{ts.URL + "/v1/sessions", ts.URL + "/v1/sessions?archived=true"} {
-		deadline := time.Now().Add(2 * time.Second)
-		for {
-			var n int
-			for _, s := range getList(t, url).Sessions {
-				if s.ID == "s1" {
-					n = s.EventCount
-				}
+		var n int
+		for _, s := range getList(t, url).Sessions {
+			if s.ID == "s1" {
+				n = s.EventCount
 			}
-			if n == 11 {
-				break
-			}
-			if time.Now().After(deadline) {
-				t.Fatalf("%s: s1 lists %d events, want 11", url, n)
-			}
-			time.Sleep(5 * time.Millisecond)
 		}
+		if n != 11 {
+			t.Fatalf("%s: s1 lists %d events, want 11", url, n)
+		}
+	}
+}
+
+// ?raw=1 adds the event's exact capture from the archive: the request as the agent sent it and
+// as it was forwarded, with its headers and query. Without the parameter, or for an event with
+// no capture, the answer is the event alone.
+func TestHandleGetEvent_RawAddsTheCapture(t *testing.T) {
+	root := t.TempDir()
+	a, err := archive.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := session.New(0, 0, 0)
+	store.AddRecorder(a)
+	want := &pipeline.RequestCapture{Original: []byte(`{"model":"m"}`), Forwarded: []byte(`{"model":"n"}`),
+		Header: http.Header{"Anthropic-Beta": {"x"}}, Query: "beta=true"}
+	store.AppendCapture("s1", pipeline.SessionEvent{At: time.Now(), Phase: pipeline.SessionRequest}, want)
+	gz := []byte("\x1f\x8b\x08\x00\xff")
+	store.AppendCapture("s1", pipeline.SessionEvent{At: time.Now(), Phase: pipeline.SessionResponse},
+		&pipeline.RequestCapture{Response: &pipeline.ResponseCapture{Status: 200,
+			Header: http.Header{"Content-Encoding": {"gzip"}}, Body: gz, Incomplete: true}})
+	store.Append("s1", pipeline.SessionEvent{At: time.Now(), Phase: pipeline.SessionRequest})
+	if err := a.Close(); err != nil { // flushes, so the capture is readable
+		t.Fatal(err)
+	}
+	if a, err = archive.Open(root); err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	srv := New(":0", store, WithArchive(a))
+	ts := httptest.NewServer(srv.server.Handler)
+	defer ts.Close()
+
+	var got struct {
+		Seq           uint64               `json:"seq"`
+		SchemaVersion int                  `json:"schemaVersion"`
+		Raw           *pipeline.RawCapture `json:"raw"`
+	}
+	code, body := getBody(t, ts.URL+"/v1/sessions/s1/events/1?raw=1")
+	if code != http.StatusOK || json.Unmarshal(body, &got) != nil || got.Seq != 1 || got.Raw == nil ||
+		got.SchemaVersion != SchemaVersion {
+		t.Fatalf("GET events/1?raw=1 = %d %s", code, body)
+	}
+	if got.Raw.Request != `{"model":"m"}` || got.Raw.Forwarded == nil || *got.Raw.Forwarded != `{"model":"n"}` ||
+		got.Raw.RequestHeaders.Get("Anthropic-Beta") != "x" || got.Raw.Query != "beta=true" {
+		t.Fatalf("raw = %+v, want the capture", got.Raw)
+	}
+	// A response whose body is not UTF-8, as every compressed body is, comes back as base64.
+	got.Raw = nil
+	code, body = getBody(t, ts.URL+"/v1/sessions/s1/events/2?raw=1")
+	if code != http.StatusOK || json.Unmarshal(body, &got) != nil || got.Raw == nil || got.Raw.Response == nil {
+		t.Fatalf("GET events/2?raw=1 = %d %s", code, body)
+	}
+	if r := got.Raw.Response; r.Status != 200 || r.Headers.Get("Content-Encoding") != "gzip" || r.Body != "" ||
+		!bytes.Equal(r.BodyBase64, gz) || !r.Incomplete || r.Truncated || r.Decoded || got.Raw.Request != "" {
+		t.Fatalf("raw = %+v, response %+v, want the gzip response as base64", got.Raw, r)
+	}
+	for _, path := range []string{"/v1/sessions/s1/events/1", "/v1/sessions/s1/events/3?raw=1"} {
+		code, body := getBody(t, ts.URL+path)
+		if code != http.StatusOK || strings.Contains(string(body), `"raw"`) {
+			t.Fatalf("GET %s = %d %s, want the event without raw", path, code, body)
+		}
+	}
+}
+
+// Rule 8a of #1911: GET raw serves a translated request's converted body and the server's raw
+// reply, each as text when it is UTF-8 and as base64 otherwise.
+func TestHandleGetEvent_RawAddsTheTranslatedHop(t *testing.T) {
+	root := t.TempDir()
+	a, err := archive.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := session.New(0, 0, 0)
+	store.AddRecorder(a)
+	store.AppendCapture("s1", pipeline.SessionEvent{At: time.Now(), Phase: pipeline.SessionRequest},
+		&pipeline.RequestCapture{Original: []byte(`{"model":"m"}`), Translated: []byte(`{"model":"c"}`)})
+	raw := []byte("data: \xff\n\n")
+	store.AppendCapture("s1", pipeline.SessionEvent{At: time.Now(), Phase: pipeline.SessionResponse},
+		&pipeline.RequestCapture{Response: &pipeline.ResponseCapture{Status: 200, Body: []byte(`{}`), Upstream: raw, UpstreamTruncated: true}})
+	if err := a.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if a, err = archive.Open(root); err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	ts := httptest.NewServer(New(":0", store, WithArchive(a)).server.Handler)
+	defer ts.Close()
+
+	var got struct {
+		Raw *pipeline.RawCapture `json:"raw"`
+	}
+	code, body := getBody(t, ts.URL+"/v1/sessions/s1/events/1?raw=1")
+	if code != http.StatusOK || json.Unmarshal(body, &got) != nil || got.Raw == nil ||
+		got.Raw.Translated == nil || *got.Raw.Translated != `{"model":"c"}` || got.Raw.TranslatedBase64 != nil {
+		t.Fatalf("GET events/1?raw=1 = %d %s, want the translated body as text", code, body)
+	}
+	got.Raw = nil
+	code, body = getBody(t, ts.URL+"/v1/sessions/s1/events/2?raw=1")
+	if code != http.StatusOK || json.Unmarshal(body, &got) != nil || got.Raw == nil || got.Raw.Response == nil {
+		t.Fatalf("GET events/2?raw=1 = %d %s", code, body)
+	}
+	if r := got.Raw.Response; r.Body != `{}` || r.Upstream != nil || !bytes.Equal(r.UpstreamBase64, raw) || !r.UpstreamTruncated {
+		t.Fatalf("response = %+v, want the non-UTF-8 upstream body as base64", r)
 	}
 }

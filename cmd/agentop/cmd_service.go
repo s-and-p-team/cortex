@@ -32,6 +32,9 @@ import (
 const (
 	launchdLabel = "io.rossoctl.cortex"
 	systemdUnit  = "cortex.service"
+	// The updater runs `agentop update --yes --auto` when the proxy starts it.
+	updaterLabel = "io.rossoctl.cortex.update"
+	updaterUnit  = "cortex-update.service"
 	// maxLogBytes bounds one generation of proxy.log; rotateLog keeps one previous
 	// file, so the pair tops out near twice this.
 	maxLogBytes = 8 << 20
@@ -88,11 +91,13 @@ var serviceBootoutTimeout = 30 * time.Second
 // servicePaths is everything the platform-specific bits need, gathered so tests
 // can point all of it at a temp dir instead of the real ~/Library/LaunchAgents.
 type servicePaths struct {
-	unitFile   string // plist or .service
-	binary     string // absolute path to cortex
-	configFile string // ~/.cortex/config.yaml
-	logFile    string
-	pidFile    string
+	unitFile string // plist or .service
+	// updaterFile is the updater's plist or .service, beside unitFile.
+	updaterFile string
+	binary      string // absolute path to cortex
+	configFile  string // ~/.cortex/config.yaml
+	logFile     string
+	pidFile     string
 	// stampFile records the SHA-256 of the proxy binary the supervisor last launched.
 	//
 	// A sidecar beside proxy.pid rather than a field in the unit, and for the same
@@ -181,7 +186,7 @@ func resolveServicePaths(cortexCfg, unitOverride, proxyOverride string) (service
 	p.home = home
 	p.configFile = cortexCfg
 	p.logFile = filepath.Join(filepath.Dir(cortexCfg), "proxy.log")
-	p.pidFile = filepath.Join(filepath.Dir(cortexCfg), "proxy.pid")
+	p.pidFile = filepath.Join(filepath.Dir(cortexCfg), proxyPIDFile)
 	p.stampFile = filepath.Join(filepath.Dir(cortexCfg), "proxy.sha256")
 
 	// An absolute binary path: a supervisor has no shell PATH to search.
@@ -196,16 +201,16 @@ func resolveServicePaths(cortexCfg, unitOverride, proxyOverride string) (service
 	bin := proxyOverride
 	if bin == "" {
 		if self, serr := os.Executable(); serr == nil {
-			if sib := filepath.Join(filepath.Dir(self), "cortex"); fileExists(sib) {
+			if sib := filepath.Join(filepath.Dir(self), proxyBinary); fileExists(sib) {
 				bin = sib
 			}
 		}
 	}
 	if bin == "" {
-		if found, lerr := exec.LookPath("cortex"); lerr == nil {
+		if found, lerr := exec.LookPath(proxyBinary); lerr == nil {
 			bin = found
 		} else {
-			bin = filepath.Join(home, ".local", "bin", "cortex")
+			bin = filepath.Join(home, ".local", "bin", proxyBinary)
 		}
 	}
 	if abs, aerr := filepath.Abs(bin); aerr == nil {
@@ -232,6 +237,11 @@ func resolveServicePaths(cortexCfg, unitOverride, proxyOverride string) (service
 	default:
 		p.unitFile = unitOverride
 	}
+	updaterBase := updaterLabel + ".plist"
+	if runtime.GOOS == "linux" {
+		updaterBase = updaterUnit
+	}
+	p.updaterFile = filepath.Join(filepath.Dir(p.unitFile), updaterBase)
 
 	p.healthURL = resolveHealthURL(cortexCfg)
 	// Kept, not discarded: install must refuse a config that cannot load, or it
@@ -478,6 +488,12 @@ func runServiceInstall(p servicePaths, adopt int, forceRestart, announceUnit boo
 	// point, and a stamp naming the binary we are about to launch is still the right
 	// answer for the next install: it reflects the unit that was just written.
 	writeProxyStamp(p)
+	// A warning only: the proxy serves without automatic updates.
+	updaterWritten := true
+	if err := writeFileAtomic(p.updaterFile, []byte(renderUpdaterUnitFor(runtime.GOOS, p)), 0o644); err != nil {
+		updaterWritten = false
+		fmt.Fprintf(stderr, "agentop: writing %s: %v; automatic updates stay off until the next install\n", p.updaterFile, err)
+	}
 	// The path is not printed on the happy path: it is one more line of output on an
 	// install that already says what happened, and `agentop service status` reports it
 	// whenever someone actually needs it.
@@ -496,8 +512,17 @@ func runServiceInstall(p servicePaths, adopt int, forceRestart, announceUnit boo
 		if rmErr := os.Remove(p.unitFile); rmErr != nil && !os.IsNotExist(rmErr) {
 			fmt.Fprintf(stderr, "agentop: also could not remove %s: %v\n", p.unitFile, rmErr)
 		}
+		// Without the unit, uninstall says "Nothing to do" and leaves this file behind.
+		if rmErr := os.Remove(p.updaterFile); rmErr != nil && !os.IsNotExist(rmErr) {
+			fmt.Fprintf(stderr, "agentop: also could not remove %s: %v\n", p.updaterFile, rmErr)
+		}
 		fmt.Fprintf(stderr, "agentop: %v\n", err)
 		return installResult{exit: 1, replaced: true}
+	}
+	if updaterWritten {
+		if err := loadUpdater(runtime.GOOS, p); err != nil {
+			fmt.Fprintf(stderr, "agentop: %v; automatic updates stay off until the next install\n", err)
+		}
 	}
 
 	// "Loaded" is not "serving". A bad config is fatal at startup and a supervisor
@@ -619,8 +644,9 @@ func removeServiceReport(p servicePaths) (unloadErr, unitErr, stampErr error) {
 	// A failed unload does not stop the removal: leaving the unit file behind would
 	// make a reinstall look installed-but-dead.
 	unloadErr = unloadService(runtime.GOOS, p)
+	updaterErr := removeUpdater(runtime.GOOS, p)
 	if err := os.Remove(p.unitFile); err != nil {
-		return unloadErr, err, nil
+		return unloadErr, err, updaterErr
 	}
 	// Launch state, so it goes with the unit rather than surviving in ~/.cortex beside
 	// the config and CA the message serviceUninstall prints promises are untouched.
@@ -628,7 +654,7 @@ func removeServiceReport(p servicePaths) (unloadErr, unitErr, stampErr error) {
 	if err := os.Remove(p.stampFile); err != nil && !os.IsNotExist(err) {
 		stampErr = err
 	}
-	return unloadErr, nil, stampErr
+	return unloadErr, nil, errors.Join(stampErr, updaterErr)
 }
 
 func serviceStatus(p servicePaths, stdout io.Writer) int {
@@ -858,7 +884,7 @@ func foreignHolderLines(p servicePaths) []string {
 	// A foreign Cortex also explains the OTHER symptom, which does not look related:
 	// requests do reach the port, and are bridged with that install's CA, so agents
 	// report a self-signed certificate rather than a connection failure.
-	if b := filepath.Base(exe); b == "cortex" || b == "authbridge-proxy" {
+	if b := filepath.Base(exe); b == proxyBinary || b == preRenameBinary {
 		lines = append(lines, "That is another Cortex, so requests reaching it are bridged with ITS CA — which is the self-signed-certificate error agents report.")
 	}
 	switch job := holderJob(runtime.GOOS, pid); {
@@ -1191,6 +1217,9 @@ func serviceIsCurrent(goos string, p servicePaths) bool {
 	if unitWriterVersion(p.unitFile) != version {
 		return false
 	}
+	if !updaterUnitCurrent(goos, p) {
+		return false
+	}
 	unit, err := os.ReadFile(p.unitFile) //nolint:gosec // path we wrote
 	if err != nil {
 		return false
@@ -1207,6 +1236,11 @@ func serviceIsCurrent(goos string, p servicePaths) bool {
 	if goos == "darwin" && !strings.Contains(body, "--supervise") {
 		return false
 	}
+	// On Linux the unit supervises only in praxis mode. A unit that does not agree
+	// with the config file must be written again.
+	if goos == "linux" && strings.Contains(body, "--supervise") != configPraxisEnabled(p.configFile) {
+		return false
+	}
 	if running, _ := supervisorRunning(goos, p); !running {
 		return false
 	}
@@ -1214,6 +1248,13 @@ func serviceIsCurrent(goos string, p servicePaths) bool {
 		return false // cannot confirm it is serving, so do not claim it is
 	}
 	return waitHealthy(p.healthURL, 2*time.Second)
+}
+
+// configPraxisEnabled reports whether the config file at path sets praxis.enabled.
+// It is false when the file does not load.
+func configPraxisEnabled(path string) bool {
+	cfg, err := config.Load(path)
+	return err == nil && cfg.PraxisEnabled()
 }
 
 // proxyBinaryUnchanged reports whether the binary on disk is still the one the unit

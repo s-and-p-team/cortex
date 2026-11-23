@@ -26,3 +26,50 @@ func (c *Context) AttributedProc() string { return c.attributedProc }
 // NamingHeader is the pinned session-id header that named the request's session, "" when
 // none did. Recorded as SessionEvent.SessionHeader on the request's own row.
 func (c *Context) NamingHeader() string { return c.namingHeader }
+
+// SetNamedSession pins the session id the request named with its session-id header (the one
+// NamingHeader names), "" when none did. FIRST CALL WINS, with its own flag, as SetProject does:
+// the listener sets it with SetAttribution, before any plugin runs, so a plugin that rewrites
+// the session-id header cannot change which session the request named (#1923).
+func (c *Context) SetNamedSession(id string) {
+	if c.namedSet {
+		return
+	}
+	c.namedSet, c.namedSession = true, id
+}
+
+// NamedSession is the pinned session id the request named, "" when none was pinned.
+func (c *Context) NamedSession() string { return c.namedSession }
+
+// SetProject pins the project label (project.Label of the agent process's repo root) for
+// every row recorded from this request. FIRST CALL WINS, as SetAttribution does, with its
+// own flag: a path that pins "" keeps "", and no later call can write a label.
+func (c *Context) SetProject(label string) {
+	if c.projectSet {
+		return
+	}
+	c.projectSet, c.project = true, label
+}
+
+// Project is the pinned project label, "" when none was pinned. Recorded as
+// SessionEvent.Project.
+func (c *Context) Project() string { return c.project }
+
+// SetParent pins the parent session (the session that the topmost process above this request's
+// agent named, when it is not this request's session) and the project label of the process that
+// holds it, for every row recorded from this request. FIRST CALL WINS, as SetProject does,
+// with its own flag: a path that pins "", "" keeps them, and no later call can write a parent.
+func (c *Context) SetParent(session, project string) {
+	if c.parentSet {
+		return
+	}
+	c.parentSet, c.parentSession, c.parentProject = true, session, project
+}
+
+// ParentSession is the pinned parent session, "" when none was pinned. Recorded as
+// SessionEvent.ParentSession.
+func (c *Context) ParentSession() string { return c.parentSession }
+
+// ParentProject is the pinned parent project label, "" when none was pinned. Recorded as
+// SessionEvent.ParentProject.
+func (c *Context) ParentProject() string { return c.parentProject }
